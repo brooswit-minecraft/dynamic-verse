@@ -120,6 +120,33 @@ source-state restoration hook is exposed by this provider; a snapshot copy or
 delete must remain prohibited until a provider adaptation supplies explicit
 success/failure completion and restoration semantics.
 
+### Failure and restoration seam audit
+
+The real GameTest's reload case verifies the *normal-success* restoration
+sequence: it writes a redstone lamp, calls `unloadDynamicDimension`, observes
+the queued disappearance on the next tick, loads the same id, and observes the
+saved lamp again. This is real loaded-source restoration evidence only for a
+successful path; it does not cover a save or close failure.
+
+No supported controlled failure seam exists in the pinned provider. The public
+API exposes only boolean admission from `unloadDynamicDimension` and
+`deleteDynamicDimension`; `DimensionRemovedCallback` is invoked *before*
+`level.save`, the removal ticket carries no completion sink, and the only
+`unloadLevel` implementation is private to `MinecraftServerMixin`. It catches
+`IOException` and removes the level in `finally`. Consequently a caller cannot
+distinguish queued admission or level disappearance from a failed save/close,
+and cannot safely restore the prior loaded state.
+
+The smallest separately reviewable provider seam is an asynchronous
+`beginQuiesceAndClose(key, completion)` operation owned by lifecycle. Its
+completion must report exactly one terminal `SAVED_AND_CLOSED` or
+`FAILED_SAVE`/`FAILED_CLOSE`, retain the managed source identity through the
+operation, and expose whether the source was loaded on admission so it can be
+restored on every terminal path. It must run from the existing tick queue,
+must not remove a level/registry entry on failure, and must precede any copy or
+delete of managed data. This is a proposal, not an implementation or proof of
+the provider capability.
+
 ## Current capability boundary
 
 MINECRAFT-469 v5 remains authoritative: explicit independently seeded creation
