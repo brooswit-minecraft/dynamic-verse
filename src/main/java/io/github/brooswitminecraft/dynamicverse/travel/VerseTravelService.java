@@ -1,22 +1,20 @@
 package io.github.brooswitminecraft.dynamicverse.travel;
 
+import io.github.brooswitminecraft.dynamicverse.lifecycle.ReadyVerseLease;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseAccessError;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseAccessService;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseReservationSnapshot;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/**
- * Travel-only implementation of the MINECRAFT-469 v5 readiness contract.
- *
- * <p>The lifecycle module supplies {@link VerseAccess}; this package neither
- * reads level keys nor defines lifecycle state.  In particular, a destination
- * is used only from the lease supplied by {@code acquireReadyRead}.</p>
- */
+/** Travel-only consumer of the lifecycle-owned v5 atomic readiness boundary. */
 public final class VerseTravelService {
-    private final VerseAccess verses;
+    private final VerseAccessService verses;
     private final PlayerDirectory players;
     private final Movement movement;
 
-    public VerseTravelService(VerseAccess verses, PlayerDirectory players, Movement movement) {
+    public VerseTravelService(VerseAccessService verses, PlayerDirectory players, Movement movement) {
         this.verses = Objects.requireNonNull(verses);
         this.players = Objects.requireNonNull(players);
         this.movement = Objects.requireNonNull(movement);
@@ -30,7 +28,7 @@ public final class VerseTravelService {
         scheduleVerseTravel(target, verseName, requested, result);
     }
 
-    /** Moves the named player to the caller's position; no verse lease is involved. */
+    /** Moves the named player to the caller's current position; no verse lease is involved. */
     public void bringPlayer(Player caller, Player target, ResultSink result) {
         UUID callerId = caller.id();
         UUID targetId = target.id();
@@ -53,37 +51,44 @@ public final class VerseTravelService {
     private void scheduleVerseTravel(Player initialTarget, String verseName, Position requested, ResultSink result) {
         UUID targetId = initialTarget.id();
         TerminalResult terminal = new TerminalResult(result);
-        verses.acquireReadyRead(verseName, new VerseAccess.AcquireCallback() {
-            @Override
-            public void acquired(ReadyVerseLease lease) {
-                if (!terminal.begin()) {
-                    lease.close();
-                    return;
-                }
-                try {
-                    Player currentTarget = players.online(targetId);
-                    if (currentTarget == null) {
-                        terminal.failedAfterBegin(TravelError.PLAYER_NOT_FOUND);
-                        return;
-                    }
-                    // The lease's world and spawn were revalidated atomically by lifecycle.
-                    movement.move(currentTarget, requested == null ? lease.spawn() : requested, lease);
-                    terminal.movedAfterBegin();
-                } catch (RuntimeException failure) {
-                    terminal.failedAfterBegin(TravelError.MOVE_FAILED);
-                } finally {
-                    lease.close();
-                }
-            }
-
-            @Override
-            public void failed(TravelError error) {
-                if (terminal.begin()) terminal.failedAfterBegin(error);
-            }
-        });
+        verses.beginAcquireReadyRead(verseName, snapshot -> completeVerseTravel(snapshot, targetId, requested, terminal));
     }
 
-    /** Defends command feedback against a faulty or stale asynchronous producer. */
+    private void completeVerseTravel(
+            VerseReservationSnapshot snapshot, UUID targetId, Position requested, TerminalResult terminal) {
+        if (!terminal.begin()) {
+            snapshot.lease().ifPresent(ReadyVerseLease::close);
+            return;
+        }
+        if (snapshot.lease().isEmpty()) {
+            terminal.failedAfterBegin(map(snapshot.error().orElse(VerseAccessError.ERR_VERSE_NOT_FOUND)));
+            return;
+        }
+        ReadyVerseLease lease = snapshot.lease().orElseThrow();
+        try {
+            Player currentTarget = players.online(targetId);
+            if (currentTarget == null) {
+                terminal.failedAfterBegin(TravelError.PLAYER_NOT_FOUND);
+                return;
+            }
+            // The concrete movement adapter resolves the acquired lease's level identity.
+            movement.move(currentTarget, requested, lease);
+            terminal.movedAfterBegin();
+        } catch (RuntimeException failure) {
+            terminal.failedAfterBegin(TravelError.MOVE_FAILED);
+        } finally {
+            lease.close();
+        }
+    }
+
+    private static TravelError map(VerseAccessError error) {
+        return switch (error) {
+            case ERR_VERSE_NOT_FOUND -> TravelError.VERSE_NOT_FOUND;
+            case ERR_VERSE_LIFECYCLE_PENDING -> TravelError.VERSE_LIFECYCLE_PENDING;
+            case ERR_VERSE_DESTINATION_CHANGED -> TravelError.VERSE_DESTINATION_CHANGED;
+        };
+    }
+
     private static final class TerminalResult {
         private final ResultSink delegate;
         private final AtomicBoolean sent = new AtomicBoolean();
@@ -94,30 +99,14 @@ public final class VerseTravelService {
         void failedAfterBegin(TravelError error) { delegate.failed(error); }
     }
 
-    public interface VerseAccess {
-        /** Nonblocking v5 acquire: completion occurs later, with one terminal callback. */
-        void acquireReadyRead(String verseName, AcquireCallback callback);
-
-        interface AcquireCallback {
-            void acquired(ReadyVerseLease lease);
-            void failed(TravelError error);
-        }
-    }
-
-    public interface ReadyVerseLease extends AutoCloseable {
-        Position spawn();
-        long generation();
-        @Override void close();
-    }
-
     public interface PlayerDirectory {
         Player online(UUID id);
         void runLater(Runnable continuation);
     }
 
     public interface Movement {
-        /** A null lease denotes caller-to-caller travel for bring. */
-        void move(Player target, Position destination, ReadyVerseLease lease);
+        /** A null lease denotes caller-to-caller travel for bring; null position means verse spawn. */
+        void move(Player target, Position requested, ReadyVerseLease lease);
     }
 
     public interface ResultSink {

@@ -1,9 +1,10 @@
-package io.github.brooswitminecraft.dynamicverse.travel;
+package io.github.brooswitminecraft.dynamicverse.lifecycle;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.github.brooswitminecraft.dynamicverse.travel.VerseTravelService;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -11,30 +12,30 @@ import org.junit.jupiter.api.Test;
 
 class VerseTravelServiceTest {
     @Test
-    void sendUsesAcquiredLeaseAndRequestedCoordinates() {
+    void sendUsesAcquiredLifecycleLeaseAndRequestedCoordinates() {
         Fixture fixture = new Fixture();
         fixture.service.sendPlayer(fixture.target, "moon", new VerseTravelService.Position(2, 70, -3), fixture.result);
 
-        fixture.access.callback.acquired(fixture.lease);
+        fixture.access.complete(VerseReservationSnapshot.acquired(fixture.id, fixture.lease));
 
         assertEquals(fixture.target, fixture.movedPlayer);
         assertEquals(new VerseTravelService.Position(2, 70, -3), fixture.movedTo);
         assertEquals(fixture.lease, fixture.movedLease);
         assertEquals(1, fixture.result.moves);
-        assertTrue(fixture.lease.closed);
+        assertTrue(fixture.released);
     }
 
     @Test
-    void teleportDefaultsToSpawnAndReleasesLeaseWhenMoveFails() {
+    void teleportPassesNullPositionForAcquiredVerseSpawnAndReleasesOnFailure() {
         Fixture fixture = new Fixture();
         fixture.movementFailure = true;
         fixture.service.teleportCaller(fixture.target, "moon", null, fixture.result);
 
-        fixture.access.callback.acquired(fixture.lease);
+        fixture.access.complete(VerseReservationSnapshot.acquired(fixture.id, fixture.lease));
 
-        assertEquals(fixture.lease.spawn(), fixture.movedTo);
+        assertNull(fixture.movedTo);
         assertEquals(VerseTravelService.TravelError.MOVE_FAILED, fixture.result.error);
-        assertTrue(fixture.lease.closed);
+        assertTrue(fixture.released);
     }
 
     @Test
@@ -42,23 +43,25 @@ class VerseTravelServiceTest {
         Fixture fixture = new Fixture();
         fixture.service.sendPlayer(fixture.target, "moon", null, fixture.result);
 
-        fixture.access.callback.failed(VerseTravelService.TravelError.VERSE_DESTINATION_CHANGED);
+        fixture.access.complete(VerseReservationSnapshot.failed(
+                fixture.id, "moon", VerseAccessError.ERR_VERSE_DESTINATION_CHANGED));
 
         assertEquals(VerseTravelService.TravelError.VERSE_DESTINATION_CHANGED, fixture.result.error);
         assertNull(fixture.movedPlayer);
     }
 
     @Test
-    void staleSecondCallbackDoesNotProduceSecondTerminalResult() {
+    void staleAcquiredCallbackReleasesLeaseWithoutMoving() {
         Fixture fixture = new Fixture();
         fixture.service.sendPlayer(fixture.target, "moon", null, fixture.result);
-
-        fixture.access.callback.failed(VerseTravelService.TravelError.VERSE_LIFECYCLE_PENDING);
-        fixture.access.callback.acquired(fixture.lease);
+        fixture.access.complete(VerseReservationSnapshot.failed(
+                fixture.id, "moon", VerseAccessError.ERR_VERSE_LIFECYCLE_PENDING));
+        fixture.access.complete(VerseReservationSnapshot.acquired(fixture.id, fixture.lease));
 
         assertEquals(VerseTravelService.TravelError.VERSE_LIFECYCLE_PENDING, fixture.result.error);
         assertEquals(0, fixture.result.moves);
         assertNull(fixture.movedPlayer);
+        assertTrue(fixture.released);
     }
 
     @Test
@@ -67,11 +70,11 @@ class VerseTravelServiceTest {
         fixture.service.sendPlayer(fixture.target, "moon", null, fixture.result);
         fixture.players.remove(fixture.target.id());
 
-        fixture.access.callback.acquired(fixture.lease);
+        fixture.access.complete(VerseReservationSnapshot.acquired(fixture.id, fixture.lease));
 
         assertEquals(VerseTravelService.TravelError.PLAYER_NOT_FOUND, fixture.result.error);
         assertNull(fixture.movedPlayer);
-        assertTrue(fixture.lease.closed);
+        assertTrue(fixture.released);
     }
 
     @Test
@@ -90,12 +93,14 @@ class VerseTravelServiceTest {
         final VerseTravelService.Player target = new VerseTravelService.Player(UUID.randomUUID(), new VerseTravelService.Position(0, 64, 0));
         final Players players = new Players(caller, target);
         final Access access = new Access();
-        final Lease lease = new Lease(new VerseTravelService.Position(10, 80, 10));
+        final VerseReservationId id = VerseReservationId.newId();
+        boolean released;
+        final ReadyVerseLease lease = new ReadyVerseLease("moon", "moon-level", 7L, id, () -> released = true);
         final Result result = new Result();
         boolean movementFailure;
         VerseTravelService.Player movedPlayer;
         VerseTravelService.Position movedTo;
-        VerseTravelService.ReadyVerseLease movedLease;
+        ReadyVerseLease movedLease;
         final VerseTravelService service = new VerseTravelService(access, players, (player, destination, leaseArgument) -> {
             movedPlayer = player;
             movedTo = destination;
@@ -104,18 +109,13 @@ class VerseTravelServiceTest {
         });
     }
 
-    private static final class Access implements VerseTravelService.VerseAccess {
-        AcquireCallback callback;
-        @Override public void acquireReadyRead(String verseName, AcquireCallback callback) { this.callback = callback; }
-    }
-
-    private static final class Lease implements VerseTravelService.ReadyVerseLease {
-        private final VerseTravelService.Position spawn;
-        boolean closed;
-        Lease(VerseTravelService.Position spawn) { this.spawn = spawn; }
-        @Override public VerseTravelService.Position spawn() { return spawn; }
-        @Override public long generation() { return 7L; }
-        @Override public void close() { closed = true; }
+    private static final class Access implements VerseAccessService {
+        VerseCompletionSink<VerseReservationSnapshot> callback;
+        @Override public VerseReservationSnapshot beginAcquireReadyRead(String verseName, VerseCompletionSink<VerseReservationSnapshot> callback) {
+            this.callback = callback;
+            return VerseReservationSnapshot.pending(VerseReservationId.newId(), verseName);
+        }
+        void complete(VerseReservationSnapshot result) { callback.complete(result); }
     }
 
     private static final class Players implements VerseTravelService.PlayerDirectory {
