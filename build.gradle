@@ -36,6 +36,26 @@ dependencies {
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
 }
 
+def dynamicDimensionsJar = layout.projectDirectory.file("local-artifacts/dynamicdimensions-neoforge.jar")
+def dynamicDimensionsSha256 = "b25aefb589ae1c8635679373230d536c6c77bd21942f65d0f9765436e5046d79"
+
+tasks.register("verifyLocalDynamicDimensionsArtifact") {
+    group = "verification"
+    description = "Verifies the disposable pinned DynamicDimensions jar used by the feasibility probe."
+    inputs.file(dynamicDimensionsJar)
+    doLast {
+        File artifact = dynamicDimensionsJar.asFile
+        if (!artifact.isFile()) throw new GradleException("Missing local DynamicDimensions artifact: " + artifact)
+        def digest = java.security.MessageDigest.getInstance("SHA-256")
+        artifact.withInputStream { stream ->
+            byte[] buffer = new byte[8192]
+            for (int read; (read = stream.read(buffer)) != -1;) digest.update(buffer, 0, read)
+        }
+        def actual = digest.digest().collect { String.format("%02x", it) }.join()
+        if (actual != dynamicDimensionsSha256) throw new GradleException("Unexpected DynamicDimensions SHA-256: " + actual)
+    }
+}
+
 test {
     useJUnitPlatform()
 }

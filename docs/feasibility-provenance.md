@@ -75,6 +75,25 @@ Gradle included-build source route for a future isolated integration test. It
 does not prove independent NORMAL/SUPERFLAT seeds, forced save-and-close
 completion, copy safety, or source restoration.
 
+## Explicit-seed falsification
+
+The composite produced the disposable NeoForge library artifact
+`dynamicdimensions-neoforge-0.10.0+ecfbdf69-dirty.jar` with SHA-256
+`b25aefb589ae1c8635679373230d536c6c77bd21942f65d0f9765436e5046d79`.
+`verifyLocalDynamicDimensionsArtifact` verifies this exact jar when placed at
+`local-artifacts/dynamicdimensions-neoforge.jar`; that ignored directory is
+never published and the artifact is not installed into a Maven cache.
+
+The pinned implementation decisively falsifies explicit per-verse seeds: both
+`createDynamicDimension` overloads accept only an identifier,
+`ChunkGenerator`, `DimensionType`, and optional properties. Its sole
+`ServerLevel` construction in `DynamicDimensionRegistryImpl#createDynamicLevel`
+passes `BiomeManager.obfuscateSeed(worldData.worldGenOptions().seed())`.
+Thus a requested seed cannot reach the constructed level's seed through this
+API; NORMAL and SUPERFLAT receive the save-wide seed. Supplied seed requests
+must remain fail-closed before filesystem/registry mutation
+(`ERR_PER_VERSE_SEED_UNSUPPORTED`), never substituted with the server seed.
+
 ## Current capability boundary
 
 MINECRAFT-469 v5 remains authoritative: explicit independently seeded creation
