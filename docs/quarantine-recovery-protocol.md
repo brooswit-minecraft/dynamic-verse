@@ -42,6 +42,37 @@ real-provider validation. Until then, `QUARANTINED` remains terminally
 unavailable, with no source-restoration claim. Explicit per-verse seed remains
 `ERR_PER_VERSE_SEED_UNSUPPORTED` and no copy/delete admission is opened.
 
+## Pinned close-chain audit and resulting recovery hold
+
+The pinned provider is configured against NeoForge `21.1.148`; its resolved
+sources show that this is not a single, all-or-nothing close:
+
+1. `ServerLevel.close()` calls `ServerChunkCache.close()` and only then
+   `PersistentEntitySectionManager.close()`.
+2. `ServerChunkCache.close()` saves chunks, closes the light engine, then calls
+   `ChunkMap.close()`.
+3. `ChunkMap.close()` calls `queueSorter.close()` and `poiManager.close()` in
+   its `try`, then always calls its superclass close in `finally`.
+4. That superclass close reaches independent storage closures; for example
+   `EntityStorage.close()` closes its `SimpleRegionStorage`, while
+   `ChunkStorage.close()` closes its region-file worker.
+
+An exception at any earlier sequential step can skip later `ServerLevel` or
+`ServerChunkCache` releases. The `ChunkMap` `finally` improves only that
+subchain; it does not prove the entity manager, light engine, chunk worker, or
+all region/POI writers have been released. None of these calls supplies an
+idempotent close-complete query, a writer-ownership token, or a supported
+reopen operation. Therefore the pinned provider exposes **no supported release
+or proof boundary** after a throwing `ServerLevel.close()`.
+
+Consequently `FRESH_INSTANCE` is unavailable: a recovery implementation must
+not construct a replacement against the same dimension path. Quarantine is
+terminal until provider support can either complete/aggregate every owned close
+or expose a durable, generation-owned proof that no old writer remains. If
+closing a hypothetical fresh instance itself throws, it remains uncertain and
+must be separately quarantined with its generation and cause; an attempted
+close is not evidence of release.
+
 ## Resource and mutation ledger required before implementation
 
 Pinned call sites establish why recovery cannot simply create another level:
@@ -58,10 +89,10 @@ The future recovery operation therefore needs a durable per-generation ledger:
 | Phase | Mutation | failure handling |
 | --- | --- | --- |
 | `QUARANTINED` | old instance removed from active map; descriptor retained | do not close/reinsert it again; deny all lifecycle/data operations |
-| `FRESH_INSTANCE` | construct a new level only after proving the old instance is no longer active and no storage handle is reusable | constructor failure closes any newly allocated resource, preserves quarantine, emits `FAILED_RECOVERY` |
-| `STEM_TYPE_REGISTERED` | register stem/type | failure unregisters only entries created by this generation, closes fresh instance, retains quarantine |
-| `MEMBER_REGISTERED` | add dynamic membership and active map, then establish one initial tick-ready state | failure removes this generation's map/member entries before close; no stale instance may tick |
-| `CLIENT_NOTIFIED` | send add/update notifications per recipient with an acknowledgement/compensation ledger | packet failure is non-atomic: remove fresh active state, close it, send best-effort compensating remove to recipients already notified, retain quarantine and report `FAILED_RECOVERY` |
+| `FRESH_INSTANCE` | unavailable on the pinned provider: construction requires a provider-issued proof that every old writer is released | without that proof do not construct; preserve quarantine and report recovery unsupported |
+| `STEM_TYPE_REGISTERED` | future provider support may register stem/type after the release proof | failure unregisters only entries created by this generation; a throwing fresh close quarantines the fresh generation rather than claiming release |
+| `MEMBER_REGISTERED` | future provider support may add dynamic membership and active map, then establish one initial tick-ready state | failure removes this generation's map/member entries before close; no stale instance may tick |
+| `CLIENT_NOTIFIED` | future provider support may send add/update notifications per recipient with an acknowledgement/compensation ledger | packet failure is non-atomic: remove fresh active state, close it, send best-effort compensating remove to recipients already notified; if close throws, quarantine the fresh generation and report `FAILED_RECOVERY` |
 | `RECOVERED_READY` | publish only after identity/generation revalidation | any mismatch returns to quarantine; never report the old instance ready |
 
 Required controlled tests before a recovery implementation is considered: each
