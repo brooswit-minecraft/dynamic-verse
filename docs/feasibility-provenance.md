@@ -94,6 +94,32 @@ API; NORMAL and SUPERFLAT receive the save-wide seed. Supplied seed requests
 must remain fail-closed before filesystem/registry mutation
 (`ERR_PER_VERSE_SEED_UNSUPPORTED`), never substituted with the server seed.
 
+## Queued removal probe
+
+With no existing runner active, the pinned composite's isolated GameTest runner
+was executed on 2026-10-27:
+
+```sh
+JAVA_HOME=/tmp/temurin21 /tmp/gradle-8.14/bin/gradle :neoforge:runGameTest --no-daemon
+```
+
+The disposable run directory was
+`/tmp/dynamicdimensions-composite/neoforge/run`. It started a `GameTestServer`,
+ran six real DynamicDimensions tests, and exited `BUILD SUCCESSFUL` in 44
+seconds. The suite exercises create, deferred unload, delete, reload, and
+file-preservation paths; the terminal runner output reported all six required
+tests passed. This is evidence that the queued removal path can complete a
+normal save-and-close in this isolated environment.
+
+It is not a verified failure protocol. The pinned `MinecraftServerMixin`
+executes `level.save(null, true, level.noSave)` in a try-with-resources block,
+catches `IOException`, and then removes the level from the map in `finally`.
+The public `unloadDynamicDimension` boolean is therefore admission evidence,
+not an explicit terminal save/close result. No safe failure injection or
+source-state restoration hook is exposed by this provider; a snapshot copy or
+delete must remain prohibited until a provider adaptation supplies explicit
+success/failure completion and restoration semantics.
+
 ## Current capability boundary
 
 MINECRAFT-469 v5 remains authoritative: explicit independently seeded creation
