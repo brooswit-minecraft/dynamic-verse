@@ -32,6 +32,20 @@ fixture does not claim a public consumable artifact coordinate; the experiment
 must use this source pin or later record a verified artifact repository and
 coordinate.
 
+### Source-route build result
+
+On 2026-10-27, the pinned checkout was invoked with:
+
+```sh
+JAVA_HOME=/path/to/jdk-21 gradle :neoforge:build --no-daemon
+```
+
+It failed before compiling DynamicDimensions because Gradle could not resolve
+the upstream plugin `dev.galacticraft.mojarn:dev.galacticraft.mojarn.gradle.plugin:0.6.1+19` from the Gradle Plugin Portal, Maven Central, Galacticraft's
+declared Maven repository, Fabric Maven, or NeoForged Maven. This is a source
+route dependency/publication hold, not evidence that the library provides or
+lacks independently seeded levels or verified save-and-close completion.
+
 ## Current capability boundary
 
 MINECRAFT-469 v5 remains authoritative: explicit independently seeded creation
