@@ -41,3 +41,31 @@ This requires a separately reviewed provider implementation and controlled
 real-provider validation. Until then, `QUARANTINED` remains terminally
 unavailable, with no source-restoration claim. Explicit per-verse seed remains
 `ERR_PER_VERSE_SEED_UNSUPPORTED` and no copy/delete admission is opened.
+
+## Resource and mutation ledger required before implementation
+
+Pinned call sites establish why recovery cannot simply create another level:
+`MinecraftServerMixin.unloadLevel` uses `try (ServerLevel level = ...)`, so
+`ServerLevel.close()` owns resources that can fail after partial release;
+`DynamicDimensionRegistryImpl.createDynamicLevel` builds a new level from the
+storage source, level stem, and world data. A second construction while the old
+resource ownership is uncertain could create concurrent writers for the same
+dimension path. There is no pinned public close-state query, reopen method, or
+atomic registry/client transaction.
+
+The future recovery operation therefore needs a durable per-generation ledger:
+
+| Phase | Mutation | failure handling |
+| --- | --- | --- |
+| `QUARANTINED` | old instance removed from active map; descriptor retained | do not close/reinsert it again; deny all lifecycle/data operations |
+| `FRESH_INSTANCE` | construct a new level only after proving the old instance is no longer active and no storage handle is reusable | constructor failure closes any newly allocated resource, preserves quarantine, emits `FAILED_RECOVERY` |
+| `STEM_TYPE_REGISTERED` | register stem/type | failure unregisters only entries created by this generation, closes fresh instance, retains quarantine |
+| `MEMBER_REGISTERED` | add dynamic membership and active map, then establish one initial tick-ready state | failure removes this generation's map/member entries before close; no stale instance may tick |
+| `CLIENT_NOTIFIED` | send add/update notifications per recipient with an acknowledgement/compensation ledger | packet failure is non-atomic: remove fresh active state, close it, send best-effort compensating remove to recipients already notified, retain quarantine and report `FAILED_RECOVERY` |
+| `RECOVERED_READY` | publish only after identity/generation revalidation | any mismatch returns to quarantine; never report the old instance ready |
+
+Required controlled tests before a recovery implementation is considered: each
+failure phase above must leave no new active instance or registry entry, must
+close the fresh instance exactly once, retain the admitted descriptor and
+generation, and preserve initially-unloaded descriptors as unloaded. This is a
+protocol specification only; it grants no runtime recovery operation.
