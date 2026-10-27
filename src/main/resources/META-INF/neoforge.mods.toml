@@ -1,0 +1,11 @@
+modLoader="javafml"
+loaderVersion="[4,)"
+license="MIT"
+
+[[mods]]
+modId="dynamicverse"
+version="0.0.1-feasibility"
+displayName="Dynamic Verse"
+description='''
+Isolated NeoForge 1.21.1 feasibility fixture for Dynamic Verse lifecycle research.
+'''

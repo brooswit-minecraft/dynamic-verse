@@ -1,0 +1,41 @@
+plugins {
+    id "net.neoforged.moddev" version "2.0.146"
+}
+
+group = "io.github.brooswitminecraft"
+version = "0.0.1-feasibility"
+
+base {
+    archivesName = "dynamic-verse"
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+neoForge {
+    // Pinned to DynamicDimensions' minecraft/1.21 source declaration.
+    version = "21.1.148"
+
+    mods {
+        dynamicverse {
+            sourceSet sourceSets.main
+        }
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    testImplementation platform("org.junit:junit-bom:5.11.4")
+    testImplementation "org.junit.jupiter:junit-jupiter"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+}
+
+test {
+    useJUnitPlatform()
+}
