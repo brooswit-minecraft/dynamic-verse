@@ -99,9 +99,10 @@ public final class NeoForgeVerseCommands {
             NeoForgeVerseTravelAdapter.ServerLevelResolver levels) throws CommandSyntaxException {
         ServerPlayer caller = context.getSource().getPlayerOrException();
         ServerPlayer target = EntityArgument.getPlayer(context, PLAYER);
+        // This must precede scheduling: server.execute may run inline in a fixture.
+        context.getSource().sendSuccess(() -> Component.literal("travel accepted/pending"), false);
         travel(context, lifecycle, levels).bringPlayer(
                 NeoForgeVerseTravelAdapter.player(caller), NeoForgeVerseTravelAdapter.player(target), sink(context));
-        context.getSource().sendSuccess(() -> Component.literal("travel accepted/pending"), false);
         return 1;
     }
 

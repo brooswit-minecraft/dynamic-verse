@@ -36,6 +36,7 @@ class VerseTravelServiceTest {
 
         assertNull(fixture.movedTo);
         assertEquals(VerseTravelService.TravelError.MOVE_FAILED, fixture.result.error);
+        assertEquals(0, fixture.result.moves);
         assertTrue(fixture.released);
     }
 
@@ -90,6 +91,20 @@ class VerseTravelServiceTest {
     }
 
     @Test
+    void bringDefersTerminalResultWithQueuedExecutor() {
+        Fixture fixture = new Fixture();
+        fixture.players.queueExecutions = true;
+
+        fixture.service.bringPlayer(fixture.caller, fixture.target, fixture.result);
+        assertEquals(0, fixture.result.moves);
+        assertNull(fixture.result.error);
+
+        fixture.players.runQueued();
+        assertEquals(1, fixture.result.moves);
+        assertNull(fixture.result.error);
+    }
+
+    @Test
     void pinnedTeleportValidationRejectsOutOfBoundsAndAllowsResolvedRelativeCoordinates() {
         assertTrue(!NeoForgeVerseTravelAdapter.isValidTeleportPosition(new VerseTravelService.Position(40_000_000, 64, 0)));
         // Vec3Argument resolves a relative literal before this boundary is applied.
@@ -128,10 +143,16 @@ class VerseTravelServiceTest {
 
     private static final class Players implements VerseTravelService.PlayerDirectory {
         private final Map<UUID, VerseTravelService.Player> online = new HashMap<>();
+        private Runnable queued;
+        boolean queueExecutions;
         Players(VerseTravelService.Player... players) { for (var player : players) online.put(player.id(), player); }
         void remove(UUID id) { online.remove(id); }
         @Override public VerseTravelService.Player online(UUID id) { return online.get(id); }
-        @Override public void runLater(Runnable continuation) { continuation.run(); }
+        @Override public void runLater(Runnable continuation) {
+            if (queueExecutions) queued = continuation;
+            else continuation.run();
+        }
+        void runQueued() { queued.run(); }
     }
 
     private static final class Result implements VerseTravelService.ResultSink {
