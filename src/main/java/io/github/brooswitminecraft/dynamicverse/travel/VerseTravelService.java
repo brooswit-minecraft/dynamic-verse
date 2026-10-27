@@ -43,7 +43,8 @@ public final class VerseTravelService {
                 movement.bring(currentTarget, currentCaller);
                 result.moved();
             } catch (RuntimeException failure) {
-                result.failed(TravelError.MOVE_FAILED);
+                result.failed(failure instanceof InvalidCoordinatesException
+                        ? TravelError.INVALID_COORDINATES : TravelError.MOVE_FAILED);
             }
         });
     }
@@ -75,7 +76,8 @@ public final class VerseTravelService {
             movement.move(currentTarget, requested, lease);
             terminal.movedAfterBegin();
         } catch (RuntimeException failure) {
-            terminal.failedAfterBegin(TravelError.MOVE_FAILED);
+            terminal.failedAfterBegin(failure instanceof InvalidCoordinatesException
+                    ? TravelError.INVALID_COORDINATES : TravelError.MOVE_FAILED);
         } finally {
             lease.close();
         }
@@ -123,6 +125,10 @@ public final class VerseTravelService {
         VERSE_LIFECYCLE_PENDING,
         VERSE_DESTINATION_CHANGED,
         PLAYER_NOT_FOUND,
-        MOVE_FAILED
+        MOVE_FAILED,
+        INVALID_COORDINATES
     }
+
+    /** Raised by a concrete movement adapter before a teleport reaches Minecraft. */
+    public static final class InvalidCoordinatesException extends RuntimeException { }
 }

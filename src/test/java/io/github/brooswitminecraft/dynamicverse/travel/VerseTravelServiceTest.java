@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.brooswitminecraft.dynamicverse.travel.VerseTravelService;
+import io.github.brooswitminecraft.dynamicverse.travel.NeoForgeVerseTravelAdapter;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -86,6 +87,13 @@ class VerseTravelServiceTest {
         assertEquals(fixture.caller.position(), fixture.movedTo);
         assertNull(fixture.movedLease);
         assertEquals(1, fixture.result.moves);
+    }
+
+    @Test
+    void pinnedTeleportValidationRejectsOutOfBoundsAndAllowsResolvedRelativeCoordinates() {
+        assertTrue(!NeoForgeVerseTravelAdapter.isValidTeleportPosition(new VerseTravelService.Position(40_000_000, 64, 0)));
+        // Vec3Argument resolves a relative literal before this boundary is applied.
+        assertTrue(NeoForgeVerseTravelAdapter.isValidTeleportPosition(new VerseTravelService.Position(13.5, 70, -8.25)));
     }
 
     private static final class Fixture {
