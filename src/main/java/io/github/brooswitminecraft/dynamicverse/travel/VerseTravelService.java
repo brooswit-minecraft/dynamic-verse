@@ -20,12 +20,12 @@ public final class VerseTravelService {
         this.movement = Objects.requireNonNull(movement);
     }
 
-    public void teleportCaller(Player caller, String verseName, Position requested, ResultSink result) {
-        scheduleVerseTravel(caller, verseName, requested, result);
+    public VerseReservationSnapshot teleportCaller(Player caller, String verseName, Position requested, ResultSink result) {
+        return scheduleVerseTravel(caller, verseName, requested, result);
     }
 
-    public void sendPlayer(Player target, String verseName, Position requested, ResultSink result) {
-        scheduleVerseTravel(target, verseName, requested, result);
+    public VerseReservationSnapshot sendPlayer(Player target, String verseName, Position requested, ResultSink result) {
+        return scheduleVerseTravel(target, verseName, requested, result);
     }
 
     /** Moves the named player to the caller's current position; no verse lease is involved. */
@@ -40,7 +40,7 @@ public final class VerseTravelService {
                 return;
             }
             try {
-                movement.move(currentTarget, currentCaller.position(), null);
+                movement.bring(currentTarget, currentCaller);
                 result.moved();
             } catch (RuntimeException failure) {
                 result.failed(TravelError.MOVE_FAILED);
@@ -48,10 +48,10 @@ public final class VerseTravelService {
         });
     }
 
-    private void scheduleVerseTravel(Player initialTarget, String verseName, Position requested, ResultSink result) {
+    private VerseReservationSnapshot scheduleVerseTravel(Player initialTarget, String verseName, Position requested, ResultSink result) {
         UUID targetId = initialTarget.id();
         TerminalResult terminal = new TerminalResult(result);
-        verses.beginAcquireReadyRead(verseName, snapshot -> completeVerseTravel(snapshot, targetId, requested, terminal));
+        return verses.beginAcquireReadyRead(verseName, snapshot -> completeVerseTravel(snapshot, targetId, requested, terminal));
     }
 
     private void completeVerseTravel(
@@ -107,6 +107,7 @@ public final class VerseTravelService {
     public interface Movement {
         /** A null lease denotes caller-to-caller travel for bring; null position means verse spawn. */
         void move(Player target, Position requested, ReadyVerseLease lease);
+        default void bring(Player target, Player caller) { move(target, caller.position(), null); }
     }
 
     public interface ResultSink {
