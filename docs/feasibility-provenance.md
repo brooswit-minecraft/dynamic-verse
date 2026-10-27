@@ -46,6 +46,35 @@ declared Maven repository, Fabric Maven, or NeoForged Maven. This is a source
 route dependency/publication hold, not evidence that the library provides or
 lacks independently seeded levels or verified save-and-close completion.
 
+### Local composite-build candidate
+
+The previous source-route hold has a reproducible, **local-only** candidate
+route. On 2026-10-27, a separate disposable checkout of the DynamicDimensions
+pin was configured with this addition to `pluginManagement`:
+
+```kotlin
+includeBuild("/tmp/mojarn-source")
+```
+
+`/tmp/mojarn-source` was an official TeamGalacticraft/mojarn checkout pinned
+to `beb2addf7ec99a398b6a243cdcec73f4f33f6b01`. That source declares plugin ID
+`dev.galacticraft.mojarn` and version `0.6.1`; its local build suffix is `+0`.
+It is **not** claimed equivalent to the unresolved historical `0.6.1+19`
+publication.
+
+With a full JDK 21, the disposable composite command below completed
+successfully (14 tasks, 10m25s):
+
+```sh
+JAVA_HOME=/path/to/jdk-21 gradle :neoforge:build --no-daemon
+```
+
+Nothing was published or installed to a global Maven cache, and the original
+DynamicDimensions checkout was not modified. This establishes only a supported
+Gradle included-build source route for a future isolated integration test. It
+does not prove independent NORMAL/SUPERFLAT seeds, forced save-and-close
+completion, copy safety, or source restoration.
+
 ## Current capability boundary
 
 MINECRAFT-469 v5 remains authoritative: explicit independently seeded creation
