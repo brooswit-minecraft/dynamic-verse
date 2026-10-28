@@ -25,6 +25,7 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.OptionalLong;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -51,6 +52,20 @@ public final class ProviderBridgeIntegrationGameTest {
         DynamicDimensionProperties sourceProperties = properties();
         ServerLevel original = requireNonNull(registry.createDynamicDimension(SOURCE_ID,
                 server.overworld().getChunkSource().getGenerator(), freshType(), sourceProperties), "source create");
+        helper.runAfterDelay(1, () -> awaitRegistration(helper, server, sourceKey, destinationKey, sourcePath, destinationPath,
+                original, sourceProperties, 0));
+    }
+
+    private static void awaitRegistration(GameTestHelper helper, MinecraftServer server, ResourceKey<Level> sourceKey,
+                                          ResourceKey<Level> destinationKey, Path sourcePath, Path destinationPath,
+                                          ServerLevel original, DynamicDimensionProperties sourceProperties, int waited) {
+        if (server.getLevel(sourceKey) != original) {
+            if (waited >= 40) throw new AssertionError("created source did not register as its returned instance");
+            helper.runAfterDelay(1, () -> awaitRegistration(helper, server, sourceKey, destinationKey, sourcePath, destinationPath,
+                    original, sourceProperties, waited + 1));
+            return;
+        }
+        require(original.dimension().equals(sourceKey) && original.players().isEmpty(), "registered source key/players");
         original.setBlock(MARKER, Blocks.REDSTONE_LAMP.defaultBlockState(), 3);
 
         OwnedDimensionDescriptor source = new OwnedDimensionDescriptor(sourceKey, original.getChunkSource().getGenerator(),
@@ -61,35 +76,63 @@ public final class ProviderBridgeIntegrationGameTest {
         catalog.register(source);
         catalog.register(destination);
         VerseOperationGate gate = new VerseOperationGate();
-        ProviderDuplicationBridge bridge = ProviderDuplicationBridge.forMinecraftServer(server, catalog, gate);
-        bridge.registerReady(source.id(), identity(original), 1);
+        AtomicReference<Path> markerRegion = new AtomicReference<>();
+        ClosedDimensionCopier productionCopier = new ClosedDimensionCopier();
+        ClosedDimensionCopyPort observingCopier = (request, receipt, fence) -> {
+            productionCopier.copy(request, receipt, fence);
+            require(gate.tryAcquireReadyRead(source.id()) == null, "source read released before copied-data observation");
+            Path relative = Path.of("region", "r.0.0.mca");
+            Path copiedSource = request.storageRoot().resolve(request.sourceRelative()).resolve(relative);
+            Path copiedDestination = request.storageRoot().resolve(request.destinationRelative()).resolve(relative);
+            require(Files.isRegularFile(copiedSource, LinkOption.NOFOLLOW_LINKS), "saved marker region source file");
+            require(Files.isRegularFile(copiedDestination, LinkOption.NOFOLLOW_LINKS), "saved marker region destination file");
+            try {
+                require(Files.mismatch(copiedSource, copiedDestination) == -1L, "marker-bearing region copied byte-for-byte");
+            } catch (java.io.IOException e) {
+                throw new ClosedDimensionCopyException("marker-bearing region comparison failed", e);
+            }
+            markerRegion.set(relative);
+        };
+        ProviderDuplicationBridge bridge = new ProviderDuplicationBridge(catalog, gate, new MinecraftProviderDuplicationPort(server),
+                new MinecraftDimensionStoragePathResolver(server, catalog), observingCopier);
+        try {
+            bridge.registerReady(source.id(), identity(original), 1);
 
-        AtomicReference<ProviderDuplicationBridge.BridgeOutcome> completion = new AtomicReference<>();
-        require(bridge.beginDuplicate(source.id(), destination.id(), completion::set)
-                == ProviderDuplicationBridge.BridgeAdmission.ADMITTED, "provider close admission");
-        require(gate.tryAcquireReadyRead(source.id()) == null, "source read must close at admission");
-        helper.runAfterDelay(1, () -> awaitTerminal(helper, server, gate, source, destination, original, sourcePath, destinationPath, completion, 0));
+            AtomicReference<ProviderDuplicationBridge.BridgeOutcome> completion = new AtomicReference<>();
+            AtomicInteger completionCount = new AtomicInteger();
+            require(bridge.beginDuplicate(source.id(), destination.id(), outcome -> { completion.set(outcome); completionCount.incrementAndGet(); })
+                    == ProviderDuplicationBridge.BridgeAdmission.ADMITTED, "provider close admission");
+            require(gate.tryAcquireReadyRead(source.id()) == null, "source read must close at admission");
+            helper.runAfterDelay(1, () -> awaitTerminal(helper, server, gate, source, destination, original, sourcePath, destinationPath,
+                    completion, completionCount, markerRegion, 0));
+        } catch (ClosedDimensionCopyException e) {
+            throw new AssertionError("provider bridge refused owned fixture", e);
+        }
     }
 
     private static void awaitTerminal(GameTestHelper helper, MinecraftServer server, VerseOperationGate gate,
                                       OwnedDimensionDescriptor source, OwnedDimensionDescriptor destination, ServerLevel original,
                                       Path sourcePath, Path destinationPath,
-                                      AtomicReference<ProviderDuplicationBridge.BridgeOutcome> completion, int waited) {
+                                      AtomicReference<ProviderDuplicationBridge.BridgeOutcome> completion, AtomicInteger completionCount,
+                                      AtomicReference<Path> markerRegion, int waited) {
         if (completion.get() == null) {
             if (waited >= 120) throw new AssertionError("provider close did not publish a terminal outcome");
-            helper.runAfterDelay(1, () -> awaitTerminal(helper, server, gate, source, destination, original, sourcePath, destinationPath, completion, waited + 1));
+            helper.runAfterDelay(1, () -> awaitTerminal(helper, server, gate, source, destination, original, sourcePath, destinationPath,
+                    completion, completionCount, markerRegion, waited + 1));
             return;
         }
-        require(completion.get() == ProviderDuplicationBridge.BridgeOutcome.RESTORED, "successful close/copy/restore outcome");
+        require(completion.get() == ProviderDuplicationBridge.BridgeOutcome.RESTORED && completionCount.get() == 1,
+                "one successful close/copy/restore outcome");
         ServerLevel restored = requireNonNull(server.getLevel(source.key()), "restored source level");
         require(restored != original, "restoration must produce a new source instance");
         require(restored.getBlockState(MARKER).is(Blocks.REDSTONE_LAMP), "persisted source marker");
         VerseOperationGate.ReadyRead ready = gate.tryAcquireReadyRead(source.id());
-        require(ready != null && ready.identity().equals(identity(restored)), "restored identity/readiness");
-        ready.close();
+        try { require(ready != null && ready.identity().equals(identity(restored)), "restored identity/readiness"); }
+        finally { if (ready != null) ready.close(); }
         require(server.getLevel(destination.key()) == null, "destination remains unloaded");
-        require(Files.isDirectory(destinationPath, LinkOption.NOFOLLOW_LINKS), "copied destination directory");
-        require(Files.isDirectory(destinationPath.resolve("region"), LinkOption.NOFOLLOW_LINKS), "copied destination region data");
+        require(gate.tryAcquireReadyRead(destination.id()) == null, "destination remains unreadable");
+        require(markerRegion.get() != null && Files.isRegularFile(destinationPath.resolve(markerRegion.get()), LinkOption.NOFOLLOW_LINKS),
+                "observed copied marker region");
         require(Files.isDirectory(sourcePath, LinkOption.NOFOLLOW_LINKS), "source directory retained");
         helper.succeed();
     }

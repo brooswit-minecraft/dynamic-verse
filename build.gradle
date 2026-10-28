@@ -47,6 +47,8 @@ repositories {
 }
 
 def dynamicDimensionsJar = layout.projectDirectory.file("local-artifacts/dynamicdimensions-neoforge.jar")
+// Must be built from the accepted 04341e14 provider source; do not substitute the older local artifact.
+def acceptedDynamicDimensionsJar = file("/tmp/dynamicdimensions-composite/neoforge/build/libs/dynamicdimensions-neoforge-0.10.0+04341e14-dirty.jar")
 // 04341e14 classes include the reviewed close API; the older local jar intentionally remains untouched.
 def reviewedDynamicDimensionsClasses = file("/tmp/dynamicdimensions-composite/neoforge/build/classes/java/main")
 def dynamicDimensionsSha256 = "b25aefb589ae1c8635679373230d536c6c77bd21942f65d0f9765436e5046d79"
@@ -59,7 +61,7 @@ dependencies {
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
     bridgeGameTestAdditionalRuntimeClasspath files(reviewedDynamicDimensionsClasses)
     // The provider integration run deliberately uses the reviewed mod artifact, including its mixin metadata.
-    providerBridgeGameTestAdditionalRuntimeClasspath files(dynamicDimensionsJar)
+    providerBridgeGameTestAdditionalRuntimeClasspath files(acceptedDynamicDimensionsJar)
     providerBridgeGameTestAdditionalRuntimeClasspath "lol.bai:badpackets:neo-0.8.2"
 }
 
