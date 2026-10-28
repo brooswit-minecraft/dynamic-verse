@@ -56,11 +56,13 @@ neoForge {
         register("bridgeGameTest") {
             type = "gameTestServer"
             // Isolated disposable run state; do not point this at an existing world.
-            gameDirectory = layout.projectDirectory.dir("run/bridgeGameTest-controlled-observation")
+            gameDirectory = layout.projectDirectory.dir("run/bridgeGameTest-controlled-observation-minecraft")
             // Test output carries the compiled facade cases and its main runtime
             // dependency; the dynamicverse mod mapping below includes both outputs.
             sourceSet = sourceSets.test
-            systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
+            // Explicit template namespaces override @GameTestHolder, so include
+            // both the Dynamic Verse and vanilla-template controlled fixtures.
+            systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse,minecraft"
         }
         register("providerBridgeGameTest") {
             type = "gameTestServer"
