@@ -40,6 +40,16 @@ class ClosedDimensionCopierTest {
     }
 
     @Test
+    void rejectsEmptyMappingsBeforeDestinationClaim() throws Exception {
+        sourceWithNestedMarker();
+        assertThrows(ClosedDimensionCopyException.class, () -> new ClosedDimensionCopier().copy(
+                new ClosedDimensionCopyRequest(temporary, Path.of(""), Path.of("destination"), "source", 1), success(1), fence()));
+        assertThrows(ClosedDimensionCopyException.class, () -> new ClosedDimensionCopier().copy(
+                new ClosedDimensionCopyRequest(temporary, Path.of("source"), Path.of(""), "source", 2), success(2), fence()));
+        assertFalse(Files.exists(temporary.resolve("destination")));
+    }
+
+    @Test
     void rejectsLinksAndSpecialFiles() throws Exception {
         Path source = sourceWithNestedMarker();
         Path target = temporary.resolve("outside");
@@ -89,6 +99,32 @@ class ClosedDimensionCopierTest {
         assertTrue(Files.isDirectory(temporary.resolve("destination")));
         assertTrue(released.get());
         assertEquals("marker", Files.readString(temporary.resolve("source/nested/marker.txt")));
+    }
+
+    @Test
+    void rejectsNullAndThrowingFenceBeforeDestinationClaim() throws Exception {
+        Path source = sourceWithNestedMarker();
+        ClosedDimensionCopier copier = new ClosedDimensionCopier();
+        assertThrows(ClosedDimensionCopyException.class, () -> copier.copy(request("source", "destination", 4), success(4),
+                (key, generation) -> null));
+        assertFalse(Files.exists(temporary.resolve("destination")));
+        assertThrows(ClosedDimensionCopyException.class, () -> copier.copy(request("source", "destination-two", 5), success(5),
+                (key, generation) -> { throw new IllegalStateException("fence"); }));
+        assertFalse(Files.exists(temporary.resolve("destination-two")));
+        assertEquals("marker", Files.readString(source.resolve("nested/marker.txt")));
+    }
+
+    @Test
+    void refusesInvalidDestinationParentWithoutChangingSource() throws Exception {
+        Path sourceParent = temporary.resolve("source-parent");
+        Files.createDirectory(sourceParent);
+        Path source = sourceParent.resolve("source");
+        Files.createDirectory(source);
+        Files.writeString(source.resolve("marker.txt"), "marker");
+        Files.writeString(temporary.resolve("not-a-directory"), "file");
+        assertThrows(ClosedDimensionCopyException.class, () -> new ClosedDimensionCopier().copy(
+                new ClosedDimensionCopyRequest(temporary, Path.of("source-parent/source"), Path.of("not-a-directory/destination"), "source", 6), success(6), fence()));
+        assertEquals("marker", Files.readString(source.resolve("marker.txt")));
     }
 
     @Test
