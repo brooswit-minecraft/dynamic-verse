@@ -23,7 +23,9 @@ public final class MinecraftProviderDuplicationPort implements ProviderDuplicati
     public boolean beginQuiesceAndClose(OwnedDimensionDescriptor source, Consumer<ProviderQuiesceCloseTerminal> terminal) {
         ServerLevel level = server.getLevel(source.key());
         if (level == null || !level.players().isEmpty()) return false;
-        return registry.beginQuiesceAndClose(source.key().location(), (MinecraftServer server, ServerPlayer player) -> { },
+        return registry.beginQuiesceAndClose(source.key().location(), (MinecraftServer server, ServerPlayer player) -> {
+                    throw new IllegalStateException("Populated source is unsupported by the empty-source-only duplication path");
+                },
                 result -> terminal.accept(map(result)));
     }
 
