@@ -4,10 +4,10 @@
 set -u
 
 workspace=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-run_root="$workspace/run/bridgeGameTest-controlled-observation-minecraft"
-expected_root="$workspace/run/bridgeGameTest-controlled-observation-minecraft"
+run_root="$workspace/run/bridgeGameTest-controlled-observation-parser-fix"
+expected_root="$workspace/run/bridgeGameTest-controlled-observation-parser-fix"
 generated="$workspace/build/moddev/runBridgeGameTest.sh"
-receipt="$workspace/build/moddev/bridgeGameTest-minecraft.original-exit"
+receipt="$workspace/build/moddev/bridgeGameTest-parser-fix.original-exit"
 
 if [[ ! -f "$generated" || ! -d "$run_root" || "$(readlink -f -- "$run_root")" != "$expected_root" ]]; then
   exit 125
