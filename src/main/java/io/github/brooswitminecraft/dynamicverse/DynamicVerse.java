@@ -19,6 +19,7 @@ import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseReservationSnapsh
 import io.github.brooswitminecraft.dynamicverse.travel.NeoForgeVerseCommands;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ProviderDuplicationBridgeGameTest;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ProviderBridgeIntegrationGameTest;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderCreateIntegrationGameTest;
 import java.util.List;
 import java.util.OptionalLong;
 import java.util.function.Consumer;
@@ -39,8 +40,10 @@ public final class DynamicVerse {
     }
 
     private void registerGameTests(RegisterGameTestsEvent event) {
-        event.register(Boolean.getBoolean("dynamicverse.providerBridgeIntegration")
-                ? ProviderBridgeIntegrationGameTest.class : ProviderDuplicationBridgeGameTest.class);
+        event.register(Boolean.getBoolean("dynamicverse.providerCreateIntegration")
+                ? ProviderCreateIntegrationGameTest.class
+                : Boolean.getBoolean("dynamicverse.providerBridgeIntegration")
+                        ? ProviderBridgeIntegrationGameTest.class : ProviderDuplicationBridgeGameTest.class);
     }
 
     private void serverStarting(ServerStartingEvent event) { runtime = ServerVerseRuntime.create(event.getServer()); }

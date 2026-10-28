@@ -72,6 +72,17 @@ neoForge {
             systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
             systemProperty "dynamicverse.providerBridgeIntegration", "true"
         }
+        register("providerCreateGameTest") {
+            type = "gameTestServer"
+            // Dedicated, disposable native-create fixture root. Preparation must
+            // create it fail-if-absent; never point a run at an existing world.
+            gameDirectory = layout.projectDirectory.dir("run/providerCreateGameTest-native-omitted-seed-create")
+            // Reuse the reviewed provider-enabled source set, but select only
+            // the native CreateGateway integration fixture below.
+            sourceSet = sourceSets.providerBridgeGameTest
+            systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
+            systemProperty "dynamicverse.providerCreateIntegration", "true"
+        }
     }
 }
 
