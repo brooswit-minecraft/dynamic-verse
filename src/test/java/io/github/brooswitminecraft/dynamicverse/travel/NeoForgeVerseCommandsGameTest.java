@@ -64,6 +64,12 @@ public final class NeoForgeVerseCommandsGameTest {
         RecordingSource feedback = new RecordingSource();
         ControlledLifecycle lifecycle = new ControlledLifecycle();
         NeoForgeVerseCommands.register(dispatcher, new PendingAccess(), lease -> helper.getLevel(), lifecycle);
+        com.mojang.brigadier.tree.CommandNode<CommandSourceStack> duplicate = dispatcher.getRoot().getChild("verse").getChild("duplicate");
+        com.mojang.brigadier.tree.CommandNode<CommandSourceStack> sourceNode = duplicate.getChild("source");
+        com.mojang.brigadier.tree.CommandNode<CommandSourceStack> nameNode = sourceNode.getChild("name");
+        helper.assertTrue(((com.mojang.brigadier.tree.ArgumentCommandNode<?, ?>) sourceNode).getType() instanceof com.mojang.brigadier.arguments.StringArgumentType
+                        && ((com.mojang.brigadier.tree.ArgumentCommandNode<?, ?>) nameNode).getType() instanceof com.mojang.brigadier.arguments.StringArgumentType,
+                "duplicate nodes must use the built-in serializable string argument type");
         CommandSourceStack operator = source(feedback, null, helper, 2);
         CommandSourceStack denied = source(feedback, null, helper, 1);
         expectRejected(() -> dispatcher.execute("verse list", denied), CommandSyntaxException.BUILT_IN_EXCEPTIONS.dispatcherUnknownCommand(), "lifecycle permission denial");

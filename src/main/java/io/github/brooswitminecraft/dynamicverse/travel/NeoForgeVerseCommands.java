@@ -1,8 +1,6 @@
 package io.github.brooswitminecraft.dynamicverse.travel;
 
 import com.mojang.brigadier.CommandDispatcher;
-import com.mojang.brigadier.StringReader;
-import com.mojang.brigadier.arguments.ArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.arguments.LongArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
@@ -92,14 +90,14 @@ public final class NeoForgeVerseCommands {
     }
 
     private static LiteralArgumentBuilder<CommandSourceStack> duplicate(VerseLifecycleCommandService lifecycle) {
-        return Commands.literal(DUPLICATE).then(Commands.argument(SOURCE, OwnedVerseNameArgument.INSTANCE)
-                .then(Commands.argument(NAME, OwnedVerseNameArgument.INSTANCE).executes(context -> {
+        return Commands.literal(DUPLICATE).then(Commands.argument(SOURCE, StringArgumentType.string())
+                .then(Commands.argument(NAME, StringArgumentType.string()).executes(context -> {
                     CommandSourceStack source = context.getSource();
                     boolean[] admitted = {false};
                     java.util.List<VerseLifecycleCommandService.DuplicateOutcome> early = new java.util.ArrayList<>();
                     java.util.concurrent.atomic.AtomicBoolean terminalOnce = new java.util.concurrent.atomic.AtomicBoolean();
                     VerseLifecycleCommandService.DuplicateAdmission result = lifecycle.beginDuplicate(
-                            context.getArgument(SOURCE, String.class), context.getArgument(NAME, String.class), outcome -> {
+                            ownedName(context, SOURCE), ownedName(context, NAME), outcome -> {
                                 if (!terminalOnce.compareAndSet(false, true)) return;
                                 if (admitted[0]) duplicateTerminal(source, outcome); else early.add(outcome);
                             });
@@ -207,18 +205,11 @@ public final class NeoForgeVerseCommands {
         return new VerseTravelService.Position(value.x, value.y, value.z);
     }
 
-    /** Preserves an owned command token; unlike ResourceLocationArgument it never defaults bare input to minecraft. */
-    private static final class OwnedVerseNameArgument implements ArgumentType<String> {
-        private static final OwnedVerseNameArgument INSTANCE = new OwnedVerseNameArgument();
-        private static final SimpleCommandExceptionType INVALID = new SimpleCommandExceptionType(() -> "Expected a Dynamic Verse name");
-        @Override public String parse(StringReader reader) throws CommandSyntaxException {
-            int start = reader.getCursor();
-            while (reader.canRead() && reader.peek() != ' ') reader.skip();
-            String value = reader.getString().substring(start, reader.getCursor());
-            if (!value.matches("[a-z0-9_-]{1,32}") && !value.matches("dynamicverse:[a-z0-9_-]{1,32}")) throw INVALID.createWithContext(reader);
-            return value;
-        }
-        @Override public java.util.Collection<String> getExamples() { return java.util.List.of("alpha", "dynamicverse:alpha"); }
+    /** Validates the built-in serialized string argument without defaulting a bare token to minecraft. */
+    private static String ownedName(CommandContext<CommandSourceStack> context, String argument) throws CommandSyntaxException {
+        String value = StringArgumentType.getString(context, argument);
+        if (value.matches("[a-z0-9_-]{1,32}") || value.matches("dynamicverse:[a-z0-9_-]{1,32}")) return value;
+        throw new SimpleCommandExceptionType(() -> "Expected a Dynamic Verse name").create();
     }
 
 }
