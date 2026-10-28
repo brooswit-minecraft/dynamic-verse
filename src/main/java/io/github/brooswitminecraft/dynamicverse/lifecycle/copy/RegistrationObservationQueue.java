@@ -9,8 +9,10 @@ import java.util.function.Consumer;
 final class RegistrationObservationQueue {
     private static final int MAX_OBSERVATION_TICKS = 40;
     private final List<Observation> observers = new ArrayList<>();
+    private boolean retired;
 
     synchronized void await(BooleanSupplier current, Consumer<Boolean> completion) {
+        if (retired) { completion.accept(false); return; }
         observers.add(new Observation(current, completion, MAX_OBSERVATION_TICKS));
     }
 
@@ -30,6 +32,17 @@ final class RegistrationObservationQueue {
     }
 
     synchronized int pendingCount() { return observers.size(); }
+
+    void retire() {
+        List<Completion> completed;
+        synchronized (this) {
+            if (retired) return;
+            retired = true;
+            completed = observers.stream().map(observer -> new Completion(observer.completion, false)).toList();
+            observers.clear();
+        }
+        completed.forEach(result -> result.completion.accept(result.current));
+    }
 
     private static final class Observation {
         private final BooleanSupplier current; private final Consumer<Boolean> completion; private int remaining;

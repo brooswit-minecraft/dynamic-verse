@@ -125,6 +125,12 @@ public final class ProviderDuplicationBridgeGameTest {
         throwingReplacedSource.provider.deliver(success(throwingReplacedSource.source.id(), 7));
         assertQuarantinedOnce(throwingReplacedSource, "source replaced before throwing destination load", 1, 1);
 
+        Scenario nullReplacedSource = admittedScenario(helper.getLevel());
+        nullReplacedSource.provider.replaceSourceDuringDestinationLoad = true;
+        nullReplacedSource.provider.nullDestinationLoad = true;
+        nullReplacedSource.provider.deliver(success(nullReplacedSource.source.id(), 7));
+        assertQuarantinedOnce(nullReplacedSource, "source replaced before null destination load", 1, 1);
+
         Scenario staleRestore = admittedScenario(helper.getLevel());
         staleRestore.provider.wrongRestoreGeneration = true;
         staleRestore.provider.deliver(success(staleRestore.source.id(), 7));
@@ -299,6 +305,7 @@ public final class ProviderDuplicationBridgeGameTest {
         private boolean sourceCurrent = true;
         private boolean replaceSourceDuringDestinationLoad;
         private boolean throwDestinationLoad;
+        private boolean nullDestinationLoad;
         private boolean delaySourceObservation;
         private boolean delayDestinationObservation;
         private java.util.function.Consumer<Boolean> pendingSourceObservation;
@@ -322,6 +329,7 @@ public final class ProviderDuplicationBridgeGameTest {
             destinationLoads.incrementAndGet();
             if (replaceSourceDuringDestinationLoad) sourceCurrent = false;
             if (throwDestinationLoad) throw new IllegalStateException("controlled destination load failure");
+            if (nullDestinationLoad) return null;
             return new LoadedDestination(foreignDestination ? new Object() : destinationInstance, "destination",
                     wrongDestinationGeneration ? generation + 1 : generation);
         }

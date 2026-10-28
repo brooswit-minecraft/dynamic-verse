@@ -7,6 +7,8 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.tick.ServerTickEvent;
+import net.neoforged.neoforge.event.server.ServerStoppingEvent;
+import net.neoforged.bus.api.SubscribeEvent;
 
 import java.util.Objects;
 import java.nio.file.Files;
@@ -18,11 +20,12 @@ public final class MinecraftProviderDuplicationPort implements ProviderDuplicati
     private final DynamicDimensionRegistry registry;
     private final MinecraftServer server;
     private final RegistrationObservationQueue observations = new RegistrationObservationQueue();
+    private final EventOwner eventOwner = new EventOwner();
 
     public MinecraftProviderDuplicationPort(MinecraftServer server) {
         this.server = Objects.requireNonNull(server);
         this.registry = DynamicDimensionRegistry.from(this.server);
-        NeoForge.EVENT_BUS.addListener(this::afterServerTick);
+        NeoForge.EVENT_BUS.register(eventOwner);
     }
 
     @Override
@@ -67,8 +70,18 @@ public final class MinecraftProviderDuplicationPort implements ProviderDuplicati
         observations.await(() -> isCurrent(descriptor, instance), completion);
     }
 
-    private void afterServerTick(ServerTickEvent.Post event) {
-        if (event.getServer() == server) observations.observeTick();
+    private final class EventOwner {
+        @SubscribeEvent
+        public void afterServerTick(ServerTickEvent.Post event) {
+            if (event.getServer() == server) observations.observeTick();
+        }
+        @SubscribeEvent
+        public void serverStopping(ServerStoppingEvent event) {
+            if (event.getServer() == server) {
+                observations.retire();
+                NeoForge.EVENT_BUS.unregister(this);
+            }
+        }
     }
 
     private static String identity(ServerLevel level) {
