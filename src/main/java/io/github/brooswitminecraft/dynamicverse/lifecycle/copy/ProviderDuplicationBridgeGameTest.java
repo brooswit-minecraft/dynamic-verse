@@ -4,6 +4,8 @@ import dev.galacticraft.dynamicdimensions.api.DynamicDimensionProperties;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseOperationGate;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ServerVerseRuntime;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseLifecycleCommandService;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.InMemoryManagedVerseStateStore;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.ManagedVerseStateStore;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.gametest.framework.GameTest;
 import net.minecraft.gametest.framework.GameTestHelper;
@@ -314,7 +316,31 @@ public final class ProviderDuplicationBridgeGameTest {
         helper.succeed();
     }
 
+    /** Compiled-only actual runtime store-fault boundary; no native provider call is permitted. */
+    @GameTest(templateNamespace = "dynamicverse", template = "empty")
+    @PrefixGameTestTemplate(false)
+    public void controlledRuntimeRejectsCreateWhenIntentCannotPersist(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        ControlledCreate create = new ControlledCreate(level);
+        ManagedVerseStateStore failing = new ManagedVerseStateStore() {
+            @Override public State read() { return State.empty(); }
+            @Override public void write(State state) { throw new IllegalStateException("controlled durable write failure"); }
+        };
+        ServerVerseRuntime runtime = controlledCreateRuntime(level, create, false, failing);
+        AtomicInteger callbacks = new AtomicInteger();
+        require(runtime.beginCreate("write-failure", VerseLifecycleCommandService.CreateType.NORMAL, java.util.OptionalLong.empty(), ignored -> callbacks.incrementAndGet())
+                        == VerseLifecycleCommandService.CreateAdmission.ERR_PROVIDER_UNAVAILABLE,
+                "create refuses before provider mutation when durable intent write fails");
+        require(create.creates.get() == 0 && callbacks.get() == 0 && runtime.listManaged().isEmpty(),
+                "no provider call, terminal claim, or READY publication follows failed pre-admission persistence");
+        runtime.close();
+        helper.succeed();
+    }
+
     private static ServerVerseRuntime controlledCreateRuntime(ServerLevel level, ControlledCreate create, boolean wrongSeed) {
+        return controlledCreateRuntime(level, create, wrongSeed, new InMemoryManagedVerseStateStore());
+    }
+    private static ServerVerseRuntime controlledCreateRuntime(ServerLevel level, ControlledCreate create, boolean wrongSeed, ManagedVerseStateStore state) {
         return ServerVerseRuntime.controlled(level.getServer(), descriptor -> create.visible && create.createdKeys.contains(descriptor.id()) ? new ServerVerseRuntime.CurrentLevelEvidence(descriptor.key(), level,
                         descriptor.generator(), descriptor.type(), descriptor.id() + "@" + Integer.toHexString(System.identityHashCode(level)),
                         wrongSeed ? level.getSeed() + 1 : level.getSeed()) : null,
@@ -324,7 +350,7 @@ public final class ProviderDuplicationBridgeGameTest {
                                                                                                java.util.function.Consumer<ProviderDuplicationBridge.BridgeOutcome> completion) {
                         return ProviderDuplicationBridge.BridgeAdmission.REJECTED;
                     }
-                }, create);
+                }, create, state);
     }
 
     private static Scenario admittedScenario(ServerLevel level) throws ClosedDimensionCopyException {
