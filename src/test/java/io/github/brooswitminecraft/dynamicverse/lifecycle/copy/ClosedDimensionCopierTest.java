@@ -6,6 +6,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -125,6 +126,37 @@ class ClosedDimensionCopierTest {
         assertThrows(ClosedDimensionCopyException.class, () -> new ClosedDimensionCopier().copy(
                 new ClosedDimensionCopyRequest(temporary, Path.of("source-parent/source"), Path.of("not-a-directory/destination"), "source", 6), success(6), fence()));
         assertEquals("marker", Files.readString(source.resolve("marker.txt")));
+    }
+
+    @Test
+    void closesNewlyOpenedStreamWhenPreviousStreamCloseFails() throws Exception {
+        record Handle(String name) { }
+        Handle root = new Handle("root");
+        Handle first = new Handle("first");
+        Handle next = new Handle("next");
+        AtomicBoolean rootClosed = new AtomicBoolean();
+        AtomicBoolean nextClosed = new AtomicBoolean();
+        BasicFileAttributes directory = Files.readAttributes(temporary, BasicFileAttributes.class);
+
+        ClosedDimensionCopier.DirectoryStreamOperations<Handle> operations = new ClosedDimensionCopier.DirectoryStreamOperations<>() {
+            @Override public BasicFileAttributes attributes(Handle ignored, Path entry) { return directory; }
+            @Override public Handle open(Handle directory, Path entry) {
+                if (directory == root && entry.toString().equals("first")) return first;
+                if (directory == first && entry.toString().equals("second")) return next;
+                throw new AssertionError("unexpected open");
+            }
+            @Override public void close(Handle directory) throws IOException {
+                if (directory == root) rootClosed.set(true);
+                if (directory == first) throw new IOException("previous close");
+                if (directory == next) nextClosed.set(true);
+            }
+        };
+
+        IOException failure = assertThrows(IOException.class,
+                () -> ClosedDimensionCopier.openParent(root, Path.of("first", "second", "leaf"), operations));
+        assertEquals("previous close", failure.getMessage());
+        assertTrue(nextClosed.get());
+        assertFalse(rootClosed.get());
     }
 
     @Test

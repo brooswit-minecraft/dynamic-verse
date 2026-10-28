@@ -89,9 +89,9 @@ public final class ClosedDimensionCopier {
                     throw new ClosedDimensionCopyException("Destination claim lost", e);
                 }
                 rejectLinkedAncestors(root, destination);
-                ParentHandle sourceParent = openParent(secureRoot, sourceRelative);
+                ParentHandle<SecureDirectoryStream<Path>> sourceParent = openParent(secureRoot, sourceRelative);
                 try {
-                    ParentHandle destinationParent = openParent(secureRoot, destinationRelative);
+                    ParentHandle<SecureDirectoryStream<Path>> destinationParent = openParent(secureRoot, destinationRelative);
                     try {
                         copyDirectory(sourceParent.stream(), sourceRelative.getFileName(), destinationParent.stream(), destinationRelative.getFileName(),
                                 destination, Path.of(""));
@@ -154,23 +154,52 @@ public final class ClosedDimensionCopier {
         }
     }
 
-    private static ParentHandle openParent(SecureDirectoryStream<Path> root, Path relative) throws IOException, ClosedDimensionCopyException {
-        SecureDirectoryStream<Path> current = root;
+    private static ParentHandle<SecureDirectoryStream<Path>> openParent(SecureDirectoryStream<Path> root, Path relative) throws IOException, ClosedDimensionCopyException {
+        return openParent(root, relative, new DirectoryStreamOperations<>() {
+            @Override public BasicFileAttributes attributes(SecureDirectoryStream<Path> directory, Path entry) throws IOException {
+                return ClosedDimensionCopier.attributes(directory, entry);
+            }
+            @Override public SecureDirectoryStream<Path> open(SecureDirectoryStream<Path> directory, Path entry) throws IOException {
+                return directory.newDirectoryStream(entry, LinkOption.NOFOLLOW_LINKS);
+            }
+            @Override public void close(SecureDirectoryStream<Path> directory) throws IOException { directory.close(); }
+        });
+    }
+
+    static <S> ParentHandle<S> openParent(S root, Path relative, DirectoryStreamOperations<S> operations) throws IOException, ClosedDimensionCopyException {
+        S current = root;
         boolean ownsCurrent = false;
         Path parent = relative.getParent();
-        if (parent == null) return new ParentHandle(root, false);
+        if (parent == null) return new ParentHandle<>(root, false);
         try {
             for (Path name : parent) {
-                BasicFileAttributes attrs = attributes(current, name);
+                BasicFileAttributes attrs = operations.attributes(current, name);
                 requireDirectory(attrs, name);
-                SecureDirectoryStream<Path> next = current.newDirectoryStream(name, LinkOption.NOFOLLOW_LINKS);
-                if (ownsCurrent) current.close();
+                S next = operations.open(current, name);
+                if (ownsCurrent) {
+                    try {
+                        operations.close(current);
+                    } catch (IOException handoffFailure) {
+                        try {
+                            operations.close(next);
+                        } catch (IOException cleanupFailure) {
+                            handoffFailure.addSuppressed(cleanupFailure);
+                        }
+                        throw handoffFailure;
+                    }
+                }
                 current = next;
                 ownsCurrent = true;
             }
-            return new ParentHandle(current, ownsCurrent);
+            return new ParentHandle<>(current, ownsCurrent);
         } catch (IOException | ClosedDimensionCopyException e) {
-            if (ownsCurrent) current.close();
+            if (ownsCurrent) {
+                try {
+                    operations.close(current);
+                } catch (IOException cleanupFailure) {
+                    e.addSuppressed(cleanupFailure);
+                }
+            }
             throw e;
         }
     }
@@ -217,7 +246,19 @@ public final class ClosedDimensionCopier {
 
     private record ReceiptId(String key, long generation) { }
 
-    private record ParentHandle(SecureDirectoryStream<Path> stream, boolean owned) implements AutoCloseable {
-        @Override public void close() throws IOException { if (owned) stream.close(); }
+    interface DirectoryStreamOperations<S> {
+        BasicFileAttributes attributes(S directory, Path entry) throws IOException;
+        S open(S directory, Path entry) throws IOException;
+        void close(S directory) throws IOException;
+    }
+
+    static final class ParentHandle<S> implements AutoCloseable {
+        private final S stream;
+        private final boolean owned;
+        ParentHandle(S stream, boolean owned) { this.stream = stream; this.owned = owned; }
+        S stream() { return stream; }
+        @Override public void close() throws IOException {
+            if (owned && stream instanceof SecureDirectoryStream<?> directory) directory.close();
+        }
     }
 }
