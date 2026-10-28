@@ -8,7 +8,6 @@ import io.netty.channel.embedded.EmbeddedChannel;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseAccessService;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseCompletionSink;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ReadyVerseLease;
-import io.github.brooswitminecraft.dynamicverse.lifecycle.ReadyVerseLeaseFixtures;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseReservationId;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseReservationSnapshot;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ManagedVerseListing;
@@ -104,10 +103,13 @@ public final class NeoForgeVerseCommandsGameTest {
     @GameTest(templateNamespace = "minecraft", template = "bastion/mobs/empty")
     public static void runtimeEnrollmentLeaseAndReservationBoundary(GameTestHelper helper) throws Exception {
         final boolean[] current = {true};
-        ServerVerseRuntime runtime = ServerVerseRuntime.controlled(helper.getLevel().getServer(), descriptor -> current[0] ? helper.getLevel() : null, gateway());
+        final AtomicInteger registrations = new AtomicInteger();
+        final AtomicInteger duplicateCallbacks = new AtomicInteger();
+        ServerVerseRuntime runtime = ServerVerseRuntime.controlled(helper.getLevel().getServer(), descriptor -> current[0] ? evidence(descriptor, helper) : null,
+                gateway(registrations, duplicateCallbacks, ProviderDuplicationBridge.BridgeAdmission.ADMITTED, ProviderDuplicationBridge.BridgeOutcome.RESTORED));
         OwnedDimensionDescriptor source = descriptor("source", helper);
         runtime.enrollVerifiedReady(source, 7L);
-        helper.assertTrue(runtime.listManaged().size() == 1 && runtime.listManaged().get(0).state() == ManagedVerseListing.State.READY, "validated enrollment publishes only READY source");
+        helper.assertTrue(registrations.get() == 1 && runtime.listManaged().size() == 1 && runtime.listManaged().get(0).state() == ManagedVerseListing.State.READY, "validated enrollment publishes exactly one READY source through the shared gate");
         final VerseReservationSnapshot[] terminal = new VerseReservationSnapshot[1];
         runtime.beginAcquireReadyRead(source.id(), result -> terminal[0] = result); runtime.tick();
         ReadyVerseLease lease = terminal[0].lease().orElseThrow();
@@ -118,18 +120,49 @@ public final class NeoForgeVerseCommandsGameTest {
         current[0] = false;
         final VerseReservationSnapshot[] stale = new VerseReservationSnapshot[1]; runtime.beginAcquireReadyRead(source.id(), result -> stale[0] = result); runtime.tick();
         helper.assertTrue(runtime.resolve(stale[0].lease().orElseThrow()) == null, "replaced/absent current instance is unavailable");
-        helper.assertTrue(runtime.beginDuplicate(source.id(), "dynamicverse:copy", ignored -> { }) == VerseLifecycleCommandService.DuplicateAdmission.ERR_VERSE_BUSY, "fresh descriptor reservation reaches controlled bridge admission");
+        final List<VerseLifecycleCommandService.DuplicateOutcome> outcomes = new ArrayList<>();
+        helper.assertTrue(runtime.beginDuplicate(source.id(), "dynamicverse:copy", outcomes::add) == VerseLifecycleCommandService.DuplicateAdmission.ADMITTED, "fresh descriptor reservation reaches controlled bridge admission");
+        runtime.tick();
+        helper.assertTrue(outcomes.equals(List.of(VerseLifecycleCommandService.DuplicateOutcome.RESTORED)) && duplicateCallbacks.get() == 1, "controlled terminal result is delivered exactly once");
         helper.assertTrue(runtime.listManaged().stream().anyMatch(item -> item.name().equals("dynamicverse:copy") && item.state() == ManagedVerseListing.State.PENDING), "reserved destination is never READY");
-        ServerVerseRuntime rejected = ServerVerseRuntime.controlled(helper.getLevel().getServer(), descriptor -> null, gateway());
+        ServerVerseRuntime rejected = ServerVerseRuntime.controlled(helper.getLevel().getServer(), descriptor -> null,
+                gateway(new AtomicInteger(), new AtomicInteger(), ProviderDuplicationBridge.BridgeAdmission.REJECTED, null));
         try { rejected.enrollVerifiedReady(descriptor("rejected", helper), 1); throw new AssertionError("forged enrollment accepted"); }
         catch (IllegalArgumentException expected) { helper.assertTrue(rejected.listManaged().isEmpty(), "rejected enrollment leaves no catalog mutation"); }
+        helper.assertTrue(!runtime.owns(new Object()), "a distinct server identity cannot access this runtime");
         helper.succeed();
     }
 
-    private static ServerVerseRuntime.BridgeGateway gateway() { return new ServerVerseRuntime.BridgeGateway() {
-        @Override public void registerReady(String key, String identity, long generation) { }
-        @Override public ProviderDuplicationBridge.BridgeAdmission beginDuplicate(String source, String destination, java.util.function.Consumer<ProviderDuplicationBridge.BridgeOutcome> completion) { return ProviderDuplicationBridge.BridgeAdmission.REJECTED; }
+    /** Compiled-only exact-once retirement evidence through the production facade. */
+    @GameTest(templateNamespace = "minecraft", template = "bastion/mobs/empty")
+    public static void runtimeRetiresAdmittedDuplicateExactlyOnce(GameTestHelper helper) throws Exception {
+        OwnedDimensionDescriptor source = descriptor("retire-source", helper);
+        ServerVerseRuntime runtime = ServerVerseRuntime.controlled(helper.getLevel().getServer(), descriptor -> evidence(descriptor, helper),
+                gateway(new AtomicInteger(), new AtomicInteger(), ProviderDuplicationBridge.BridgeAdmission.ADMITTED, null));
+        runtime.enrollVerifiedReady(source, 2L);
+        AtomicInteger completions = new AtomicInteger();
+        runtime.beginDuplicate(source.id(), "dynamicverse:retire-copy", outcome -> {
+            helper.assertTrue(outcome == VerseLifecycleCommandService.DuplicateOutcome.QUARANTINED, "runtime retirement quarantines one admitted duplicate");
+            completions.incrementAndGet();
+        });
+        runtime.close(); runtime.close();
+        helper.assertTrue(completions.get() == 1, "runtime retirement must not replay duplicate feedback");
+        helper.succeed();
+    }
+
+    private static ServerVerseRuntime.BridgeGateway gateway(AtomicInteger registrations, AtomicInteger callbacks,
+                                                              ProviderDuplicationBridge.BridgeAdmission admission,
+                                                              ProviderDuplicationBridge.BridgeOutcome terminal) { return new ServerVerseRuntime.BridgeGateway() {
+        @Override public void registerReady(String key, String identity, long generation) { registrations.incrementAndGet(); }
+        @Override public ProviderDuplicationBridge.BridgeAdmission beginDuplicate(String source, String destination, java.util.function.Consumer<ProviderDuplicationBridge.BridgeOutcome> completion) {
+            if (admission == ProviderDuplicationBridge.BridgeAdmission.ADMITTED && terminal != null) { callbacks.incrementAndGet(); completion.accept(terminal); }
+            return admission;
+        }
     }; }
+    private static ServerVerseRuntime.CurrentLevelEvidence evidence(OwnedDimensionDescriptor descriptor, GameTestHelper helper) {
+        return new ServerVerseRuntime.CurrentLevelEvidence(descriptor.key(), helper.getLevel(), descriptor.generator(), descriptor.type(), descriptor.properties(),
+                descriptor.id() + "@" + Integer.toHexString(System.identityHashCode(helper.getLevel())));
+    }
     private static OwnedDimensionDescriptor descriptor(String path, GameTestHelper helper) {
         return new OwnedDimensionDescriptor(ResourceKey.create(Registries.DIMENSION, ResourceLocation.fromNamespaceAndPath("dynamicverse", path)), helper.getLevel().getChunkSource().getGenerator(), helper.getLevel().dimensionType(), new DynamicDimensionProperties() {
             public int priority() { return 0; } public Vector3f baseGravity() { return new Vector3f(); } public double basePressure() { return 0; } public float universalDrag() { return 0; } public Vector3f magneticNorth() { return new Vector3f(); }
