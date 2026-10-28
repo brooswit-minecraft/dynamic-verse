@@ -14,6 +14,7 @@ import java.util.Objects;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.arguments.EntityArgument;
+import net.minecraft.commands.arguments.ResourceLocationArgument;
 import net.minecraft.commands.arguments.coordinates.Vec3Argument;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
@@ -90,8 +91,8 @@ public final class NeoForgeVerseCommands {
     }
 
     private static LiteralArgumentBuilder<CommandSourceStack> duplicate(VerseLifecycleCommandService lifecycle) {
-        return Commands.literal(DUPLICATE).then(Commands.argument(SOURCE, StringArgumentType.string())
-                .then(Commands.argument(NAME, StringArgumentType.string()).executes(context -> {
+        return Commands.literal(DUPLICATE).then(Commands.argument(SOURCE, ResourceLocationArgument.id())
+                .then(Commands.argument(NAME, ResourceLocationArgument.id()).executes(context -> {
                     CommandSourceStack source = context.getSource();
                     boolean[] admitted = {false};
                     java.util.List<VerseLifecycleCommandService.DuplicateOutcome> early = new java.util.ArrayList<>();
@@ -205,9 +206,10 @@ public final class NeoForgeVerseCommands {
         return new VerseTravelService.Position(value.x, value.y, value.z);
     }
 
-    /** Validates the built-in serialized string argument without defaulting a bare token to minecraft. */
+    /** Validates the raw token parsed by ResourceLocationArgument without forwarding its minecraft-defaulted value. */
     private static String ownedName(CommandContext<CommandSourceStack> context, String argument) throws CommandSyntaxException {
-        String value = StringArgumentType.getString(context, argument);
+        String value = context.getNodes().stream().filter(node -> node.getNode().getName().equals(argument)).findFirst()
+                .map(node -> node.getRange().get(context.getInput())).orElse("");
         if (value.matches("[a-z0-9_-]{1,32}") || value.matches("dynamicverse:[a-z0-9_-]{1,32}")) return value;
         throw new SimpleCommandExceptionType(() -> "Expected a Dynamic Verse name").create();
     }
