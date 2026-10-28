@@ -31,11 +31,19 @@ neoForge {
             gameDirectory = layout.projectDirectory.dir("run/bridgeGameTest")
             systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
         }
+        register("providerBridgeGameTest") {
+            type = "gameTestServer"
+            // Separate disposable root: this run activates the reviewed provider mod artifact.
+            gameDirectory = layout.projectDirectory.dir("run/providerBridgeGameTest")
+            systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
+            systemProperty "dynamicverse.providerBridgeIntegration", "true"
+        }
     }
 }
 
 repositories {
     mavenCentral()
+    maven { url = "https://maven.bai.lol" }
 }
 
 def dynamicDimensionsJar = layout.projectDirectory.file("local-artifacts/dynamicdimensions-neoforge.jar")
@@ -50,6 +58,9 @@ dependencies {
     testImplementation "org.junit.jupiter:junit-jupiter"
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
     bridgeGameTestAdditionalRuntimeClasspath files(reviewedDynamicDimensionsClasses)
+    // The provider integration run deliberately uses the reviewed mod artifact, including its mixin metadata.
+    providerBridgeGameTestAdditionalRuntimeClasspath files(dynamicDimensionsJar)
+    providerBridgeGameTestAdditionalRuntimeClasspath "lol.bai:badpackets:neo-0.8.2"
 }
 
 tasks.register("verifyLocalDynamicDimensionsArtifact") {

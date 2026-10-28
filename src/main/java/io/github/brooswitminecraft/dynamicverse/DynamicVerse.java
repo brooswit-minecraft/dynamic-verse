@@ -4,6 +4,7 @@ import net.neoforged.fml.common.Mod;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.neoforge.event.RegisterGameTestsEvent;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ProviderDuplicationBridgeGameTest;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ProviderBridgeIntegrationGameTest;
 
 /**
  * Isolated feasibility fixture only. No lifecycle operation is registered or
@@ -17,5 +18,8 @@ public final class DynamicVerse {
         modEventBus.addListener(this::registerGameTests);
     }
 
-    private void registerGameTests(RegisterGameTestsEvent event) { event.register(ProviderDuplicationBridgeGameTest.class); }
+    private void registerGameTests(RegisterGameTestsEvent event) {
+        event.register(Boolean.getBoolean("dynamicverse.providerBridgeIntegration")
+                ? ProviderBridgeIntegrationGameTest.class : ProviderDuplicationBridgeGameTest.class);
+    }
 }
