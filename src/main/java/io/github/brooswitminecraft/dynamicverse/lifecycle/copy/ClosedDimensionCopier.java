@@ -1,0 +1,202 @@
+package io.github.brooswitminecraft.dynamicverse.lifecycle.copy;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.SeekableByteChannel;
+import java.nio.file.DirectoryStream;
+import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.OpenOption;
+import java.nio.file.Path;
+import java.nio.file.SecureDirectoryStream;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.HashSet;
+import java.util.Objects;
+import java.util.Set;
+
+/**
+ * Production closed-dimension copier. It accepts only a provider-resolved,
+ * fenced successful close receipt and copies one exact dimension directory.
+ * It never deletes, replaces, loads, or retries a destination.
+ */
+public final class ClosedDimensionCopier {
+    @FunctionalInterface
+    interface CopyObserver { void beforeEntry(Path relative) throws IOException; }
+
+    private static final CopyObserver NO_OBSERVER = ignored -> { };
+    private final CopyObserver observer;
+    private final Set<ReceiptId> consumedReceipts = new HashSet<>();
+
+    public ClosedDimensionCopier() { this(NO_OBSERVER); }
+
+    ClosedDimensionCopier(CopyObserver observer) { this.observer = Objects.requireNonNull(observer); }
+
+    public synchronized void copy(ClosedDimensionCopyRequest request, ClosedDimensionReceipt receipt,
+                                  SourceWriteReloadFence fence) throws ClosedDimensionCopyException {
+        Objects.requireNonNull(request);
+        Objects.requireNonNull(fence);
+        if (receipt == null || !receipt.isExactSuccess(request.sourceKey(), request.generation())) {
+            throw new ClosedDimensionCopyException("Missing, wrong, or failed SAVED_AND_CLOSED receipt");
+        }
+        ReceiptId receiptId = new ReceiptId(receipt.sourceKey(), receipt.generation());
+        if (!consumedReceipts.add(receiptId)) {
+            throw new ClosedDimensionCopyException("Close generation was already consumed; automatic retry is prohibited");
+        }
+        try (SourceWriteReloadFence.Lease ignored = fence.retain(request.sourceKey(), request.generation())) {
+            this.copyFenced(request);
+        } catch (ClosedDimensionCopyException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            throw new ClosedDimensionCopyException("Copy fence failed", e);
+        }
+    }
+
+    private void copyFenced(ClosedDimensionCopyRequest request) throws ClosedDimensionCopyException {
+        try {
+            Path root = checkedRoot(request.storageRoot());
+            Path sourceRelative = checkedRelative(request.sourceRelative());
+            Path destinationRelative = checkedRelative(request.destinationRelative());
+            if (sourceRelative.equals(destinationRelative) || sourceRelative.startsWith(destinationRelative)
+                    || destinationRelative.startsWith(sourceRelative)) {
+                throw new ClosedDimensionCopyException("Source and destination overlap");
+            }
+            Path source = root.resolve(sourceRelative).normalize();
+            Path destination = root.resolve(destinationRelative).normalize();
+            if (!source.startsWith(root) || !destination.startsWith(root)) throw new ClosedDimensionCopyException("Storage mapping escaped root");
+            rejectLinkedAncestors(root, source.getParent());
+            rejectLinkedAncestors(root, destination.getParent());
+            if (!Files.isDirectory(source, LinkOption.NOFOLLOW_LINKS)) throw new ClosedDimensionCopyException("Source is not an exact directory");
+            if (Files.exists(destination, LinkOption.NOFOLLOW_LINKS)) throw new ClosedDimensionCopyException("Destination already exists");
+
+            DirectoryStream<Path> rootStream = Files.newDirectoryStream(root);
+            if (!(rootStream instanceof SecureDirectoryStream<Path>)) {
+                rootStream.close();
+                throw new ClosedDimensionCopyException("Filesystem lacks SecureDirectoryStream; path-substitution guarantees unavailable");
+            }
+            try (SecureDirectoryStream<Path> secureRoot = (SecureDirectoryStream<Path>) rootStream) {
+                try {
+                    Files.createDirectory(destination); // CREATE_NEW directory claim; never replacement.
+                } catch (FileAlreadyExistsException e) {
+                    throw new ClosedDimensionCopyException("Destination claim lost", e);
+                }
+                rejectLinkedAncestors(root, destination);
+                SecureDirectoryStream<Path> sourceParent = openParent(secureRoot, sourceRelative);
+                SecureDirectoryStream<Path> destinationParent = openParent(secureRoot, destinationRelative);
+                try {
+                    copyDirectory(sourceParent, sourceRelative.getFileName(), destinationParent, destinationRelative.getFileName(),
+                            destination, Path.of(""));
+                } finally {
+                    if (sourceParent != secureRoot) sourceParent.close();
+                    if (destinationParent != secureRoot) destinationParent.close();
+                }
+            }
+        } catch (ClosedDimensionCopyException e) {
+            throw e;
+        } catch (IOException e) {
+            throw new ClosedDimensionCopyException("Copy failed; partial destination remains unavailable", e);
+        }
+    }
+
+    private void copyDirectory(SecureDirectoryStream<Path> sourceParent, Path sourceName,
+                               SecureDirectoryStream<Path> destinationParent, Path destinationName,
+                               Path destinationFull, Path relative) throws IOException, ClosedDimensionCopyException {
+        BasicFileAttributes sourceAttributes = attributes(sourceParent, sourceName);
+        requireDirectory(sourceAttributes, relative);
+        try (SecureDirectoryStream<Path> source = sourceParent.newDirectoryStream(sourceName, LinkOption.NOFOLLOW_LINKS);
+             SecureDirectoryStream<Path> destination = destinationParent.newDirectoryStream(destinationName, LinkOption.NOFOLLOW_LINKS)) {
+            for (Path child : source) {
+                Path name = child.getFileName();
+                if (name == null || name.getNameCount() != 1) throw new ClosedDimensionCopyException("Unsafe directory entry");
+                Path childRelative = relative.resolve(name);
+                BasicFileAttributes attributes = attributes(source, name);
+                rejectLinkOrSpecial(attributes, childRelative);
+                observer.beforeEntry(childRelative);
+                if (attributes.isDirectory()) {
+                    // The destination stream is authoritative for all file I/O; mkdir is CREATE_NEW then reopened NOFOLLOW.
+                    Path childDestination = destinationFull.resolve(name).normalize();
+                    Files.createDirectory(childDestination);
+                    copyDirectory(source, name, destination, name, childDestination, childRelative);
+                } else if (attributes.isRegularFile()) {
+                    copyFile(source, name, destination, name, childRelative);
+                } else {
+                    throw new ClosedDimensionCopyException("Special file rejected: " + childRelative);
+                }
+            }
+        }
+    }
+
+    private void copyFile(SecureDirectoryStream<Path> source, Path sourceName,
+                          SecureDirectoryStream<Path> destination, Path destinationName,
+                          Path relative) throws IOException, ClosedDimensionCopyException {
+        try (SeekableByteChannel in = source.newByteChannel(sourceName, Set.of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS));
+             SeekableByteChannel out = destination.newByteChannel(destinationName,
+                     Set.<OpenOption>of(StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW, LinkOption.NOFOLLOW_LINKS))) {
+            ByteBuffer buffer = ByteBuffer.allocate(8192);
+            while (in.read(buffer) >= 0) {
+                buffer.flip();
+                while (buffer.hasRemaining()) out.write(buffer);
+                buffer.clear();
+            }
+        } catch (FileAlreadyExistsException e) {
+            throw new ClosedDimensionCopyException("Destination entry already exists: " + relative, e);
+        }
+    }
+
+    private static SecureDirectoryStream<Path> openParent(SecureDirectoryStream<Path> root, Path relative) throws IOException, ClosedDimensionCopyException {
+        SecureDirectoryStream<Path> current = root;
+        Path parent = relative.getParent();
+        if (parent == null) return current;
+        for (Path name : parent) {
+            BasicFileAttributes attrs = attributes(current, name);
+            requireDirectory(attrs, name);
+            SecureDirectoryStream<Path> next = current.newDirectoryStream(name, LinkOption.NOFOLLOW_LINKS);
+            if (current != root) current.close();
+            current = next;
+        }
+        return current;
+    }
+
+    private static BasicFileAttributes attributes(SecureDirectoryStream<Path> directory, Path entry) throws IOException {
+        return directory.getFileAttributeView(entry, java.nio.file.attribute.BasicFileAttributeView.class,
+                LinkOption.NOFOLLOW_LINKS).readAttributes();
+    }
+
+    private static void requireDirectory(BasicFileAttributes attributes, Path entry) throws ClosedDimensionCopyException {
+        rejectLinkOrSpecial(attributes, entry);
+        if (!attributes.isDirectory()) throw new ClosedDimensionCopyException("Expected directory: " + entry);
+    }
+
+    private static void rejectLinkOrSpecial(BasicFileAttributes attributes, Path entry) throws ClosedDimensionCopyException {
+        if (attributes.isSymbolicLink() || attributes.isOther()) throw new ClosedDimensionCopyException("Link or special file rejected: " + entry);
+    }
+
+    private static Path checkedRoot(Path root) throws IOException, ClosedDimensionCopyException {
+        Path absolute = root.toAbsolutePath().normalize();
+        rejectLinkedAncestors(absolute.getRoot(), absolute);
+        if (!Files.isDirectory(absolute, LinkOption.NOFOLLOW_LINKS)) throw new ClosedDimensionCopyException("Storage root is not a directory");
+        return absolute;
+    }
+
+    private static Path checkedRelative(Path relative) throws ClosedDimensionCopyException {
+        if (relative.isAbsolute() || relative.getNameCount() == 0 || !relative.normalize().equals(relative)) {
+            throw new ClosedDimensionCopyException("Storage mapping must be a normalized relative path");
+        }
+        for (Path name : relative) if (name.toString().equals(".") || name.toString().equals("..")) {
+            throw new ClosedDimensionCopyException("Traversal in storage mapping");
+        }
+        return relative;
+    }
+
+    private static void rejectLinkedAncestors(Path root, Path candidate) throws IOException, ClosedDimensionCopyException {
+        Path current = candidate.toAbsolutePath().normalize();
+        while (current != null) {
+            if (Files.isSymbolicLink(current)) throw new ClosedDimensionCopyException("Linked root or ancestor rejected: " + current);
+            if (root != null && current.equals(root.toAbsolutePath().normalize())) return;
+            current = current.getParent();
+        }
+    }
+
+    private record ReceiptId(String key, long generation) { }
+}
