@@ -67,19 +67,26 @@ public final class ProviderDuplicationBridge {
 
     private void finish(OwnedDimensionDescriptor source, String destinationKey, VerseOperationGate.Operation operation,
                         ProviderQuiesceCloseTerminal terminal, Consumer<BridgeOutcome> completion) {
-        if (terminal == null || !operation.claimTerminal(terminal.generation())) {
-            return;
-        }
-        ClosedDimensionDuplicationIntent intent = new ClosedDimensionDuplicationIntent(source.id(), destinationKey, terminal.generation());
-        ClosedDimensionDuplicationResult copied = coordinator.duplicate(intent, terminal, operation.copierFence());
-        if (copied.outcome() != ClosedDimensionDuplicationResult.Outcome.COPIED || !provider.loadOriginalSource(source)) {
+        long generation = terminal == null ? Long.MIN_VALUE : terminal.generation();
+        if (!operation.claimTerminal(generation)) return;
+        BridgeOutcome outcome = BridgeOutcome.QUARANTINED;
+        try {
+            if (terminal != null) {
+                ClosedDimensionDuplicationIntent intent = new ClosedDimensionDuplicationIntent(source.id(), destinationKey, terminal.generation());
+                ClosedDimensionDuplicationResult copied = coordinator.duplicate(intent, terminal, operation.copierFence());
+                if (copied.outcome() == ClosedDimensionDuplicationResult.Outcome.COPIED) {
+                    ProviderDuplicationPort.RestoredSource restored = provider.loadOriginalSource(source, terminal.generation());
+                    if (restored != null && restored.instanceIdentity() != null && !restored.instanceIdentity().isBlank()) {
+                        operation.restored(restored.instanceIdentity(), restored.generation());
+                        outcome = BridgeOutcome.RESTORED;
+                    }
+                }
+            }
+        } catch (RuntimeException ignored) {
+        } finally {
             operation.close();
-            completion.accept(BridgeOutcome.QUARANTINED);
-            return;
+            try { completion.accept(outcome); } catch (RuntimeException ignored) { }
         }
-        operation.restored();
-        operation.close();
-        completion.accept(BridgeOutcome.RESTORED);
     }
 
     public enum BridgeAdmission { ADMITTED, REJECTED }

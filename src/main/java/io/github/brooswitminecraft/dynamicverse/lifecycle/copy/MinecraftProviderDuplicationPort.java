@@ -12,21 +12,25 @@ import java.util.function.Consumer;
 /** Actual pinned-provider adapter. It uses only DynamicDimensionRegistry's public close/load methods. */
 public final class MinecraftProviderDuplicationPort implements ProviderDuplicationPort {
     private final DynamicDimensionRegistry registry;
+    private final MinecraftServer server;
 
     public MinecraftProviderDuplicationPort(MinecraftServer server) {
-        this.registry = DynamicDimensionRegistry.from(Objects.requireNonNull(server));
+        this.server = Objects.requireNonNull(server);
+        this.registry = DynamicDimensionRegistry.from(this.server);
     }
 
     @Override
     public boolean beginQuiesceAndClose(OwnedDimensionDescriptor source, Consumer<ProviderQuiesceCloseTerminal> terminal) {
+        ServerLevel level = server.getLevel(source.key());
+        if (level == null || !level.players().isEmpty()) return false;
         return registry.beginQuiesceAndClose(source.key().location(), (MinecraftServer server, ServerPlayer player) -> { },
                 result -> terminal.accept(map(result)));
     }
 
     @Override
-    public boolean loadOriginalSource(OwnedDimensionDescriptor source) {
+    public RestoredSource loadOriginalSource(OwnedDimensionDescriptor source, long restorationGeneration) {
         ServerLevel restored = registry.loadDynamicDimension(source.key().location(), source.generator(), source.type(), source.properties());
-        return restored != null;
+        return restored == null ? null : new RestoredSource(source.id() + "@" + Integer.toHexString(System.identityHashCode(restored)), restorationGeneration);
     }
 
     private static ProviderQuiesceCloseTerminal map(QuiesceAndCloseResult result) {

@@ -15,7 +15,7 @@ public final class VerseOperationGate {
 
     public synchronized void publishReady(String key, String identity, long generation) {
         Entry entry = entries.computeIfAbsent(key, ignored -> new Entry());
-        if (entry.operating) throw new IllegalStateException("Cannot publish while lifecycle operation is active: " + key);
+        if (entry.operating || entry.reads != 0 || entry.quarantined) throw new IllegalStateException("Cannot replace active or quarantined ready state: " + key);
         entry.identity = Objects.requireNonNull(identity);
         entry.generation = generation;
         entry.ready = true;
@@ -56,8 +56,8 @@ public final class VerseOperationGate {
     public final class Operation implements AutoCloseable {
         private final String source;
         private final String destination;
-        private final String sourceIdentity;
-        private final long sourceGeneration;
+        private String sourceIdentity;
+        private long sourceGeneration;
         private Long terminalGeneration;
         private boolean restored;
         private boolean closed;
@@ -77,7 +77,7 @@ public final class VerseOperationGate {
                 return () -> { }; // sublease ends, while Operation remains exclusive through restoration.
             }};
         }
-        public synchronized void restored() { restored = true; }
+        public synchronized void restored(String identity, long generation) { sourceIdentity = Objects.requireNonNull(identity); sourceGeneration = generation; restored = true; }
         /** Admission was refused before any provider close ticket existed. */
         public synchronized void admissionRefused() { restored = true; }
         @Override public void close() { synchronized (VerseOperationGate.this) {

@@ -25,11 +25,12 @@ class VerseOperationGateTest {
         sublease.close();
         assertNull(gate.tryAcquireReadyRead("source"), "copier sublease close must not open a pre-restoration window");
 
-        operation.restored();
+        operation.restored("restored-instance", 31);
         operation.close();
         VerseOperationGate.ReadyRead read = gate.tryAcquireReadyRead("source");
         assertNotNull(read);
-        assertEquals("source-instance", read.identity());
+        assertEquals("restored-instance", read.identity());
+        assertEquals(31, read.generation());
         read.close();
     }
 
@@ -59,5 +60,18 @@ class VerseOperationGateTest {
         ReadyVerseLease lease = terminal.get().lease().orElseThrow();
         assertEquals("source-instance", lease.levelIdentity());
         lease.close();
+    }
+
+    @Test
+    void heldReadBlocksReplacementAndQuarantineCannotBeRepublished() {
+        VerseOperationGate gate = new VerseOperationGate();
+        gate.publishReady("source", "first", 1);
+        VerseOperationGate.ReadyRead read = gate.tryAcquireReadyRead("source");
+        try {
+            org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, () -> gate.publishReady("source", "replacement", 2));
+        } finally { read.close(); }
+        VerseOperationGate.Operation operation = gate.beginOperation("source", "destination");
+        operation.close();
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, () -> gate.publishReady("source", "recovered", 3));
     }
 }
