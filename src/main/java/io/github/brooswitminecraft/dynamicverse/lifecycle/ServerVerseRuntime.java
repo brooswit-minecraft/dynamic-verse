@@ -25,7 +25,7 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
     private final GatedVerseAccessService access;
     private final Queue<Runnable> terminalFeedback = new ArrayDeque<>();
     private final Set<Consumer<DuplicateOutcome>> admittedCompletions = new LinkedHashSet<>();
-    private final ProviderDuplicationBridge bridge;
+    private final BridgeGateway bridge;
     private final String providerUnavailable;
     private boolean closed;
 
@@ -35,13 +35,20 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
             OwnedDimensionCatalog catalog = new OwnedDimensionCatalog();
             VerseOperationGate gate = new VerseOperationGate();
             ProviderDuplicationBridge bridge = ProviderDuplicationBridge.forMinecraftServer(server, catalog, gate);
-            return new ServerVerseRuntime(server, bridge, null, catalog, gate);
+            return new ServerVerseRuntime(server, new BridgeGateway() {
+                @Override public void registerReady(String key, String identity, long generation) throws ClosedDimensionCopyException { bridge.registerReady(key, identity, generation); }
+                @Override public ProviderDuplicationBridge.BridgeAdmission beginDuplicate(String source, String destination, Consumer<ProviderDuplicationBridge.BridgeOutcome> completion) throws ClosedDimensionCopyException { return bridge.beginDuplicate(source, destination, completion); }
+            }, null, catalog, gate);
         } catch (LinkageError | RuntimeException unavailable) {
             return new ServerVerseRuntime(server, null, unavailable.getClass().getSimpleName(), new OwnedDimensionCatalog(), new VerseOperationGate());
         }
     }
 
-    private ServerVerseRuntime(MinecraftServer server, ProviderDuplicationBridge bridge, String providerUnavailable,
+    public static ServerVerseRuntime controlled(MinecraftServer server, BridgeGateway bridge) {
+        return new ServerVerseRuntime(server, bridge, null, new OwnedDimensionCatalog(), new VerseOperationGate());
+    }
+
+    private ServerVerseRuntime(MinecraftServer server, BridgeGateway bridge, String providerUnavailable,
                                OwnedDimensionCatalog catalog, VerseOperationGate gate) {
         this.server = Objects.requireNonNull(server); this.bridge = bridge; this.providerUnavailable = providerUnavailable;
         this.catalog = catalog; this.gate = gate; this.access = new GatedVerseAccessService(gate);
@@ -118,6 +125,10 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         }
     }
     private static String identity(ServerLevel level) { return level.dimension().location() + "@" + Integer.toHexString(System.identityHashCode(level)); }
+    public interface BridgeGateway {
+        void registerReady(String key, String identity, long generation) throws ClosedDimensionCopyException;
+        ProviderDuplicationBridge.BridgeAdmission beginDuplicate(String source, String destination, Consumer<ProviderDuplicationBridge.BridgeOutcome> completion) throws ClosedDimensionCopyException;
+    }
     private static DuplicateOutcome map(ProviderDuplicationBridge.BridgeOutcome outcome) {
         return switch (outcome) { case LOADED -> DuplicateOutcome.LOADED; case RESTORED -> DuplicateOutcome.RESTORED; case QUARANTINED -> DuplicateOutcome.QUARANTINED; };
     }
