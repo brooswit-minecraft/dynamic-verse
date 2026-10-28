@@ -16,6 +16,14 @@ import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseLifecycleCommandS
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ServerVerseRuntime;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ProviderDuplicationBridge;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ClosedDimensionCopyException;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.OwnedDimensionDescriptor;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.ReadyVerseLeaseFixtures;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.world.level.Level;
+import dev.galacticraft.dynamicdimensions.api.DynamicDimensionProperties;
+import org.joml.Vector3f;
 import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.List;
@@ -90,6 +98,42 @@ public final class NeoForgeVerseCommandsGameTest {
         helper.assertTrue(completions.get() == 2, "post-close acquire must refuse immediately");
         helper.assertTrue(runtime.listManaged().isEmpty(), "rejected enrollment cannot publish catalog state");
         helper.succeed();
+    }
+
+    /** Compiled-only production-facade identity cases; lookup is controlled, no level lifecycle call occurs. */
+    @GameTest(templateNamespace = "minecraft", template = "bastion/mobs/empty")
+    public static void runtimeEnrollmentLeaseAndReservationBoundary(GameTestHelper helper) throws Exception {
+        final boolean[] current = {true};
+        ServerVerseRuntime runtime = ServerVerseRuntime.controlled(helper.getLevel().getServer(), descriptor -> current[0] ? helper.getLevel() : null, gateway());
+        OwnedDimensionDescriptor source = descriptor("source", helper);
+        runtime.enrollVerifiedReady(source, 7L);
+        helper.assertTrue(runtime.listManaged().size() == 1 && runtime.listManaged().get(0).state() == ManagedVerseListing.State.READY, "validated enrollment publishes only READY source");
+        final VerseReservationSnapshot[] terminal = new VerseReservationSnapshot[1];
+        runtime.beginAcquireReadyRead(source.id(), result -> terminal[0] = result); runtime.tick();
+        ReadyVerseLease lease = terminal[0].lease().orElseThrow();
+        helper.assertTrue(runtime.resolve(lease) == helper.getLevel(), "live owned matching lease resolves current instance");
+        lease.close(); helper.assertTrue(runtime.resolve(lease) == null, "closed lease is unavailable");
+        ReadyVerseLease foreign = ReadyVerseLeaseFixtures.acquired(source.id(), helper.getLevel().dimension().location()+"@foreign", 7L, VerseReservationId.newId(), () -> { });
+        helper.assertTrue(runtime.resolve(foreign) == null, "foreign lease is unavailable");
+        current[0] = false;
+        final VerseReservationSnapshot[] stale = new VerseReservationSnapshot[1]; runtime.beginAcquireReadyRead(source.id(), result -> stale[0] = result); runtime.tick();
+        helper.assertTrue(runtime.resolve(stale[0].lease().orElseThrow()) == null, "replaced/absent current instance is unavailable");
+        helper.assertTrue(runtime.beginDuplicate(source.id(), "dynamicverse:copy", ignored -> { }) == VerseLifecycleCommandService.DuplicateAdmission.ERR_VERSE_BUSY, "fresh descriptor reservation reaches controlled bridge admission");
+        helper.assertTrue(runtime.listManaged().stream().anyMatch(item -> item.name().equals("dynamicverse:copy") && item.state() == ManagedVerseListing.State.PENDING), "reserved destination is never READY");
+        ServerVerseRuntime rejected = ServerVerseRuntime.controlled(helper.getLevel().getServer(), descriptor -> null, gateway());
+        try { rejected.enrollVerifiedReady(descriptor("rejected", helper), 1); throw new AssertionError("forged enrollment accepted"); }
+        catch (IllegalArgumentException expected) { helper.assertTrue(rejected.listManaged().isEmpty(), "rejected enrollment leaves no catalog mutation"); }
+        helper.succeed();
+    }
+
+    private static ServerVerseRuntime.BridgeGateway gateway() { return new ServerVerseRuntime.BridgeGateway() {
+        @Override public void registerReady(String key, String identity, long generation) { }
+        @Override public ProviderDuplicationBridge.BridgeAdmission beginDuplicate(String source, String destination, java.util.function.Consumer<ProviderDuplicationBridge.BridgeOutcome> completion) { return ProviderDuplicationBridge.BridgeAdmission.REJECTED; }
+    }; }
+    private static OwnedDimensionDescriptor descriptor(String path, GameTestHelper helper) {
+        return new OwnedDimensionDescriptor(ResourceKey.create(Registries.DIMENSION, ResourceLocation.fromNamespaceAndPath("dynamicverse", path)), helper.getLevel().getChunkSource().getGenerator(), helper.getLevel().dimensionType(), new DynamicDimensionProperties() {
+            public int priority() { return 0; } public Vector3f baseGravity() { return new Vector3f(); } public double basePressure() { return 0; } public float universalDrag() { return 0; } public Vector3f magneticNorth() { return new Vector3f(); }
+        });
     }
 
     // This exact pinned-Minecraft template exists at data/minecraft/structure/bastion/mobs/empty.nbt.

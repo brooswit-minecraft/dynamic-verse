@@ -85,6 +85,8 @@ def dynamicDimensionsSha256 = "b25aefb589ae1c8635679373230d536c6c77bd21942f65d0f
 dependencies {
     // Compile against the reviewed, pinned provider API; it is never bundled or published by this fixture.
     compileOnly files(reviewedDynamicDimensionsClasses)
+    // Compiled-only controlled facade GameTests construct the production descriptor; never a runtime provider activation.
+    testCompileOnly files(reviewedDynamicDimensionsClasses)
     // Already pinned by the NeoForge/Minecraft toolchain; needed by the no-server Brigadier JUnit harness.
     testImplementation "com.mojang:brigadier:1.3.10"
     testImplementation platform("org.junit:junit-bom:5.11.4")
