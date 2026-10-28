@@ -30,6 +30,33 @@ class ClosedDimensionDuplicationCoordinatorTest {
     }
 
     @Test
+    void exactSuccessPredicateRejectsWrongGenerationInitiallyUnloadedAndFailureMarkedTerminal() {
+        RecordingCopier copier = new RecordingCopier(false);
+        ClosedDimensionDuplicationCoordinator coordinator = coordinator(copier, this::request);
+        ClosedDimensionDuplicationIntent intent = intent(11);
+
+        assertRejected(coordinator.duplicate(intent, terminal("source", 12, true, ClosedDimensionStatus.SAVED_AND_CLOSED, false)));
+        assertRejected(coordinator.duplicate(intent, terminal("source", 11, false, ClosedDimensionStatus.SAVED_AND_CLOSED, false)));
+        assertRejected(coordinator.duplicate(intent, terminal("source", 11, true, ClosedDimensionStatus.SAVED_AND_CLOSED, true)));
+        assertEquals(0, copier.calls.get());
+    }
+
+    @Test
+    void resolverIdentityMismatchAndDifferentGenerationForClaimedDestinationNeverReachCopy() {
+        RecordingCopier mismatchCopier = new RecordingCopier(false);
+        ClosedDimensionDuplicationCoordinator mismatch = coordinator(mismatchCopier,
+                intent -> new ClosedDimensionCopyRequest(temporary, Path.of("source"), Path.of("destination"), "other", intent.generation()));
+        assertUnavailable(mismatch.duplicate(intent(13), success(13)));
+        assertEquals(0, mismatchCopier.calls.get());
+
+        RecordingCopier claimedCopier = new RecordingCopier(false);
+        ClosedDimensionDuplicationCoordinator claimed = coordinator(claimedCopier, this::request);
+        assertCopied(claimed.duplicate(intent(14), success(14)));
+        assertRejected(claimed.duplicate(intent(15), success(15)));
+        assertEquals(1, claimedCopier.calls.get());
+    }
+
+    @Test
     void unsupportedMappingAndFenceRefusalLeaveNoMutationAndMarkDestinationUnavailable() throws Exception {
         Path source = source();
         AtomicInteger calls = new AtomicInteger();
@@ -84,11 +111,16 @@ class ClosedDimensionDuplicationCoordinatorTest {
     }
 
     private static ProviderQuiesceCloseTerminal success(long generation) {
-        return terminal("source", generation, ClosedDimensionStatus.SAVED_AND_CLOSED, false);
+        return terminal("source", generation, true, ClosedDimensionStatus.SAVED_AND_CLOSED, false);
     }
 
     private static ProviderQuiesceCloseTerminal terminal(String key, long generation, ClosedDimensionStatus status, boolean failure) {
-        return new ProviderQuiesceCloseTerminal(key, generation, true, status, failure);
+        return terminal(key, generation, true, status, failure);
+    }
+
+    private static ProviderQuiesceCloseTerminal terminal(String key, long generation, boolean initiallyLoaded,
+                                                          ClosedDimensionStatus status, boolean failure) {
+        return new ProviderQuiesceCloseTerminal(key, generation, initiallyLoaded, status, failure);
     }
 
     private static void assertRejected(ClosedDimensionDuplicationResult result) {
