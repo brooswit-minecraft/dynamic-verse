@@ -46,7 +46,7 @@ neoForge {
         register("providerBridgeGameTest") {
             type = "gameTestServer"
             // Reserved fresh root for the reviewed top-level-save-adapter candidate; never reuse a prior root.
-            gameDirectory = layout.projectDirectory.dir("run/providerBridgeGameTest-top-level-save-adapter")
+            gameDirectory = layout.projectDirectory.dir("run/providerBridgeGameTest-destination-load-integration")
             sourceSet = sourceSets.providerBridgeGameTest
             systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
             systemProperty "dynamicverse.providerBridgeIntegration", "true"
