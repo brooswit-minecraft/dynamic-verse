@@ -42,6 +42,11 @@ public final class VerseTravelCommandExecutor<S> {
     }
 
     private int fail(S source, VerseTravelService.TravelError error) { context.failure(source, "travel failed: " + error); return 0; }
+    private VerseTravelService.ResultSink sink(S source) { return new VerseTravelService.ResultSink() {
+        @Override public void moved() { context.success(source, "travel moved"); }
+        @Override public void failed(VerseTravelService.TravelError error) { context.failure(source, "travel failed: " + error); }
+    }; }
+
     /** Buffers an inline terminal callback until the reservation receipt has been published. */
     private final class PendingFirstResultSink implements VerseTravelService.ResultSink {
         private final S source;
