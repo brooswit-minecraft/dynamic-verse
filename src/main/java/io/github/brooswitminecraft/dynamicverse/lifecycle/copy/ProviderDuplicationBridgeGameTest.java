@@ -16,7 +16,7 @@ import java.util.function.Consumer;
 
 /** Source-only ModDev GameTest harness; do not execute without serialized runtime approval. */
 public final class ProviderDuplicationBridgeGameTest {
-    @GameTest(template = "empty")
+    @GameTest(template = "dynamicverse:empty")
     public void controlledBridgeCallback(GameTestHelper helper) throws Exception {
         ServerLevel level = helper.getLevel();
         OwnedDimensionCatalog catalog = new OwnedDimensionCatalog();

@@ -27,7 +27,7 @@ neoForge {
     runs {
         register("bridgeGameTest") {
             type = "gameTestServer"
-            systemProperty "neoforge.enabledGameTestNamespaces", "minecraft"
+            systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
         }
     }
 }
