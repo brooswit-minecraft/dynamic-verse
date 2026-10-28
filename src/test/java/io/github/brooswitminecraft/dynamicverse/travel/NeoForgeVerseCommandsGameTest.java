@@ -78,12 +78,17 @@ public final class NeoForgeVerseCommandsGameTest {
         }
         dispatcher.execute("verse duplicate dynamicverse:alpha dynamicverse:copy", operator);
         helper.assertTrue(feedback.successes.equals(List.of("duplicate accepted/pending")), "admission must not claim terminal success");
+        helper.assertTrue(lifecycle.source.equals("dynamicverse:alpha") && lifecycle.destination.equals("dynamicverse:copy"), "explicit owned names must reach lifecycle unchanged");
         lifecycle.complete(VerseLifecycleCommandService.DuplicateOutcome.LOADED);
         lifecycle.complete(VerseLifecycleCommandService.DuplicateOutcome.QUARANTINED);
         helper.assertTrue(feedback.successes.equals(List.of("duplicate accepted/pending", "duplicate loaded")), "terminal feedback must be exactly once");
         feedback.clear(); lifecycle.admission = VerseLifecycleCommandService.DuplicateAdmission.ERR_PROVIDER_UNAVAILABLE;
         dispatcher.execute("verse duplicate dynamicverse:alpha dynamicverse:copy", operator);
         helper.assertTrue(feedback.successes.equals(List.of("duplicate failed: ERR_PROVIDER_UNAVAILABLE")), "unavailable provider must fail closed without a pending claim");
+        feedback.clear(); lifecycle.admission = VerseLifecycleCommandService.DuplicateAdmission.ADMITTED;
+        dispatcher.execute("verse duplicate alpha copy", operator);
+        helper.assertTrue(lifecycle.source.equals("alpha") && lifecycle.destination.equals("copy")
+                && feedback.successes.equals(List.of("duplicate accepted/pending")), "bare owned names must reach the same lifecycle service unchanged");
         helper.succeed();
     }
 
@@ -439,8 +444,10 @@ public final class NeoForgeVerseCommandsGameTest {
         private java.util.function.Consumer<DuplicateOutcome> completion;
         private DuplicateAdmission admission = DuplicateAdmission.ADMITTED;
         private int admissions;
+        private String source;
+        private String destination;
         @Override public DuplicateAdmission beginDuplicate(String source, String destination, java.util.function.Consumer<DuplicateOutcome> callback) {
-            admissions++; completion = callback; return admission;
+            admissions++; this.source = source; this.destination = destination; completion = callback; return admission;
         }
         @Override public CreateAdmission beginCreate(String name, CreateType type, java.util.OptionalLong seed,
                                                       java.util.function.Consumer<CreateOutcome> callback) {
