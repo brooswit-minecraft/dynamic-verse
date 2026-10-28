@@ -34,6 +34,23 @@ neoForge {
     mods {
         dynamicverse {
             sourceSet sourceSets.main
+            sourceSet sourceSets.test
+        }
+    }
+
+    unitTest {
+        enable()
+        testedMod = mods.dynamicverse
+    }
+
+    // Source-only preparation for the serialized GameTest server validation gate.
+    runs {
+        gameTestServer {
+            type = "gameTestServer"
+            gameDirectory = project.file("run/gametest")
+            // This test's explicit template namespace is minecraft for the pinned vanilla empty template.
+            // Project source scan finds no other GameTest registration, so this does not broaden this project suite.
+            systemProperty "neoforge.enabledGameTestNamespaces", "minecraft"
         }
     }
     runs {
@@ -69,6 +86,8 @@ def dynamicDimensionsSha256 = "b25aefb589ae1c8635679373230d536c6c77bd21942f65d0f
 dependencies {
     // Compile against the reviewed, pinned provider API; it is never bundled or published by this fixture.
     compileOnly files(reviewedDynamicDimensionsClasses)
+    // Already pinned by the NeoForge/Minecraft toolchain; needed by the no-server Brigadier JUnit harness.
+    testImplementation "com.mojang:brigadier:1.3.10"
     testImplementation platform("org.junit:junit-bom:5.11.4")
     testImplementation "org.junit.jupiter:junit-jupiter"
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
