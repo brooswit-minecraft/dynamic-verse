@@ -125,6 +125,7 @@ public final class VerseTravelService {
         VERSE_LIFECYCLE_PENDING,
         VERSE_DESTINATION_CHANGED,
         PLAYER_NOT_FOUND,
+        SOURCE_REQUIRES_PLAYER,
         MOVE_FAILED,
         INVALID_COORDINATES
     }

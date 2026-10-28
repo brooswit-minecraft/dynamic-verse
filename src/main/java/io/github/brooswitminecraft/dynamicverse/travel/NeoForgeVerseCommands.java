@@ -76,22 +76,14 @@ public final class NeoForgeVerseCommands {
             CommandContext<CommandSourceStack> context, VerseAccessService lifecycle,
             NeoForgeVerseTravelAdapter.ServerLevelResolver levels, VerseTravelService.Position requested) throws CommandSyntaxException {
         ServerPlayer caller = context.getSource().getPlayerOrException();
-        VerseTravelService travel = travel(context, lifecycle, levels);
-        VerseReservationSnapshot admission = travel.teleportCaller(
-                NeoForgeVerseTravelAdapter.player(caller), StringArgumentType.getString(context, NAME), requested, sink(context));
-        accepted(context.getSource(), admission);
-        return 1;
+        return executor(lifecycle, levels).tp(context.getSource(), NeoForgeVerseTravelAdapter.player(caller), StringArgumentType.getString(context, NAME), requested);
     }
 
     private static int send(
             CommandContext<CommandSourceStack> context, VerseAccessService lifecycle,
             NeoForgeVerseTravelAdapter.ServerLevelResolver levels, VerseTravelService.Position requested) throws CommandSyntaxException {
         ServerPlayer target = EntityArgument.getPlayer(context, PLAYER);
-        VerseTravelService travel = travel(context, lifecycle, levels);
-        VerseReservationSnapshot admission = travel.sendPlayer(
-                NeoForgeVerseTravelAdapter.player(target), StringArgumentType.getString(context, NAME), requested, sink(context));
-        accepted(context.getSource(), admission);
-        return 1;
+        return executor(lifecycle, levels).send(context.getSource(), NeoForgeVerseTravelAdapter.player(target), StringArgumentType.getString(context, NAME), requested);
     }
 
     private static int bring(
@@ -99,16 +91,22 @@ public final class NeoForgeVerseCommands {
             NeoForgeVerseTravelAdapter.ServerLevelResolver levels) throws CommandSyntaxException {
         ServerPlayer caller = context.getSource().getPlayerOrException();
         ServerPlayer target = EntityArgument.getPlayer(context, PLAYER);
-        // This must precede scheduling: server.execute may run inline in a fixture.
-        context.getSource().sendSuccess(() -> Component.literal("travel accepted/pending"), false);
-        travel(context, lifecycle, levels).bringPlayer(
-                NeoForgeVerseTravelAdapter.player(caller), NeoForgeVerseTravelAdapter.player(target), sink(context));
-        return 1;
+        return executor(lifecycle, levels).bring(context.getSource(), NeoForgeVerseTravelAdapter.player(caller), NeoForgeVerseTravelAdapter.player(target));
     }
 
-    private static VerseTravelService travel(CommandContext<CommandSourceStack> context, VerseAccessService lifecycle,
-                                               NeoForgeVerseTravelAdapter.ServerLevelResolver levels) {
-        return NeoForgeVerseTravelAdapter.create(lifecycle, context.getSource().getServer(), levels);
+    private static VerseTravelCommandExecutor<CommandSourceStack> executor(
+            VerseAccessService lifecycle, NeoForgeVerseTravelAdapter.ServerLevelResolver levels) {
+        return new VerseTravelCommandExecutor<>(new VerseTravelCommandExecutor.Context<>() {
+            @Override public VerseTravelService travel(CommandSourceStack source) {
+                return NeoForgeVerseTravelAdapter.create(lifecycle, source.getServer(), levels);
+            }
+            @Override public void success(CommandSourceStack source, String message) {
+                source.sendSuccess(() -> Component.literal(message), false);
+            }
+            @Override public void failure(CommandSourceStack source, String message) {
+                source.sendFailure(Component.literal(message));
+            }
+        });
     }
 
     private static VerseTravelService.Position position(CommandContext<CommandSourceStack> context) {
@@ -116,17 +114,4 @@ public final class NeoForgeVerseCommands {
         return new VerseTravelService.Position(value.x, value.y, value.z);
     }
 
-    private static VerseTravelService.ResultSink sink(CommandContext<CommandSourceStack> context) {
-        CommandSourceStack source = context.getSource();
-        return new VerseTravelService.ResultSink() {
-            @Override public void moved() { source.sendSuccess(() -> Component.literal("travel moved"), false); }
-            @Override public void failed(VerseTravelService.TravelError error) {
-                source.sendFailure(Component.literal("travel failed: " + error));
-            }
-        };
-    }
-
-    private static void accepted(CommandSourceStack source, VerseReservationSnapshot admission) {
-        source.sendSuccess(() -> Component.literal("travel accepted/pending " + admission.id().value()), false);
-    }
 }

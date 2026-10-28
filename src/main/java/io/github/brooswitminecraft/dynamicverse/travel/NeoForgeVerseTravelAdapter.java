@@ -29,22 +29,10 @@ public final class NeoForgeVerseTravelAdapter {
                 player.getX(), player.getY(), player.getZ()));
     }
 
-    /**
-     * Mirrors the pinned 1.21.1 {@code Level.isInSpawnableBounds(BlockPos)}
-     * boundary used by TeleportCommand: x/z [-30,000,000, 30,000,000) and
-     * y [-20,000,000, 20,000,000), after block-position flooring.
-     */
+    /** @deprecated use the shared command/movement bounds in {@link TravelCoordinates}. */
+    @Deprecated
     public static boolean isValidTeleportPosition(VerseTravelService.Position position) {
-        int x = floorToBlock(position.x());
-        int y = floorToBlock(position.y());
-        int z = floorToBlock(position.z());
-        return x >= -30_000_000 && x < 30_000_000
-                && z >= -30_000_000 && z < 30_000_000
-                && y >= -20_000_000 && y < 20_000_000;
-    }
-
-    private static int floorToBlock(double coordinate) {
-        return (int) Math.floor(coordinate);
+        return TravelCoordinates.isValid(position);
     }
 
     private static final class Players implements VerseTravelService.PlayerDirectory {
@@ -91,7 +79,7 @@ public final class NeoForgeVerseTravelAdapter {
             return player;
         }
         private static void validate(VerseTravelService.Position destination) {
-            if (!isValidTeleportPosition(destination)) throw new VerseTravelService.InvalidCoordinatesException();
+            if (!TravelCoordinates.isValid(destination)) throw new VerseTravelService.InvalidCoordinatesException();
         }
     }
 }
