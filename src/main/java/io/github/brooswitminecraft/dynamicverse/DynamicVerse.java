@@ -20,6 +20,7 @@ import io.github.brooswitminecraft.dynamicverse.travel.NeoForgeVerseCommands;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ProviderDuplicationBridgeGameTest;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ProviderBridgeIntegrationGameTest;
 import java.util.List;
+import java.util.OptionalLong;
 import java.util.function.Consumer;
 
 /** Server bootstrap owns one runtime facade and the existing GameTest registrations. */
@@ -59,6 +60,9 @@ public final class DynamicVerse {
         }
         @Override public DuplicateAdmission beginDuplicate(String source, String destination, Consumer<DuplicateOutcome> completion) {
             return runtime == null ? DuplicateAdmission.ERR_PROVIDER_UNAVAILABLE : runtime.beginDuplicate(source, destination, completion);
+        }
+        @Override public CreateAdmission beginCreate(String name, CreateType type, OptionalLong seed, Consumer<CreateOutcome> completion) {
+            return runtime == null ? CreateAdmission.ERR_PROVIDER_UNAVAILABLE : runtime.beginCreate(name, type, seed, completion);
         }
         @Override public List<ManagedVerseListing> listManaged() { return runtime == null ? List.of() : runtime.listManaged(); }
     }

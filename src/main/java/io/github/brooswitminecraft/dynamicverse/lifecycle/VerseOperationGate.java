@@ -36,6 +36,20 @@ public final class VerseOperationGate {
         return new Operation(source, destination, sourceEntry.identity, sourceEntry.generation);
     }
 
+    /**
+     * Exclusively stages a brand-new owned destination.  Unlike a duplicate
+     * operation there is no source to restore, so a failed post-provider
+     * create deliberately remains quarantined rather than becoming reusable.
+     */
+    public synchronized CreateReservation beginCreate(String destination) {
+        Entry entry = entries.computeIfAbsent(destination, ignored -> new Entry());
+        if (entry.ready || entry.operating || entry.reads != 0 || entry.quarantined) {
+            throw new IllegalStateException("Destination is not exclusively available for create: " + destination);
+        }
+        entry.operating = true;
+        return new CreateReservation(destination);
+    }
+
     public synchronized ReadyRead tryAcquireReadyRead(String key) {
         Entry entry = entries.get(key);
         if (entry == null || !entry.ready || entry.operating || entry.quarantined) return null;
@@ -67,6 +81,41 @@ public final class VerseOperationGate {
         public String identity() { return identity; }
         public long generation() { return generation; }
         @Override public void close() { synchronized (VerseOperationGate.this) { if (!closed) { entries.get(key).reads--; closed = true; } } }
+    }
+
+    /** Reservation held from create admission through exact observed publication. */
+    public final class CreateReservation implements AutoCloseable {
+        private final String destination;
+        private boolean published;
+        private boolean closed;
+
+        private CreateReservation(String destination) { this.destination = destination; }
+
+        public synchronized void publishReady(String identity, long generation) {
+            if (closed || published) throw new IllegalStateException("Create reservation is no longer publishable");
+            synchronized (VerseOperationGate.this) {
+                Entry entry = entries.get(destination);
+                if (!entry.operating || entry.reads != 0 || entry.quarantined) {
+                    throw new IllegalStateException("Create destination lost exclusivity");
+                }
+                entry.identity = Objects.requireNonNull(identity);
+                entry.generation = generation;
+                entry.ready = true;
+                entry.operating = false;
+                published = true;
+            }
+        }
+
+        @Override public void close() { synchronized (VerseOperationGate.this) {
+            if (closed) return;
+            Entry entry = entries.get(destination);
+            if (!published) {
+                entry.ready = false;
+                entry.quarantined = true;
+            }
+            entry.operating = false;
+            closed = true;
+        }}
     }
 
     public final class Operation implements AutoCloseable {

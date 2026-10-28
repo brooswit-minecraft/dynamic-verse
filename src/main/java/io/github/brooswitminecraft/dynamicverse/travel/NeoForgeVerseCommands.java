@@ -2,6 +2,7 @@ package io.github.brooswitminecraft.dynamicverse.travel;
 
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.StringArgumentType;
+import com.mojang.brigadier.arguments.LongArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
@@ -27,11 +28,14 @@ public final class NeoForgeVerseCommands {
     private static final String SEND = "send";
     private static final String BRING = "bring";
     private static final String DUPLICATE = "duplicate";
+    private static final String CREATE = "create";
     private static final String LIST = "list";
     private static final String SOURCE = "source";
     private static final String NAME = "name";
     private static final String PLAYER = "player";
     private static final String POSITION = "position";
+    private static final String TYPE = "type";
+    private static final String SEED = "seed";
 
     private NeoForgeVerseCommands() { }
 
@@ -58,7 +62,7 @@ public final class NeoForgeVerseCommands {
                 .then(tp(lifecycle, levels))
                 .then(send(lifecycle, levels))
                 .then(bring(lifecycle, levels));
-        if (commands != null) root.then(duplicate(commands)).then(list(commands));
+        if (commands != null) root.then(duplicate(commands)).then(create(commands)).then(list(commands));
         dispatcher.register(root);
     }
 
@@ -112,6 +116,42 @@ public final class NeoForgeVerseCommands {
     private static void duplicateTerminal(CommandSourceStack source, VerseLifecycleCommandService.DuplicateOutcome outcome) {
         if (outcome == VerseLifecycleCommandService.DuplicateOutcome.LOADED) source.sendSuccess(() -> Component.literal("duplicate loaded"), false);
         else source.sendFailure(Component.literal("duplicate failed: " + outcome));
+    }
+
+    /** Accepted grammar: /verse create <name> <normal|superflat> [seed]. */
+    private static LiteralArgumentBuilder<CommandSourceStack> create(VerseLifecycleCommandService lifecycle) {
+        return Commands.literal(CREATE).then(Commands.argument(NAME, StringArgumentType.word())
+                .then(Commands.argument(TYPE, StringArgumentType.word())
+                        .executes(context -> create(context, lifecycle, java.util.OptionalLong.empty()))
+                        .then(Commands.argument(SEED, LongArgumentType.longArg())
+                                .executes(context -> create(context, lifecycle,
+                                        java.util.OptionalLong.of(LongArgumentType.getLong(context, SEED)))))));
+    }
+    private static int create(CommandContext<CommandSourceStack> context, VerseLifecycleCommandService lifecycle,
+                              java.util.OptionalLong seed) {
+        CommandSourceStack source = context.getSource();
+        VerseLifecycleCommandService.CreateType type;
+        try { type = VerseLifecycleCommandService.CreateType.valueOf(StringArgumentType.getString(context, TYPE).toUpperCase(java.util.Locale.ROOT)); }
+        catch (IllegalArgumentException badType) { source.sendFailure(Component.literal("create failed: ERR_INVALID_NAME_OR_TYPE")); return 0; }
+        boolean[] admitted = {false};
+        java.util.List<VerseLifecycleCommandService.CreateOutcome> early = new java.util.ArrayList<>();
+        java.util.concurrent.atomic.AtomicBoolean terminalOnce = new java.util.concurrent.atomic.AtomicBoolean();
+        VerseLifecycleCommandService.CreateAdmission result = lifecycle.beginCreate(StringArgumentType.getString(context, NAME), type, seed, outcome -> {
+            if (!terminalOnce.compareAndSet(false, true)) return;
+            if (admitted[0]) createTerminal(source, outcome); else early.add(outcome);
+        });
+        if (result != VerseLifecycleCommandService.CreateAdmission.ADMITTED) {
+            source.sendFailure(Component.literal("create failed: " + result));
+            return 0;
+        }
+        admitted[0] = true;
+        source.sendSuccess(() -> Component.literal("create accepted/pending"), false);
+        early.forEach(outcome -> createTerminal(source, outcome));
+        return 1;
+    }
+    private static void createTerminal(CommandSourceStack source, VerseLifecycleCommandService.CreateOutcome outcome) {
+        if (outcome == VerseLifecycleCommandService.CreateOutcome.READY) source.sendSuccess(() -> Component.literal("create ready"), false);
+        else source.sendFailure(Component.literal("create failed: " + outcome));
     }
 
     private static LiteralArgumentBuilder<CommandSourceStack> list(VerseLifecycleCommandService lifecycle) {

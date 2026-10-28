@@ -189,7 +189,7 @@ public final class NeoForgeVerseCommandsGameTest {
     }; }
     private static ServerVerseRuntime.CurrentLevelEvidence evidence(OwnedDimensionDescriptor descriptor, GameTestHelper helper) {
         return new ServerVerseRuntime.CurrentLevelEvidence(descriptor.key(), helper.getLevel(), descriptor.generator(), descriptor.type(),
-                descriptor.id() + "@" + Integer.toHexString(System.identityHashCode(helper.getLevel())));
+                descriptor.id() + "@" + Integer.toHexString(System.identityHashCode(helper.getLevel())), helper.getLevel().getSeed());
     }
     private static ServerVerseRuntime.EnrollmentProvenance provenance(OwnedDimensionDescriptor descriptor, GameTestHelper helper, long generation) {
         ServerVerseRuntime.CurrentLevelEvidence evidence = evidence(descriptor, helper);
@@ -441,6 +441,10 @@ public final class NeoForgeVerseCommandsGameTest {
         private int admissions;
         @Override public DuplicateAdmission beginDuplicate(String source, String destination, java.util.function.Consumer<DuplicateOutcome> callback) {
             admissions++; completion = callback; return admission;
+        }
+        @Override public CreateAdmission beginCreate(String name, CreateType type, java.util.OptionalLong seed,
+                                                      java.util.function.Consumer<CreateOutcome> callback) {
+            return CreateAdmission.ERR_PROVIDER_UNAVAILABLE;
         }
         @Override public List<ManagedVerseListing> listManaged() {
             return List.of(new ManagedVerseListing("dynamicverse:alpha", ManagedVerseListing.State.READY, java.util.Optional.of("identity"), java.util.Optional.of(1L)),
