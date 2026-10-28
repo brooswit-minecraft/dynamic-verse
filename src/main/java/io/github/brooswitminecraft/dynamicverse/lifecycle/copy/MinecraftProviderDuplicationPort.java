@@ -58,6 +58,17 @@ public final class MinecraftProviderDuplicationPort implements ProviderDuplicati
         return Files.isDirectory(request.storageRoot().resolve(request.destinationRelative()).normalize(), LinkOption.NOFOLLOW_LINKS);
     }
 
+    @Override
+    public void awaitCurrent(OwnedDimensionDescriptor descriptor, Object instance, Consumer<Boolean> completion) {
+        observeCurrent(descriptor, instance, 40, completion);
+    }
+
+    private void observeCurrent(OwnedDimensionDescriptor descriptor, Object instance, int remaining, Consumer<Boolean> completion) {
+        if (isCurrent(descriptor, instance)) { completion.accept(true); return; }
+        if (remaining == 0) { completion.accept(false); return; }
+        server.execute(() -> observeCurrent(descriptor, instance, remaining - 1, completion));
+    }
+
     private static String identity(ServerLevel level) {
         return level.dimension().location() + "@" + Integer.toHexString(System.identityHashCode(level));
     }

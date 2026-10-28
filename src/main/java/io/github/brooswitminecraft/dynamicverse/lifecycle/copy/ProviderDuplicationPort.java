@@ -10,6 +10,7 @@ public interface ProviderDuplicationPort {
     boolean isCurrent(OwnedDimensionDescriptor descriptor, Object instance);
     boolean isAbsent(OwnedDimensionDescriptor descriptor);
     boolean hasCopiedDestination(ClosedDimensionCopyRequest request);
+    void awaitCurrent(OwnedDimensionDescriptor descriptor, Object instance, Consumer<Boolean> completion);
 
     record RestoredSource(Object instance, String instanceIdentity, long generation) { }
     record LoadedDestination(Object instance, String instanceIdentity, long generation) { }

@@ -61,6 +61,7 @@ public final class VerseOperationGate {
         private long sourceGeneration;
         private Long terminalGeneration;
         private boolean restored;
+        private boolean admissionRefused;
         private boolean destinationPublished;
         private CopyReservation reservation;
         private boolean closed;
@@ -81,6 +82,7 @@ public final class VerseOperationGate {
             }};
         }
         public synchronized void restored(String identity, long generation) { sourceIdentity = Objects.requireNonNull(identity); sourceGeneration = generation; restored = true; }
+        public synchronized void revokeRestoration() { restored = false; }
         /** Binds one copied directory to this exact admitted close generation. */
         public synchronized CopyReservation reserveCopied(String expectedSource, String expectedDestination, long generation,
                                                           ClosedDimensionCopyRequest request) {
@@ -110,7 +112,7 @@ public final class VerseOperationGate {
             }
         }
         /** Admission was refused before any provider close ticket existed. */
-        public synchronized void admissionRefused() { restored = true; }
+        public synchronized void admissionRefused() { restored = true; admissionRefused = true; }
         @Override public void close() { synchronized (VerseOperationGate.this) {
             if (closed) return;
             Entry sourceEntry = entries.get(source);
@@ -121,7 +123,7 @@ public final class VerseOperationGate {
                 sourceEntry.identity = sourceIdentity;
                 sourceEntry.generation = sourceGeneration;
                 sourceEntry.ready = true;
-                if (!destinationPublished) destinationEntry.quarantined = true;
+                if (!destinationPublished && !admissionRefused) destinationEntry.quarantined = true;
             } else {
                 sourceEntry.quarantined = true;
                 destinationEntry.quarantined = true;

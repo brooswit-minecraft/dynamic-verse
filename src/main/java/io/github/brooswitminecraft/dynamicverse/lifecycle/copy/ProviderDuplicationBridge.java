@@ -73,70 +73,72 @@ public final class ProviderDuplicationBridge {
         String destinationKey = destination.id();
         long generation = terminal == null ? Long.MIN_VALUE : terminal.generation();
         if (!operation.claimTerminal(generation)) return;
-        BridgeOutcome outcome = BridgeOutcome.QUARANTINED;
-        String phase = "terminal evaluation";
         try {
-            if (terminal != null) {
-                LOGGER.info("Provider duplicate terminal expectedSource=" + source.id() + " terminalSource=" + terminal.sourceKey()
-                        + " destination=" + destinationKey + " generation=" + terminal.generation() + " initiallyLoaded="
-                        + terminal.initiallyLoaded() + " status=" + terminal.status() + " failurePresent=" + terminal.failurePresent()
-                        + " failureStage=" + terminal.failureStage() + " cause=" + terminal.cause());
-                if (terminal.cause() != null) {
-                    LOGGER.log(Level.WARNING, "Provider duplicate terminal cause expectedSource=" + source.id() + " terminalSource="
-                            + terminal.sourceKey() + " destination=" + destinationKey + " generation=" + terminal.generation(), terminal.cause());
-                }
-                ClosedDimensionDuplicationIntent intent = new ClosedDimensionDuplicationIntent(source.id(), destinationKey, terminal.generation());
-                phase = "coordinator evaluation";
-                ClosedDimensionDuplicationResult copied = coordinator.duplicate(intent, terminal, operation.copierFence());
-                LOGGER.info("Provider duplicate coordinator result source=" + source.id() + " destination=" + destinationKey
-                        + " generation=" + terminal.generation() + " outcome=" + copied.outcome() + " detail=" + copied.detail()
-                        + " cause=" + copied.cause());
-                if (copied.outcome() == ClosedDimensionDuplicationResult.Outcome.COPIED && copied.copyRequest() != null) {
-                    VerseOperationGate.CopyReservation reservation = operation.reserveCopied(source.id(), destinationKey,
-                            terminal.generation(), copied.copyRequest());
-                    phase = "restoration";
-                    LOGGER.info("Provider duplicate restoration entered source=" + source.id() + " generation=" + terminal.generation());
-                    ProviderDuplicationPort.RestoredSource restored = provider.loadOriginalSource(source, terminal.generation());
-                    if (valid(restored) && restored.generation() == terminal.generation() && provider.isCurrent(source, restored.instance())) {
-                        LOGGER.info("Provider duplicate restoration returned source=" + source.id() + " generation=" + restored.generation()
-                                + " identity=" + restored.instanceIdentity());
-                        operation.restored(restored.instanceIdentity(), restored.generation());
-                        outcome = BridgeOutcome.RESTORED;
-                        phase = "destination load";
-                        if (!provider.hasCopiedDestination(reservation.request())) {
-                            LOGGER.warning("Provider duplicate copied destination directory is absent/unusable destination=" + destinationKey
-                                    + " path=" + reservation.request().destinationRelative());
-                        } else if (!provider.isAbsent(destination)) {
-                            LOGGER.warning("Provider duplicate destination was registered before load destination=" + destinationKey);
-                        } else {
-                            ProviderDuplicationPort.LoadedDestination loaded = provider.loadCopiedDestination(destination, terminal.generation());
-                            if (valid(loaded) && loaded.generation() == terminal.generation() && provider.isCurrent(source, restored.instance())
-                                    && provider.isCurrent(destination, loaded.instance())) {
-                                operation.publishDestination(reservation, loaded.instanceIdentity(), loaded.generation());
-                                outcome = BridgeOutcome.LOADED;
-                                LOGGER.info("Provider duplicate destination loaded destination=" + destinationKey + " generation="
-                                        + loaded.generation() + " identity=" + loaded.instanceIdentity());
-                            } else {
-                                LOGGER.warning("Provider duplicate destination load returned null/foreign/stale identity destination=" + destinationKey);
-                            }
-                        }
-                    } else {
-                        LOGGER.warning("Provider duplicate restoration returned null/invalid source=" + source.id()
-                                + " generation=" + terminal.generation());
-                    }
-                }
-            } else {
-                LOGGER.warning("Provider duplicate terminal absent source=" + source.id() + " destination=" + destinationKey);
-            }
+            new Pipeline(source, destination, operation, terminal, completion).start();
         } catch (RuntimeException e) {
-            LOGGER.log(Level.WARNING, "Provider duplicate pipeline failure phase=" + phase + " source=" + source.id()
+            LOGGER.log(Level.WARNING, "Provider duplicate pipeline failure phase=terminal evaluation source=" + source.id()
                     + " destination=" + destinationKey + " generation=" + generation, e);
-        } finally {
-            operation.close();
-            LOGGER.info("Provider duplicate final source=" + source.id() + " destination=" + destinationKey
-                    + " generation=" + generation + " outcome=" + outcome);
-            try { completion.accept(outcome); } catch (RuntimeException ignored) { }
+            complete(operation, source, destination, generation, completion, BridgeOutcome.QUARANTINED);
         }
+    }
+
+    private final class Pipeline {
+        private final OwnedDimensionDescriptor source, destination; private final VerseOperationGate.Operation operation;
+        private final ProviderQuiesceCloseTerminal terminal; private final Consumer<BridgeOutcome> completion;
+        private final long generation; private boolean completed;
+        private Pipeline(OwnedDimensionDescriptor source, OwnedDimensionDescriptor destination, VerseOperationGate.Operation operation,
+                         ProviderQuiesceCloseTerminal terminal, Consumer<BridgeOutcome> completion) {
+            this.source=source; this.destination=destination; this.operation=operation; this.terminal=terminal; this.completion=completion;
+            this.generation=terminal == null ? Long.MIN_VALUE : terminal.generation();
+        }
+        private void start() {
+            if (terminal == null) { finish(BridgeOutcome.QUARANTINED); return; }
+            ClosedDimensionDuplicationResult copied=coordinator.duplicate(new ClosedDimensionDuplicationIntent(source.id(), destination.id(), generation), terminal, operation.copierFence());
+            if (copied.outcome()!=ClosedDimensionDuplicationResult.Outcome.COPIED || copied.copyRequest()==null) { finish(BridgeOutcome.QUARANTINED); return; }
+            VerseOperationGate.CopyReservation reservation=operation.reserveCopied(source.id(), destination.id(), generation, copied.copyRequest());
+            ProviderDuplicationPort.RestoredSource restored=provider.loadOriginalSource(source,generation);
+            if (!valid(restored) || restored.generation()!=generation) { finish(BridgeOutcome.QUARANTINED); return; }
+            provider.awaitCurrent(source, restored.instance(), current -> {
+                try { afterSource(reservation, restored, current); }
+                catch (RuntimeException e) { operation.revokeRestoration(); finish(BridgeOutcome.QUARANTINED); }
+            });
+        }
+        private void afterSource(VerseOperationGate.CopyReservation reservation, ProviderDuplicationPort.RestoredSource restored, boolean current) {
+            if (!current) { operation.revokeRestoration(); finish(BridgeOutcome.QUARANTINED); return; }
+            operation.restored(restored.instanceIdentity(), restored.generation());
+            if (!provider.hasCopiedDestination(reservation.request()) || !provider.isAbsent(destination)) { finish(BridgeOutcome.RESTORED); return; }
+            ProviderDuplicationPort.LoadedDestination loaded;
+            try { loaded=provider.loadCopiedDestination(destination,generation); }
+            catch (RuntimeException e) {
+                boolean sourceCurrent=provider.isCurrent(source, restored.instance());
+                if (!sourceCurrent) operation.revokeRestoration();
+                finish(sourceCurrent ? BridgeOutcome.RESTORED : BridgeOutcome.QUARANTINED); return;
+            }
+            if (!valid(loaded) || loaded.generation()!=generation) { finish(BridgeOutcome.RESTORED); return; }
+            provider.awaitCurrent(destination, loaded.instance(), currentDestination -> {
+                try { afterDestination(reservation, restored, loaded, currentDestination); }
+                catch (RuntimeException e) {
+                    boolean sourceCurrent=provider.isCurrent(source, restored.instance());
+                    if (!sourceCurrent) operation.revokeRestoration();
+                    finish(sourceCurrent ? BridgeOutcome.RESTORED : BridgeOutcome.QUARANTINED);
+                }
+            });
+        }
+        private void afterDestination(VerseOperationGate.CopyReservation reservation, ProviderDuplicationPort.RestoredSource restored,
+                                      ProviderDuplicationPort.LoadedDestination loaded, boolean currentDestination) {
+            if (!provider.isCurrent(source, restored.instance())) { operation.revokeRestoration(); finish(BridgeOutcome.QUARANTINED); return; }
+            if (!currentDestination) { finish(BridgeOutcome.RESTORED); return; }
+            operation.publishDestination(reservation, loaded.instanceIdentity(), loaded.generation());
+            finish(BridgeOutcome.LOADED);
+        }
+        private void finish(BridgeOutcome outcome) { if (!completed) { completed=true; complete(operation,source,destination,generation,completion,outcome); } }
+    }
+
+    private static void complete(VerseOperationGate.Operation operation, OwnedDimensionDescriptor source, OwnedDimensionDescriptor destination,
+                                 long generation, Consumer<BridgeOutcome> completion, BridgeOutcome outcome) {
+        operation.close();
+        LOGGER.info("Provider duplicate final source=" + source.id() + " destination=" + destination.id()+" generation="+generation+" outcome="+outcome);
+        try { completion.accept(outcome); } catch (RuntimeException ignored) { }
     }
 
     private static boolean valid(ProviderDuplicationPort.RestoredSource source) {

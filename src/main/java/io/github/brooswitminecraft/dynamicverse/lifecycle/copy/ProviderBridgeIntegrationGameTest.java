@@ -147,6 +147,8 @@ public final class ProviderBridgeIntegrationGameTest {
         finally { if (destinationReady != null) destinationReady.close(); }
         loadedDestination.setBlock(new BlockPos(2, 64, 1), Blocks.GLOWSTONE.defaultBlockState(), 3);
         require(helper, !restored.getBlockState(new BlockPos(2, 64, 1)).is(Blocks.GLOWSTONE), "source/destination mutations are independent");
+        restored.setBlock(new BlockPos(3, 64, 1), Blocks.DIAMOND_BLOCK.defaultBlockState(), 3);
+        require(helper, !loadedDestination.getBlockState(new BlockPos(3, 64, 1)).is(Blocks.DIAMOND_BLOCK), "destination/source mutations are independent");
         require(helper, markerRegion.get() != null && Files.isRegularFile(destinationPath.resolve(markerRegion.get()), LinkOption.NOFOLLOW_LINKS),
                 "observed copied marker region");
         require(helper, Files.isDirectory(sourcePath, LinkOption.NOFOLLOW_LINKS), "source directory retained");

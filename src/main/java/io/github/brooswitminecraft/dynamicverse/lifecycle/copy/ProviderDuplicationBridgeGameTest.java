@@ -114,6 +114,17 @@ public final class ProviderDuplicationBridgeGameTest {
         wrongGeneration.provider.deliver(success(wrongGeneration.source.id(), 7));
         assertSourceOnlyRestored(wrongGeneration, "wrong destination generation", 1);
 
+        Scenario replacedSource = admittedScenario(helper.getLevel());
+        replacedSource.provider.replaceSourceDuringDestinationObservation = true;
+        replacedSource.provider.deliver(success(replacedSource.source.id(), 7));
+        assertQuarantinedOnce(replacedSource, "source replaced during destination observation", 1, 1);
+
+        Scenario throwingReplacedSource = admittedScenario(helper.getLevel());
+        throwingReplacedSource.provider.replaceSourceDuringDestinationLoad = true;
+        throwingReplacedSource.provider.throwDestinationLoad = true;
+        throwingReplacedSource.provider.deliver(success(throwingReplacedSource.source.id(), 7));
+        assertQuarantinedOnce(throwingReplacedSource, "source replaced before throwing destination load", 1, 1);
+
         Scenario staleRestore = admittedScenario(helper.getLevel());
         staleRestore.provider.wrongRestoreGeneration = true;
         staleRestore.provider.deliver(success(staleRestore.source.id(), 7));
@@ -133,6 +144,47 @@ public final class ProviderDuplicationBridgeGameTest {
         require(scenario.provider.terminal == null && scenario.copies.get() == 0 && scenario.provider.loads.get() == 0
                 && scenario.completions.get() == 0, "refusal must have no terminal work");
         assertReady(scenario.gate, scenario.source.id(), "old", 1);
+        helper.succeed();
+    }
+
+    @GameTest(templateNamespace = "dynamicverse", template = "empty")
+    @PrefixGameTestTemplate(false)
+    public void controlledBridgeAdmissionRefusalAllowsSameDestinationRetry(GameTestHelper helper) throws Exception {
+        Scenario scenario = scenario(helper.getLevel());
+        scenario.bridge.registerReady(scenario.source.id(), "old", 1);
+        scenario.provider.admit = false;
+        require(scenario.bridge.beginDuplicate(scenario.source.id(), scenario.destination.id(), scenario.completion())
+                == ProviderDuplicationBridge.BridgeAdmission.REJECTED, "first admission refused");
+        scenario.provider.admit = true;
+        require(scenario.bridge.beginDuplicate(scenario.source.id(), scenario.destination.id(), scenario.completion())
+                == ProviderDuplicationBridge.BridgeAdmission.ADMITTED, "same destination retry admitted");
+        scenario.provider.deliver(success(scenario.source.id(), 7));
+        require(scenario.outcome.get() == ProviderDuplicationBridge.BridgeOutcome.LOADED && scenario.copies.get() == 1
+                && scenario.provider.loads.get() == 1 && scenario.provider.destinationLoads.get() == 1, "retry performed only successful work");
+        helper.succeed();
+    }
+
+    @GameTest(templateNamespace = "dynamicverse", template = "empty")
+    @PrefixGameTestTemplate(false)
+    public void controlledBridgeDeferredRegistrationRetainsGateAndRefusesWrongInstance(GameTestHelper helper) throws Exception {
+        Scenario eventual = admittedScenario(helper.getLevel());
+        eventual.provider.delaySourceObservation = true;
+        eventual.provider.delayDestinationObservation = true;
+        eventual.provider.deliver(success(eventual.source.id(), 7));
+        require(eventual.completions.get() == 0 && eventual.gate.tryAcquireReadyRead(eventual.source.id()) == null,
+                "source remains unavailable during deferred registration");
+        eventual.provider.completeSourceObservation(true);
+        require(eventual.completions.get() == 0 && eventual.gate.tryAcquireReadyRead(eventual.destination.id()) == null,
+                "destination remains unavailable during deferred registration");
+        eventual.provider.completeDestinationObservation(true);
+        require(eventual.outcome.get() == ProviderDuplicationBridge.BridgeOutcome.LOADED && eventual.completions.get() == 1,
+                "eventual exact registration publishes once");
+
+        Scenario wrong = admittedScenario(helper.getLevel());
+        wrong.provider.delayDestinationObservation = true;
+        wrong.provider.deliver(success(wrong.source.id(), 7));
+        wrong.provider.completeDestinationObservation(false);
+        assertSourceOnlyRestored(wrong, "wrong/timeout destination registration", 1);
         helper.succeed();
     }
 
@@ -243,6 +295,14 @@ public final class ProviderDuplicationBridgeGameTest {
         private boolean foreignDestination;
         private boolean wrongRestoreGeneration;
         private boolean wrongDestinationGeneration;
+        private boolean replaceSourceDuringDestinationObservation;
+        private boolean sourceCurrent = true;
+        private boolean replaceSourceDuringDestinationLoad;
+        private boolean throwDestinationLoad;
+        private boolean delaySourceObservation;
+        private boolean delayDestinationObservation;
+        private java.util.function.Consumer<Boolean> pendingSourceObservation;
+        private java.util.function.Consumer<Boolean> pendingDestinationObservation;
 
         private ControlledProvider(VerseOperationGate gate, String sourceKey, String destinationKey) {
             this.gate = gate; this.sourceKey = sourceKey; this.destinationKey = destinationKey;
@@ -260,14 +320,24 @@ public final class ProviderDuplicationBridgeGameTest {
         public LoadedDestination loadCopiedDestination(OwnedDimensionDescriptor destination, long generation) {
             require(gate.tryAcquireReadyRead(destinationKey) == null, "destination published before load");
             destinationLoads.incrementAndGet();
+            if (replaceSourceDuringDestinationLoad) sourceCurrent = false;
+            if (throwDestinationLoad) throw new IllegalStateException("controlled destination load failure");
             return new LoadedDestination(foreignDestination ? new Object() : destinationInstance, "destination",
                     wrongDestinationGeneration ? generation + 1 : generation);
         }
         public boolean isCurrent(OwnedDimensionDescriptor descriptor, Object instance) {
-            return descriptor.id().equals(sourceKey) ? instance == sourceInstance : instance == destinationInstance;
+            return descriptor.id().equals(sourceKey) ? sourceCurrent && instance == sourceInstance : instance == destinationInstance;
         }
         public boolean isAbsent(OwnedDimensionDescriptor descriptor) { return descriptor.id().equals(destinationKey); }
         public boolean hasCopiedDestination(ClosedDimensionCopyRequest request) { return copiedDirectory; }
+        public void awaitCurrent(OwnedDimensionDescriptor descriptor, Object instance, java.util.function.Consumer<Boolean> completion) {
+            if (descriptor.id().equals(sourceKey) && delaySourceObservation) { pendingSourceObservation = completion; return; }
+            if (descriptor.id().equals(destinationKey) && delayDestinationObservation) { pendingDestinationObservation = completion; return; }
+            if (descriptor.id().equals(destinationKey) && replaceSourceDuringDestinationObservation) sourceCurrent = false;
+            completion.accept(isCurrent(descriptor, instance));
+        }
+        private void completeSourceObservation(boolean value) { pendingSourceObservation.accept(value); }
+        private void completeDestinationObservation(boolean value) { pendingDestinationObservation.accept(value); }
         private void deliver(ProviderQuiesceCloseTerminal value) { terminal.accept(value); }
     }
 }
