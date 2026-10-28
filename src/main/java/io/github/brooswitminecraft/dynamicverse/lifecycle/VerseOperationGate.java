@@ -82,7 +82,15 @@ public final class VerseOperationGate {
             }};
         }
         public synchronized void restored(String identity, long generation) { sourceIdentity = Objects.requireNonNull(identity); sourceGeneration = generation; restored = true; }
-        public synchronized void revokeRestoration() { restored = false; }
+        public synchronized void revokeRestoration() {
+            restored = false;
+            if (destinationPublished) synchronized (VerseOperationGate.this) {
+                Entry destinationEntry = entries.get(destination);
+                destinationEntry.ready = false;
+                destinationEntry.quarantined = true;
+                destinationPublished = false;
+            }
+        }
         /** Binds one copied directory to this exact admitted close generation. */
         public synchronized CopyReservation reserveCopied(String expectedSource, String expectedDestination, long generation,
                                                           ClosedDimensionCopyRequest request) {

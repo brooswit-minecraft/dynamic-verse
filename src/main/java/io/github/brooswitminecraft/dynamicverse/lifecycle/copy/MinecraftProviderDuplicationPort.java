@@ -5,6 +5,8 @@ import dev.galacticraft.dynamicdimensions.api.lifecycle.QuiesceAndCloseResult;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.neoforged.neoforge.common.NeoForge;
+import net.neoforged.neoforge.event.tick.ServerTickEvent;
 
 import java.util.Objects;
 import java.nio.file.Files;
@@ -15,10 +17,12 @@ import java.util.function.Consumer;
 public final class MinecraftProviderDuplicationPort implements ProviderDuplicationPort {
     private final DynamicDimensionRegistry registry;
     private final MinecraftServer server;
+    private final RegistrationObservationQueue observations = new RegistrationObservationQueue();
 
     public MinecraftProviderDuplicationPort(MinecraftServer server) {
         this.server = Objects.requireNonNull(server);
         this.registry = DynamicDimensionRegistry.from(this.server);
+        NeoForge.EVENT_BUS.addListener(this::afterServerTick);
     }
 
     @Override
@@ -60,13 +64,11 @@ public final class MinecraftProviderDuplicationPort implements ProviderDuplicati
 
     @Override
     public void awaitCurrent(OwnedDimensionDescriptor descriptor, Object instance, Consumer<Boolean> completion) {
-        observeCurrent(descriptor, instance, 40, completion);
+        observations.await(() -> isCurrent(descriptor, instance), completion);
     }
 
-    private void observeCurrent(OwnedDimensionDescriptor descriptor, Object instance, int remaining, Consumer<Boolean> completion) {
-        if (isCurrent(descriptor, instance)) { completion.accept(true); return; }
-        if (remaining == 0) { completion.accept(false); return; }
-        server.execute(() -> observeCurrent(descriptor, instance, remaining - 1, completion));
+    private void afterServerTick(ServerTickEvent.Post event) {
+        if (event.getServer() == server) observations.observeTick();
     }
 
     private static String identity(ServerLevel level) {
