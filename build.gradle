@@ -30,14 +30,18 @@ repositories {
     mavenCentral()
 }
 
+def dynamicDimensionsJar = layout.projectDirectory.file("local-artifacts/dynamicdimensions-neoforge.jar")
+// 04341e14 classes include the reviewed close API; the older local jar intentionally remains untouched.
+def reviewedDynamicDimensionsClasses = file("/tmp/dynamicdimensions-composite/neoforge/build/classes/java/main")
+def dynamicDimensionsSha256 = "b25aefb589ae1c8635679373230d536c6c77bd21942f65d0f9765436e5046d79"
+
 dependencies {
+    // Compile against the reviewed, pinned provider API; it is never bundled or published by this fixture.
+    compileOnly files(reviewedDynamicDimensionsClasses)
     testImplementation platform("org.junit:junit-bom:5.11.4")
     testImplementation "org.junit.jupiter:junit-jupiter"
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
 }
-
-def dynamicDimensionsJar = layout.projectDirectory.file("local-artifacts/dynamicdimensions-neoforge.jar")
-def dynamicDimensionsSha256 = "b25aefb589ae1c8635679373230d536c6c77bd21942f65d0f9765436e5046d79"
 
 tasks.register("verifyLocalDynamicDimensionsArtifact") {
     group = "verification"

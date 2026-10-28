@@ -1,47 +1,52 @@
 # Production duplication coordinator (source-only)
 
-`ClosedDimensionDuplicationCoordinator` is the only new handoff between the
-accepted close adapter and `ClosedDimensionCopier`. It accepts a fixed
-`ClosedDimensionDuplicationIntent` plus one dependency-free representation of
-the provider terminal. It permits a copier call only when the terminal has the
-same source key and generation, `initiallyLoaded == true`,
+`ProviderDuplicationBridge` is the production handoff around the accepted
+provider close adapter and `ClosedDimensionCopier`. It admits an operation only
+for two explicitly `OwnedDimensionDescriptor` entries. Its one retained
+`ClosedDimensionDuplicationCoordinator` accepts a copier call only for the
+matching source key/generation, `initiallyLoaded == true`,
 `SAVED_AND_CLOSED`, and no mapped failure. Admission, removal callbacks, and
 level disappearance are not terminals.
 
-The coordinator centrally consumes that `(source key, generation)` before it
-asks for storage paths. A duplicate terminal cannot reach the copier, including
-when a previous attempt failed. It claims each destination key once. Mapping,
-fence, and copier failures put that claimed destination in the unavailable
-state; no retry, load, or publication method exists in this component. A
-separate reviewed integration may act only on `COPIED` and must still restore
-the original and load the destination with `loadDynamicDimension(...,
-deleteData=false)` semantics.
+The coordinator centrally consumes the terminal identity and claims each
+destination once. Mapping, fence, and copier failures leave a claimed
+destination unavailable; no retry, destination load, or publication method
+exists here. On successful copy the bridge restores only the original source.
 
-## Required provider bridge, not implemented in this source-only unit
+## Implemented supported bridge
 
-The pinned provider's public API is
-`DynamicDimensionRegistry.beginQuiesceAndClose(ResourceLocation, PlayerRemover,
-QuiesceAndCloseCompletion)`. Its `true` return is admission only. The
-completion's `QuiesceAndCloseResult` has `key()`, `generation()`,
-`initiallyLoaded()`, `status()`, `failureStage()`, and `cause()`; the bridge
-must create `ProviderQuiesceCloseTerminal` from those exact fields and map only
-the provider's `SAVED_AND_CLOSED`, `FAILED_SAVE`, and `FAILED_CLOSE` values.
+`MinecraftProviderDuplicationPort` calls public
+`DynamicDimensionRegistry.beginQuiesceAndClose` and maps the completion's
+`QuiesceAndCloseResult.key()`, `generation()`, `initiallyLoaded()`, `status()`,
+`failureStage()`, and `cause()` exactly into `ProviderQuiesceCloseTerminal`.
+It maps only `SAVED_AND_CLOSED`, `FAILED_SAVE`, and `FAILED_CLOSE`; either
+failure field makes the terminal fail closed. After an exact successful copy it
+uses public `DynamicDimensionRegistry.loadDynamicDimension(id, generator,
+type, properties)` for normal original-source restoration. The pinned
+implementation calls `createDynamicLevel(..., false)`, never its deleting
+create path.
 
-The supported path method is
-`LevelStorageSource.LevelStorageAccess#getDimensionPath(ResourceKey<Level>)`,
-whose pinned source returns
-`DimensionType.getStorageFolder(dimensionPath, this.levelDirectory.path())`.
-The pinned `MinecraftServerMixin` calls it through its protected
-`@Shadow LevelStorageAccess storageSource` for internal deletion only. Neither
-`DynamicDimensionRegistry` nor `DynamicDimensionProvider` exposes that storage
-access, a common-root resolver, or a source write/reload plus root/ancestor
-stability lease. Therefore a runtime `DimensionStoragePathResolver` and
-`SourceWriteReloadFence` cannot be honestly wired through the supported public
-provider API at this pin. No private/mixin bypass or no-op fence is supplied.
+`MinecraftDimensionStoragePathResolver` uses public NeoForge 21.1.148
+`MinecraftServer#getWorldPath(LevelResource.ROOT)` (ROOT is `.`) and public
+`DimensionType#getStorageFolder(ownedKey, root)`. The latter maps an owned
+custom key to `dimensions/<namespace>/<path>`, matching
+`LevelStorageAccess#getDimensionPath`. The resolver rejects Overworld/root,
+vanilla keys, unowned descriptors, escaped paths, and any mapping outside that
+exact custom-dimension shape. It does not access `storageSource`, reflect into
+the server, or bypass the registry.
 
-The future bridge must retain its actual source write/reload and cooperative
-root/ancestor stability exclusion until the copier closes its lease. It must
-derive source and destination from the two supported `getDimensionPath` calls,
-prove one common root and normalized relatives, then pass them to the
-coordinator. Runtime copying, restoration, and destination loading remain
-unexecuted and require separately serialized review.
+## Shared operation/read gate
+
+`VerseOperationGate` is the application-owned through-restoration exclusion.
+The bridge enters it before provider admission and gives the matching terminal
+generation a subordinate copier fence. Closing that copier sublease does not
+release ready reads: the operation stays exclusive until the original normal
+load succeeds and calls `restored()`. Any non-success, unsupported mapping,
+fence/copy failure, or failed original load ends quarantined, so source and
+destination remain unavailable. `GatedVerseAccessService` uses the same gate
+and returns `PENDING` until its cooperating tick owner resolves the read.
+
+This source/unit-only unit compiled against the reviewed `04341e14` provider
+classes; the older local artifact is intentionally not replaced. Failed-close
+restoration, initially-unloaded semantics, foreign descriptors, seed support,
+and runtime provider/world execution remain held.

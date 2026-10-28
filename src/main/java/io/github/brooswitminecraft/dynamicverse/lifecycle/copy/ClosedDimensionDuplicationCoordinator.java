@@ -28,7 +28,14 @@ public final class ClosedDimensionDuplicationCoordinator {
 
     public synchronized ClosedDimensionDuplicationResult duplicate(
             ClosedDimensionDuplicationIntent intent, ProviderQuiesceCloseTerminal terminal) {
+        return duplicate(intent, terminal, fence);
+    }
+
+    /** The operation bridge supplies its gate-owned sublease for real provider work. */
+    public synchronized ClosedDimensionDuplicationResult duplicate(
+            ClosedDimensionDuplicationIntent intent, ProviderQuiesceCloseTerminal terminal, SourceWriteReloadFence operationFence) {
         Objects.requireNonNull(intent);
+        Objects.requireNonNull(operationFence);
         if (terminal == null || !terminal.receipt().isExactSuccess(intent.sourceKey(), intent.generation())) {
             return rejected("Terminal is absent, mismatched, or not SAVED_AND_CLOSED without failure");
         }
@@ -48,7 +55,7 @@ public final class ClosedDimensionDuplicationCoordinator {
         }
 
         try {
-            copier.copy(request, terminal.receipt(), fence);
+            copier.copy(request, terminal.receipt(), operationFence);
             return new ClosedDimensionDuplicationResult(ClosedDimensionDuplicationResult.Outcome.COPIED,
                     "Exact close terminal copied; separate ordered load wiring is still required");
         } catch (ClosedDimensionCopyException | RuntimeException e) {
