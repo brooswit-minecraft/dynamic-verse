@@ -21,7 +21,7 @@ import java.util.Set;
  * fenced successful close receipt and copies one exact dimension directory.
  * It never deletes, replaces, loads, or retries a destination.
  */
-public final class ClosedDimensionCopier {
+public final class ClosedDimensionCopier implements ClosedDimensionCopyPort {
     @FunctionalInterface
     interface CopyObserver { void beforeEntry(Path relative) throws IOException; }
 
