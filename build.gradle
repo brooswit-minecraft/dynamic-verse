@@ -21,6 +21,9 @@ sourceSets {
     providerBridgeGameTest {
         compileClasspath += sourceSets.main.output
         runtimeClasspath += sourceSets.main.output
+        // Retain the complete NeoForge/FML launch closure from main while
+        // preserving this source set's provider-only runtime dependencies.
+        runtimeClasspath += sourceSets.main.runtimeClasspath
     }
 }
 
