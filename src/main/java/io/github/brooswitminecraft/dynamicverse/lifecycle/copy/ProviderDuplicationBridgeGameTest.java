@@ -254,6 +254,15 @@ public final class ProviderDuplicationBridgeGameTest {
                 .anyMatch(entry -> entry.name().equals("dynamicverse:normal-owned") && entry.state()
                         == io.github.brooswitminecraft.dynamicverse.lifecycle.ManagedVerseListing.State.READY)
                 && runtime.recordedEffectiveSeed("dynamicverse:normal-owned").orElseThrow() == level.getSeed(), "normal publishes once with observed seed");
+        AtomicReference<io.github.brooswitminecraft.dynamicverse.lifecycle.VerseReservationSnapshot> ready = new AtomicReference<>();
+        runtime.beginAcquireReadyRead("normal-owned", ready::set);
+        runtime.tick();
+        require(ready.get().lease().isPresent() && runtime.resolve(ready.get().lease().orElseThrow()) == level,
+                "bare owned name resolves through the existing access facade");
+        ready.get().lease().orElseThrow().close();
+        require(runtime.beginDuplicate("normal-owned", "normal-copy", ignored -> { })
+                        == VerseLifecycleCommandService.DuplicateAdmission.ERR_VERSE_BUSY,
+                "bare owned names reach the duplicate facade rather than minecraft/default lookup");
 
         ControlledCreate flat = new ControlledCreate(level);
         ServerVerseRuntime flatRuntime = controlledCreateRuntime(level, flat, false);
@@ -284,13 +293,31 @@ public final class ProviderDuplicationBridgeGameTest {
         for (int tick = 0; tick < 20; tick++) mismatchRuntime.tick();
         require(mismatch.creates.get() == 1 && quarantined.get() == 1 && mismatchRuntime.listManaged().stream().anyMatch(entry -> entry.name().equals("dynamicverse:mismatch")
                 && entry.state() == io.github.brooswitminecraft.dynamicverse.lifecycle.ManagedVerseListing.State.QUARANTINED), "mismatch never publishes ready");
+
+        ControlledCreate pending = new ControlledCreate(level); pending.visibleAfterCreate = false;
+        ServerVerseRuntime pendingRuntime = controlledCreateRuntime(level, pending, false);
+        AtomicInteger pendingTerminal = new AtomicInteger();
+        require(pendingRuntime.beginCreate("pending-close", VerseLifecycleCommandService.CreateType.NORMAL, java.util.OptionalLong.empty(),
+                outcome -> { require(outcome == VerseLifecycleCommandService.CreateOutcome.QUARANTINED, "pending close quarantines"); pendingTerminal.incrementAndGet(); })
+                == VerseLifecycleCommandService.CreateAdmission.ADMITTED, "pending create admitted");
+        pendingRuntime.close(); pendingRuntime.tick(); pendingRuntime.close();
+        require(pendingTerminal.get() == 1, "pending close terminal exactly once");
+
+        ControlledCreate queued = new ControlledCreate(level); queued.returnNull = true;
+        ServerVerseRuntime queuedRuntime = controlledCreateRuntime(level, queued, false);
+        AtomicInteger queuedTerminal = new AtomicInteger();
+        require(queuedRuntime.beginCreate("queued-close", VerseLifecycleCommandService.CreateType.NORMAL, java.util.OptionalLong.empty(),
+                outcome -> { require(outcome == VerseLifecycleCommandService.CreateOutcome.QUARANTINED, "queued close quarantines"); queuedTerminal.incrementAndGet(); })
+                == VerseLifecycleCommandService.CreateAdmission.ADMITTED, "queued terminal admitted");
+        queuedRuntime.close(); queuedRuntime.tick(); queuedRuntime.close();
+        require(queuedTerminal.get() == 1, "queued close terminal exactly once");
         helper.succeed();
     }
 
     private static ServerVerseRuntime controlledCreateRuntime(ServerLevel level, ControlledCreate create, boolean wrongSeed) {
-        return ServerVerseRuntime.controlled(level.getServer(), descriptor -> new ServerVerseRuntime.CurrentLevelEvidence(descriptor.key(), level,
+        return ServerVerseRuntime.controlled(level.getServer(), descriptor -> create.visible && create.createdKeys.contains(descriptor.id()) ? new ServerVerseRuntime.CurrentLevelEvidence(descriptor.key(), level,
                         descriptor.generator(), descriptor.type(), descriptor.id() + "@" + Integer.toHexString(System.identityHashCode(level)),
-                        wrongSeed ? level.getSeed() + 1 : level.getSeed()),
+                        wrongSeed ? level.getSeed() + 1 : level.getSeed()) : null,
                 (catalog, gate) -> new ServerVerseRuntime.BridgeGateway() {
                     @Override public void registerReady(String key, String identity, long generation) { throw new AssertionError("create must publish through its reservation"); }
                     @Override public ProviderDuplicationBridge.BridgeAdmission beginDuplicate(String source, String destination,
@@ -394,11 +421,20 @@ public final class ProviderDuplicationBridgeGameTest {
     private static final class ControlledCreate implements ServerVerseRuntime.CreateGateway {
         private final ServerLevel level;
         private final AtomicInteger creates = new AtomicInteger();
+        private final java.util.Set<String> createdKeys = new java.util.HashSet<>();
         private boolean storageExists;
+        private boolean visible;
+        private boolean visibleAfterCreate = true;
+        private boolean returnNull;
         private ControlledCreate(ServerLevel level) { this.level = level; }
         @Override public boolean canCreate(ResourceLocation id) { return true; }
         @Override public boolean storageExists(OwnedDimensionDescriptor descriptor) { return storageExists; }
-        @Override public ServerLevel create(OwnedDimensionDescriptor descriptor) { creates.incrementAndGet(); return level; }
+        @Override public ServerLevel create(OwnedDimensionDescriptor descriptor) {
+            creates.incrementAndGet();
+            createdKeys.add(descriptor.id());
+            visible = visibleAfterCreate;
+            return returnNull ? null : level;
+        }
     }
 
     private static final class ControlledProvider implements ProviderDuplicationPort {

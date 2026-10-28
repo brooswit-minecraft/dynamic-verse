@@ -44,6 +44,7 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
     private final GatedVerseAccessService access;
     private final Queue<Runnable> terminalFeedback = new ArrayDeque<>();
     private final Set<AdmittedCompletion> admittedCompletions = new LinkedHashSet<>();
+    private final Set<AdmittedCreate> admittedCreates = new LinkedHashSet<>();
     private final Map<String, PendingCreate> pendingCreates = new HashMap<>();
     private final Map<String, Long> effectiveSeeds = new HashMap<>();
     private final BridgeGateway bridge;
@@ -119,11 +120,20 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
     public void stageOwnedDestination(OwnedDimensionDescriptor descriptor) { if (closed) throw new IllegalStateException("runtime closed"); catalog.register(descriptor); }
 
     @Override public VerseReservationSnapshot beginAcquireReadyRead(String verseName, VerseCompletionSink<VerseReservationSnapshot> sink) {
-        return access.beginAcquireReadyRead(verseName, sink);
+        String key = normalizeOwnedName(verseName);
+        if (key == null) {
+            VerseReservationSnapshot failed = VerseReservationSnapshot.failed(VerseReservationId.newId(), verseName, VerseAccessError.ERR_VERSE_NOT_FOUND);
+            sink.complete(failed);
+            return failed;
+        }
+        return access.beginAcquireReadyRead(key, sink);
     }
 
     @Override public DuplicateAdmission beginDuplicate(String source, String destination, Consumer<DuplicateOutcome> completion) {
         if (closed || bridge == null) return DuplicateAdmission.ERR_PROVIDER_UNAVAILABLE;
+        source = normalizeOwnedName(source);
+        destination = normalizeOwnedName(destination);
+        if (source == null || destination == null) return DuplicateAdmission.ERR_VERSE_NOT_FOUND;
         if (!catalog.contains(source)) return DuplicateAdmission.ERR_VERSE_NOT_FOUND;
         if (!catalog.contains(destination)) {
             try { reserveDuplicateDestination(source, destination); }
@@ -169,6 +179,7 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
             return CreateAdmission.ERR_VERSE_ALREADY_EXISTS;
         }
         AdmittedCreate admitted = new AdmittedCreate(completion);
+        admittedCreates.add(admitted);
         try {
             catalog.register(descriptor); // retains owned exclusion if provider invocation becomes uncertain.
             ServerLevel returned = creates.create(descriptor);
@@ -222,6 +233,8 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
             terminalFeedback.clear();
             for (PendingCreate pending : List.copyOf(pendingCreates.values())) pending.fail();
             pendingCreates.clear();
+            for (AdmittedCreate completion : List.copyOf(admittedCreates)) completion.forceQuarantine();
+            admittedCreates.clear();
             for (AdmittedCompletion completion : List.copyOf(admittedCompletions)) completion.complete(DuplicateOutcome.QUARANTINED);
             admittedCompletions.clear();
         }
@@ -244,6 +257,13 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
     private static ResourceLocation ownedCreateId(String name) {
         if (name == null || !name.matches("[a-z0-9_-]{1,32}")) return null;
         return ResourceLocation.fromNamespaceAndPath("dynamicverse", name);
+    }
+    /** One command/runtime boundary: bare approved names are ours; explicit forms must already be dynamicverse-owned. */
+    private static String normalizeOwnedName(String name) {
+        if (name == null) return null;
+        if (name.matches("[a-z0-9_-]{1,32}")) return ResourceLocation.fromNamespaceAndPath("dynamicverse", name).toString();
+        ResourceLocation id = ResourceLocation.tryParse(name);
+        return id != null && id.getNamespace().equals("dynamicverse") && id.getPath().matches("[a-z0-9_-]{1,32}") ? id.toString() : null;
     }
     private OwnedDimensionDescriptor createDescriptor(ResourceLocation id, CreateType type) {
         ChunkGenerator generator = switch (type) {
@@ -306,10 +326,25 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
     }
     private final class AdmittedCreate {
         private final Consumer<CreateOutcome> completion;
+        private CreateOutcome queued;
         private final AtomicBoolean delivered = new AtomicBoolean();
         private AdmittedCreate(Consumer<CreateOutcome> completion) { this.completion = completion; }
-        private void complete(CreateOutcome outcome) {
-            if (delivered.compareAndSet(false, true)) terminalFeedback.add(() -> completion.accept(outcome));
+        private synchronized void complete(CreateOutcome outcome) {
+            if (delivered.get() || queued != null) return;
+            queued = outcome;
+            terminalFeedback.add(this::deliverQueued);
+        }
+        private synchronized void forceQuarantine() {
+            if (delivered.get()) return;
+            queued = CreateOutcome.QUARANTINED;
+            deliverQueued();
+        }
+        private synchronized void deliverQueued() {
+            if (queued != null && delivered.compareAndSet(false, true)) {
+                CreateOutcome outcome = queued;
+                admittedCreates.remove(this);
+                completion.accept(outcome);
+            }
         }
     }
     private final class PendingCreate {
@@ -360,8 +395,7 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
                 @Override public boolean canCreate(ResourceLocation id) { return registry.canCreateDimension(id) && !registry.anyDimensionExists(id); }
                 @Override public boolean storageExists(OwnedDimensionDescriptor descriptor) {
                     java.nio.file.Path root = server.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT).toAbsolutePath().normalize();
-                    java.nio.file.Path path = DimensionType.getStorageFolder(descriptor.key(), root).toAbsolutePath().normalize();
-                    return !path.startsWith(root) || java.nio.file.Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS);
+                    return !OwnedCreateStorageConfinement.isFreshConfined(root, descriptor.key());
                 }
                 @Override public ServerLevel create(OwnedDimensionDescriptor descriptor) {
                     return registry.createDynamicDimension(descriptor.key().location(), descriptor.generator(), descriptor.type(), descriptor.properties());

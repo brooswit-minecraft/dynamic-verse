@@ -13,7 +13,6 @@ import java.util.Objects;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.arguments.EntityArgument;
-import net.minecraft.commands.arguments.ResourceLocationArgument;
 import net.minecraft.commands.arguments.coordinates.Vec3Argument;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
@@ -90,15 +89,14 @@ public final class NeoForgeVerseCommands {
     }
 
     private static LiteralArgumentBuilder<CommandSourceStack> duplicate(VerseLifecycleCommandService lifecycle) {
-        return Commands.literal(DUPLICATE).then(Commands.argument(SOURCE, ResourceLocationArgument.id())
-                .then(Commands.argument(NAME, ResourceLocationArgument.id()).executes(context -> {
+        return Commands.literal(DUPLICATE).then(Commands.argument(SOURCE, StringArgumentType.word())
+                .then(Commands.argument(NAME, StringArgumentType.word()).executes(context -> {
                     CommandSourceStack source = context.getSource();
                     boolean[] admitted = {false};
                     java.util.List<VerseLifecycleCommandService.DuplicateOutcome> early = new java.util.ArrayList<>();
                     java.util.concurrent.atomic.AtomicBoolean terminalOnce = new java.util.concurrent.atomic.AtomicBoolean();
                     VerseLifecycleCommandService.DuplicateAdmission result = lifecycle.beginDuplicate(
-                            ResourceLocationArgument.getId(context, SOURCE).toString(),
-                            ResourceLocationArgument.getId(context, NAME).toString(), outcome -> {
+                            StringArgumentType.getString(context, SOURCE), StringArgumentType.getString(context, NAME), outcome -> {
                                 if (!terminalOnce.compareAndSet(false, true)) return;
                                 if (admitted[0]) duplicateTerminal(source, outcome); else early.add(outcome);
                             });
