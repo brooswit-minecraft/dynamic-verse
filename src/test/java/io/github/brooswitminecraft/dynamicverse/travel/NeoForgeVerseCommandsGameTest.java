@@ -133,39 +133,27 @@ public final class NeoForgeVerseCommandsGameTest {
         helper.succeed();
     }
 
-    /** Compiled-only exact-once retirement evidence through the production facade. */
+    /** Compiled-only held-lease and pending-request retirement evidence through the production facade. */
     @GameTest(templateNamespace = "minecraft", template = "bastion/mobs/empty")
-    public static void runtimeRetiresAdmittedDuplicateExactlyOnce(GameTestHelper helper) throws Exception {
+    public static void runtimeRetiresOpenLeaseAndPendingAccess(GameTestHelper helper) throws Exception {
         OwnedDimensionDescriptor source = descriptor("retire-source", helper);
-        AtomicReference<java.util.function.Consumer<ProviderDuplicationBridge.BridgeOutcome>> lateCompletion = new AtomicReference<>();
         ServerVerseRuntime runtime = ServerVerseRuntime.controlled(helper.getLevel().getServer(), descriptor -> descriptor.id().equals(source.id()) ? evidence(descriptor, helper) : null,
-                (catalog, gate) -> new ServerVerseRuntime.BridgeGateway() {
-                    @Override public void registerReady(String key, String identity, long generation) { gate.publishReady(key, identity, generation); }
-                    @Override public ProviderDuplicationBridge.BridgeAdmission beginDuplicate(String sourceKey, String destinationKey, java.util.function.Consumer<ProviderDuplicationBridge.BridgeOutcome> completion) {
-                        gate.beginOperation(sourceKey, destinationKey);
-                        lateCompletion.set(completion);
-                        return ProviderDuplicationBridge.BridgeAdmission.ADMITTED;
-                    }
-                });
+                gateway(new AtomicInteger(), new AtomicInteger(), ProviderDuplicationBridge.BridgeAdmission.REJECTED, null));
         runtime.enrollVerifiedReady(provenance(source, helper, 2L));
         final VerseReservationSnapshot[] openRead = new VerseReservationSnapshot[1];
         runtime.beginAcquireReadyRead(source.id(), result -> openRead[0] = result); runtime.tick();
         ReadyVerseLease stillOpen = openRead[0].lease().orElseThrow();
         helper.assertTrue(runtime.resolve(stillOpen) == helper.getLevel(), "open owned lease resolves before runtime retirement");
-        AtomicInteger completions = new AtomicInteger();
-        runtime.beginDuplicate(source.id(), "dynamicverse:retire-copy", outcome -> {
-            helper.assertTrue(outcome == VerseLifecycleCommandService.DuplicateOutcome.QUARANTINED, "runtime retirement quarantines one admitted duplicate");
-            completions.incrementAndGet();
+        AtomicInteger pendingCompletions = new AtomicInteger();
+        runtime.beginAcquireReadyRead("dynamicverse:pending", result -> {
+            helper.assertTrue(result.phase() == io.github.brooswitminecraft.dynamicverse.lifecycle.VerseReservationPhase.FAILED,
+                    "runtime retirement settles a pending request");
+            pendingCompletions.incrementAndGet();
         });
-        helper.assertTrue(runtime.beginDuplicate(source.id(), "dynamicverse:retire-copy", ignored -> { }) == VerseLifecycleCommandService.DuplicateAdmission.ERR_VERSE_BUSY,
-                "an admitted operation holds the shared gate before retirement");
         runtime.close(); runtime.close();
-        helper.assertTrue(completions.get() == 1, "runtime retirement must not replay duplicate feedback");
+        helper.assertTrue(pendingCompletions.get() == 1, "pending retirement must complete exactly once");
         helper.assertTrue(runtime.resolve(stillOpen) == null, "an open lease cannot resolve after runtime retirement");
         stillOpen.close();
-        lateCompletion.get().accept(ProviderDuplicationBridge.BridgeOutcome.LOADED); runtime.tick();
-        helper.assertTrue(completions.get() == 1 && runtime.listManaged().stream().noneMatch(item -> item.name().equals("dynamicverse:retire-copy") && item.state() == ManagedVerseListing.State.READY),
-                "late provider completion cannot publish or replay after closure");
         AtomicInteger postClose = new AtomicInteger(); runtime.beginAcquireReadyRead(source.id(), ignored -> postClose.incrementAndGet());
         helper.assertTrue(postClose.get() == 1, "post-close access refuses immediately");
         helper.succeed();
