@@ -15,6 +15,15 @@ java {
     }
 }
 
+sourceSets {
+    // This run keeps the provider as an ordinary runtime mod dependency rather
+    // than a legacy-only classpath library; main still owns the fixture classes.
+    providerBridgeGameTest {
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+    }
+}
+
 neoForge {
     // Pinned to DynamicDimensions' minecraft/1.21 source declaration.
     version = "21.1.148"
@@ -33,8 +42,9 @@ neoForge {
         }
         register("providerBridgeGameTest") {
             type = "gameTestServer"
-            // Separate disposable root: this run activates the reviewed provider mod artifact.
-            gameDirectory = layout.projectDirectory.dir("run/providerBridgeGameTest")
+            // Never reuse the preserved failed-provider run root.
+            gameDirectory = layout.projectDirectory.dir("run/providerBridgeGameTest-runtime-mods")
+            sourceSet = sourceSets.providerBridgeGameTest
             systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
             systemProperty "dynamicverse.providerBridgeIntegration", "true"
         }
@@ -60,9 +70,10 @@ dependencies {
     testImplementation "org.junit.jupiter:junit-jupiter"
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
     bridgeGameTestAdditionalRuntimeClasspath files(reviewedDynamicDimensionsClasses)
-    // The provider integration run deliberately uses the reviewed mod artifact, including its mixin metadata.
-    providerBridgeGameTestAdditionalRuntimeClasspath files(acceptedDynamicDimensionsJar)
-    providerBridgeGameTestAdditionalRuntimeClasspath "lol.bai:badpackets:neo-0.8.2"
+    // The selected provider runtime source set exposes these as ordinary run
+    // dependencies so NeoForge discovers their mod metadata and mixins.
+    providerBridgeGameTestRuntimeOnly files(acceptedDynamicDimensionsJar)
+    providerBridgeGameTestRuntimeOnly "lol.bai:badpackets:neo-0.8.2"
 }
 
 tasks.register("verifyLocalDynamicDimensionsArtifact") {
