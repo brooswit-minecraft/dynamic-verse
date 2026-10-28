@@ -6,7 +6,8 @@ import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseAccessService;
-import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseReservationSnapshot;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.ManagedVerseListing;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseLifecycleCommandService;
 import java.util.Objects;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
@@ -24,6 +25,9 @@ public final class NeoForgeVerseCommands {
     private static final String TP = "tp";
     private static final String SEND = "send";
     private static final String BRING = "bring";
+    private static final String DUPLICATE = "duplicate";
+    private static final String LIST = "list";
+    private static final String SOURCE = "source";
     private static final String NAME = "name";
     private static final String PLAYER = "player";
     private static final String POSITION = "position";
@@ -39,14 +43,22 @@ public final class NeoForgeVerseCommands {
             CommandDispatcher<CommandSourceStack> dispatcher,
             VerseAccessService lifecycle,
             NeoForgeVerseTravelAdapter.ServerLevelResolver levels) {
+        register(dispatcher, lifecycle, levels, null);
+    }
+
+    /** Extends the single /verse tree; null lifecycle commands retain travel-only test registration. */
+    public static void register(CommandDispatcher<CommandSourceStack> dispatcher, VerseAccessService lifecycle,
+                                NeoForgeVerseTravelAdapter.ServerLevelResolver levels, VerseLifecycleCommandService commands) {
         Objects.requireNonNull(dispatcher);
         Objects.requireNonNull(lifecycle);
         Objects.requireNonNull(levels);
-        dispatcher.register(Commands.literal(VERSE)
+        LiteralArgumentBuilder<CommandSourceStack> root = Commands.literal(VERSE)
                 .requires(source -> source.hasPermission(OPERATOR_PERMISSION_LEVEL))
                 .then(tp(lifecycle, levels))
                 .then(send(lifecycle, levels))
-                .then(bring(lifecycle, levels)));
+                .then(bring(lifecycle, levels));
+        if (commands != null) root.then(duplicate(commands)).then(list(commands));
+        dispatcher.register(root);
     }
 
     private static LiteralArgumentBuilder<CommandSourceStack> tp(
@@ -70,6 +82,44 @@ public final class NeoForgeVerseCommands {
             VerseAccessService lifecycle, NeoForgeVerseTravelAdapter.ServerLevelResolver levels) {
         return Commands.literal(BRING).then(Commands.argument(PLAYER, EntityArgument.player())
                 .executes(context -> bring(context, lifecycle, levels)));
+    }
+
+    private static LiteralArgumentBuilder<CommandSourceStack> duplicate(VerseLifecycleCommandService lifecycle) {
+        return Commands.literal(DUPLICATE).then(Commands.argument(SOURCE, StringArgumentType.word())
+                .then(Commands.argument(NAME, StringArgumentType.word()).executes(context -> {
+                    CommandSourceStack source = context.getSource();
+                    boolean[] admitted = {false};
+                    java.util.List<VerseLifecycleCommandService.DuplicateOutcome> early = new java.util.ArrayList<>();
+                    java.util.concurrent.atomic.AtomicBoolean terminalOnce = new java.util.concurrent.atomic.AtomicBoolean();
+                    VerseLifecycleCommandService.DuplicateAdmission result = lifecycle.beginDuplicate(
+                            StringArgumentType.getString(context, SOURCE), StringArgumentType.getString(context, NAME), outcome -> {
+                                if (!terminalOnce.compareAndSet(false, true)) return;
+                                if (admitted[0]) duplicateTerminal(source, outcome); else early.add(outcome);
+                            });
+                    if (result != VerseLifecycleCommandService.DuplicateAdmission.ADMITTED) {
+                        source.sendFailure(Component.literal("duplicate failed: " + result));
+                        return 0;
+                    }
+                    admitted[0] = true;
+                    source.sendSuccess(() -> Component.literal("duplicate accepted/pending"), false);
+                    early.forEach(outcome -> duplicateTerminal(source, outcome));
+                    return 1;
+                })));
+    }
+
+    private static void duplicateTerminal(CommandSourceStack source, VerseLifecycleCommandService.DuplicateOutcome outcome) {
+        if (outcome == VerseLifecycleCommandService.DuplicateOutcome.LOADED) source.sendSuccess(() -> Component.literal("duplicate loaded"), false);
+        else source.sendFailure(Component.literal("duplicate failed: " + outcome));
+    }
+
+    private static LiteralArgumentBuilder<CommandSourceStack> list(VerseLifecycleCommandService lifecycle) {
+        return Commands.literal(LIST).executes(context -> {
+            java.util.List<ManagedVerseListing> managed = lifecycle.listManaged();
+            String message = managed.isEmpty() ? "managed verses: none" : "managed verses: " + managed.stream()
+                    .map(entry -> entry.name() + "=" + entry.state()).collect(java.util.stream.Collectors.joining(", "));
+            context.getSource().sendSuccess(() -> Component.literal(message), false);
+            return managed.size();
+        });
     }
 
     private static int teleportCaller(

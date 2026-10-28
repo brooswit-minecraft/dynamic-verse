@@ -1,6 +1,7 @@
 package io.github.brooswitminecraft.dynamicverse.lifecycle.copy;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
@@ -20,4 +21,9 @@ public final class OwnedDimensionCatalog {
         if (descriptor == null) throw new ClosedDimensionCopyException("Unsupported or unowned dimension descriptor: " + id);
         return descriptor;
     }
+
+    public synchronized boolean contains(String id) { return descriptors.containsKey(id); }
+
+    /** Snapshot only; catalog ownership never implies runtime readiness. */
+    public synchronized List<OwnedDimensionDescriptor> descriptors() { return List.copyOf(descriptors.values()); }
 }

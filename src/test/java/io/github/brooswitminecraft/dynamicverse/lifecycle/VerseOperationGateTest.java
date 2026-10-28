@@ -74,4 +74,21 @@ class VerseOperationGateTest {
         operation.close();
         org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, () -> gate.publishReady("source", "recovered", 3));
     }
+
+    @Test
+    void listingObservationNeverExposesPendingOrQuarantinedIdentity() {
+        VerseOperationGate gate = new VerseOperationGate();
+        assertEquals(VerseOperationGate.Readiness.State.PENDING, gate.readiness("source").state());
+        gate.publishReady("source", "source-instance", 1);
+        VerseOperationGate.Readiness ready = gate.readiness("source");
+        assertEquals(VerseOperationGate.Readiness.State.READY, ready.state());
+        assertEquals("source-instance", ready.identity());
+        VerseOperationGate.Operation operation = gate.beginOperation("source", "destination");
+        assertEquals(VerseOperationGate.Readiness.State.PENDING, gate.readiness("source").state());
+        assertEquals(VerseOperationGate.Readiness.State.PENDING, gate.readiness("destination").state());
+        operation.close();
+        assertEquals(VerseOperationGate.Readiness.State.QUARANTINED, gate.readiness("source").state());
+        assertEquals(null, gate.readiness("source").identity());
+        assertEquals(null, gate.readiness("destination").identity());
+    }
 }

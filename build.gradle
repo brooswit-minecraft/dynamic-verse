@@ -48,8 +48,7 @@ neoForge {
         gameTestServer {
             type = "gameTestServer"
             gameDirectory = project.file("run/gametest")
-            // This test's explicit template namespace is minecraft for the pinned vanilla empty template.
-            // Project source scan finds no other GameTest registration, so this does not broaden this project suite.
+            // The travel fixture uses the pinned vanilla empty template; bridge fixtures register separately.
             systemProperty "neoforge.enabledGameTestNamespaces", "minecraft"
         }
     }

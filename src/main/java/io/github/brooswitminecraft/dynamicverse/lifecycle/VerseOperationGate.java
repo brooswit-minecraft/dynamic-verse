@@ -43,6 +43,21 @@ public final class VerseOperationGate {
         return new ReadyRead(key, entry.identity, entry.generation);
     }
 
+    /** Non-leasing observation for truthful command listing. */
+    public synchronized Readiness readiness(String key) {
+        Entry entry = entries.get(key);
+        if (entry == null) return Readiness.pending();
+        if (entry.ready && !entry.operating && !entry.quarantined) return Readiness.ready(entry.identity, entry.generation);
+        return entry.quarantined ? Readiness.quarantined() : Readiness.pending();
+    }
+
+    public record Readiness(State state, String identity, long generation) {
+        public static Readiness ready(String identity, long generation) { return new Readiness(State.READY, identity, generation); }
+        public static Readiness pending() { return new Readiness(State.PENDING, null, 0); }
+        public static Readiness quarantined() { return new Readiness(State.QUARANTINED, null, 0); }
+        public enum State { READY, PENDING, QUARANTINED }
+    }
+
     public final class ReadyRead implements AutoCloseable {
         private final String key;
         private final String identity;

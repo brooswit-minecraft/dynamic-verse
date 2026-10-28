@@ -11,6 +11,8 @@ import io.github.brooswitminecraft.dynamicverse.lifecycle.ReadyVerseLease;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ReadyVerseLeaseFixtures;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseReservationId;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseReservationSnapshot;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.ManagedVerseListing;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseLifecycleCommandService;
 import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.List;
@@ -42,6 +44,30 @@ import net.neoforged.neoforge.gametest.PrefixGameTestTemplate;
 @PrefixGameTestTemplate(false)
 public final class NeoForgeVerseCommandsGameTest {
     private NeoForgeVerseCommandsGameTest() { }
+
+    /** Compiled platform-boundary coverage for the same /verse tree's lifecycle literals; no server run is implied here. */
+    @GameTest(templateNamespace = "minecraft", template = "bastion/mobs/empty")
+    public static void lifecycleDuplicateAndListBoundary(GameTestHelper helper) throws Exception {
+        CommandDispatcher<CommandSourceStack> dispatcher = new CommandDispatcher<>();
+        RecordingSource feedback = new RecordingSource();
+        ControlledLifecycle lifecycle = new ControlledLifecycle();
+        NeoForgeVerseCommands.register(dispatcher, new PendingAccess(), lease -> helper.getLevel(), lifecycle);
+        CommandSourceStack operator = source(feedback, null, helper, 2);
+        CommandSourceStack denied = source(feedback, null, helper, 1);
+        expectRejected(() -> dispatcher.execute("verse list", denied), CommandSyntaxException.BUILT_IN_EXCEPTIONS.dispatcherUnknownCommand(), "lifecycle permission denial");
+        dispatcher.execute("verse list", operator);
+        helper.assertTrue(feedback.successes.equals(List.of("managed verses: dynamicverse:alpha=READY, dynamicverse:pending=PENDING")), "list must expose state without a live identity");
+        feedback.clear();
+        dispatcher.execute("verse duplicate dynamicverse:alpha dynamicverse:copy", operator);
+        helper.assertTrue(feedback.successes.equals(List.of("duplicate accepted/pending")), "admission must not claim terminal success");
+        lifecycle.complete(VerseLifecycleCommandService.DuplicateOutcome.LOADED);
+        lifecycle.complete(VerseLifecycleCommandService.DuplicateOutcome.QUARANTINED);
+        helper.assertTrue(feedback.successes.equals(List.of("duplicate accepted/pending", "duplicate loaded")), "terminal feedback must be exactly once");
+        feedback.clear(); lifecycle.admission = VerseLifecycleCommandService.DuplicateAdmission.ERR_PROVIDER_UNAVAILABLE;
+        dispatcher.execute("verse duplicate dynamicverse:alpha dynamicverse:copy", operator);
+        helper.assertTrue(feedback.successes.equals(List.of("duplicate failed: ERR_PROVIDER_UNAVAILABLE")), "unavailable provider must fail closed without a pending claim");
+        helper.succeed();
+    }
 
     // This exact pinned-Minecraft template exists at data/minecraft/structure/bastion/mobs/empty.nbt.
     @GameTest(templateNamespace = "minecraft", template = "bastion/mobs/empty")
@@ -275,6 +301,19 @@ public final class NeoForgeVerseCommandsGameTest {
         }
         Request next() { return requests.removeFirst(); }
         record Request(VerseReservationId id, VerseCompletionSink<VerseReservationSnapshot> callback) { }
+    }
+
+    private static final class ControlledLifecycle implements VerseLifecycleCommandService {
+        private java.util.function.Consumer<DuplicateOutcome> completion;
+        private DuplicateAdmission admission = DuplicateAdmission.ADMITTED;
+        @Override public DuplicateAdmission beginDuplicate(String source, String destination, java.util.function.Consumer<DuplicateOutcome> callback) {
+            completion = callback; return admission;
+        }
+        @Override public List<ManagedVerseListing> listManaged() {
+            return List.of(new ManagedVerseListing("dynamicverse:alpha", ManagedVerseListing.State.READY, java.util.Optional.of("identity"), java.util.Optional.of(1L)),
+                    new ManagedVerseListing("dynamicverse:pending", ManagedVerseListing.State.PENDING, java.util.Optional.empty(), java.util.Optional.empty()));
+        }
+        void complete(DuplicateOutcome outcome) { completion.accept(outcome); }
     }
 
     private static final class RecordingLevelResolver implements NeoForgeVerseTravelAdapter.ServerLevelResolver {
