@@ -24,6 +24,12 @@ neoForge {
             sourceSet sourceSets.main
         }
     }
+    runs {
+        register("bridgeGameTest") {
+            type = "gameTestServer"
+            systemProperty "neoforge.enabledGameTestNamespaces", "minecraft"
+        }
+    }
 }
 
 repositories {
