@@ -14,6 +14,8 @@ import org.joml.Vector3f;
 
 import java.nio.file.Path;
 import java.util.function.Consumer;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** Source-only ModDev GameTest harness; do not execute without serialized runtime approval. */
 public final class ProviderDuplicationBridgeGameTest {
@@ -26,12 +28,17 @@ public final class ProviderDuplicationBridgeGameTest {
         catalog.register(source); catalog.register(descriptor("destination", level));
         VerseOperationGate gate = new VerseOperationGate();
         ControlledProvider provider = new ControlledProvider();
+        AtomicInteger copies = new AtomicInteger(); AtomicReference<ProviderDuplicationBridge.BridgeOutcome> outcome = new AtomicReference<>();
         ProviderDuplicationBridge bridge = new ProviderDuplicationBridge(catalog, gate, provider,
                 intent -> new ClosedDimensionCopyRequest(Path.of("/tmp"), Path.of("source"), Path.of("destination"), intent.sourceKey(), intent.generation()),
-                (request, receipt, fence) -> { if (gate.tryAcquireReadyRead(source.id()) != null) throw new AssertionError("premature ready"); });
+                (request, receipt, fence) -> { copies.incrementAndGet(); if (gate.tryAcquireReadyRead(source.id()) != null) throw new AssertionError("premature ready"); });
         bridge.registerReady(source.id(), "old", 1);
-        if (bridge.beginDuplicate(source.id(), "dynamicverse:destination", ignored -> { }) != ProviderDuplicationBridge.BridgeAdmission.ADMITTED) throw new AssertionError("admission");
+        if (bridge.beginDuplicate(source.id(), "dynamicverse:destination", outcome::set) != ProviderDuplicationBridge.BridgeAdmission.ADMITTED) throw new AssertionError("admission");
         provider.terminal.accept(new ProviderQuiesceCloseTerminal(source.id(), 7, true, ClosedDimensionStatus.SAVED_AND_CLOSED, false));
+        if (outcome.get() != ProviderDuplicationBridge.BridgeOutcome.RESTORED || copies.get() != 1 || provider.loads != 1) throw new AssertionError("terminal counts/outcome");
+        VerseOperationGate.ReadyRead read = gate.tryAcquireReadyRead(source.id());
+        if (read == null || !read.identity().equals("restored") || read.generation() != 7) throw new AssertionError("restored readiness");
+        read.close();
         helper.succeed();
     }
     private static OwnedDimensionDescriptor descriptor(String path, ServerLevel level) {
@@ -43,7 +50,8 @@ public final class ProviderDuplicationBridgeGameTest {
     }
     private static final class ControlledProvider implements ProviderDuplicationPort {
         Consumer<ProviderQuiesceCloseTerminal> terminal;
+        int loads;
         public boolean beginQuiesceAndClose(OwnedDimensionDescriptor source, Consumer<ProviderQuiesceCloseTerminal> terminal) { this.terminal = terminal; return true; }
-        public RestoredSource loadOriginalSource(OwnedDimensionDescriptor source, long generation) { return new RestoredSource("restored", generation); }
+        public RestoredSource loadOriginalSource(OwnedDimensionDescriptor source, long generation) { loads++; return new RestoredSource("restored", generation); }
     }
 }
