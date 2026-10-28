@@ -14,6 +14,7 @@ public final class ReadyVerseLease implements AutoCloseable {
     private final long generation;
     private final VerseReservationId reservationId;
     private final Runnable release;
+    private final Object owner;
     private final AtomicBoolean closed = new AtomicBoolean();
 
     ReadyVerseLease(
@@ -21,18 +22,22 @@ public final class ReadyVerseLease implements AutoCloseable {
             String levelIdentity,
             long generation,
             VerseReservationId reservationId,
-            Runnable release) {
+            Runnable release) { this(verseName, levelIdentity, generation, reservationId, release, null); }
+    ReadyVerseLease(String verseName, String levelIdentity, long generation, VerseReservationId reservationId, Runnable release, Object owner) {
         this.verseName = Objects.requireNonNull(verseName);
         this.levelIdentity = Objects.requireNonNull(levelIdentity);
         this.generation = generation;
         this.reservationId = Objects.requireNonNull(reservationId);
         this.release = Objects.requireNonNull(release);
+        this.owner = owner;
     }
 
     public String verseName() { return verseName; }
     public String levelIdentity() { return levelIdentity; }
     public long generation() { return generation; }
     public VerseReservationId reservationId() { return reservationId; }
+    boolean isClosed() { return closed.get(); }
+    boolean isOwnedBy(Object expected) { return owner == expected; }
 
     @Override
     public void close() {

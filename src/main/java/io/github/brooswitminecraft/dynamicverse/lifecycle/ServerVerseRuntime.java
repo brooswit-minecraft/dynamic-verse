@@ -45,10 +45,16 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
     }
 
     /** Future authorized ownership producer only: it must supply an exact live identity after successful enrollment. */
-    public void enrollVerifiedReady(OwnedDimensionDescriptor descriptor, String liveIdentity, long generation) throws ClosedDimensionCopyException {
+    public void enrollVerifiedReady(OwnedDimensionDescriptor descriptor, long generation) throws ClosedDimensionCopyException {
         if (closed || bridge == null) throw new IllegalStateException("Provider is unavailable: " + providerUnavailable);
+        ServerLevel level = server.getLevel(descriptor.key());
+        if (level == null || level.getChunkSource().getGenerator() != descriptor.generator()) {
+            throw new IllegalArgumentException("Verified ownership enrollment requires the current descriptor instance");
+        }
+        String identity = identity(level);
         catalog.register(descriptor);
-        bridge.registerReady(descriptor.id(), liveIdentity, generation);
+        try { bridge.registerReady(descriptor.id(), identity, generation); }
+        catch (ClosedDimensionCopyException | RuntimeException failed) { catalog.unregister(descriptor.id()); throw failed; }
     }
 
     /** Future authorized destination allocation only; staged descriptors are not READY or travelable. */
@@ -84,13 +90,20 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         };
     }
     public ServerLevel resolve(ReadyVerseLease lease) {
-        if (gate.readiness(lease.verseName()).state() != VerseOperationGate.Readiness.State.READY) return null;
-        try { return server.getLevel(catalog.require(lease.verseName()).key()); }
+        if (lease == null || lease.isClosed() || !lease.isOwnedBy(access)) return null;
+        VerseOperationGate.Readiness current = gate.readiness(lease.verseName());
+        if (current.state() != VerseOperationGate.Readiness.State.READY || !lease.levelIdentity().equals(current.identity()) || lease.generation() != current.generation()) return null;
+        try {
+            ServerLevel level = server.getLevel(catalog.require(lease.verseName()).key());
+            return level != null && identity(level).equals(lease.levelIdentity()) ? level : null;
+        }
         catch (ClosedDimensionCopyException ignored) { return null; }
     }
     /** Cooperating server tick; callback feedback is dispatched after access revalidation. */
     public void tick() { if (!closed) { access.tick(); while (!terminalFeedback.isEmpty()) terminalFeedback.remove().run(); } }
-    @Override public void close() { closed = true; terminalFeedback.clear(); }
+    public boolean owns(MinecraftServer candidate) { return server == candidate; }
+    @Override public void close() { if (!closed) { closed = true; access.retire(); terminalFeedback.clear(); } }
+    private static String identity(ServerLevel level) { return level.dimension().location() + "@" + Integer.toHexString(System.identityHashCode(level)); }
     private static DuplicateOutcome map(ProviderDuplicationBridge.BridgeOutcome outcome) {
         return switch (outcome) { case LOADED -> DuplicateOutcome.LOADED; case RESTORED -> DuplicateOutcome.RESTORED; case QUARANTINED -> DuplicateOutcome.QUARANTINED; };
     }

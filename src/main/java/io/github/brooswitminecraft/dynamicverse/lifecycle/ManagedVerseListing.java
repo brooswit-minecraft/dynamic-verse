@@ -10,7 +10,10 @@ public record ManagedVerseListing(String name, State state, Optional<String> lev
         Objects.requireNonNull(state);
         Objects.requireNonNull(levelIdentity);
         Objects.requireNonNull(generation);
-        if (state == State.READY != (levelIdentity.isPresent() && generation.isPresent())) {
+        if (state == State.READY && (!levelIdentity.isPresent() || !generation.isPresent())) {
+            throw new IllegalArgumentException("READY listings require identity and generation");
+        }
+        if (state != State.READY && (levelIdentity.isPresent() || generation.isPresent())) {
             throw new IllegalArgumentException("Only READY listings may expose a live level identity");
         }
     }

@@ -150,7 +150,9 @@ the provider capability.
 ## Current capability boundary
 
 MINECRAFT-469 v5 remains authoritative: explicit independently seeded creation
-and a verified forced-save-and-close result are unproven. The server runtime
+and a generalized failed-close/recovery protocol are unproven. The accepted
+initially-loaded normal path has verified forced save-and-close followed by
+confined copy, source restoration, and destination load. The server runtime
 starts with an empty, runtime-only managed catalog: it does not adopt existing
 world files or reconstruct READY entries after restart. A future authorized
 ownership producer must supply a verified descriptor and exact live identity

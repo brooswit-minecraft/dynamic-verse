@@ -1,4 +1,4 @@
-# Production duplication coordinator (source-only)
+# Production duplication coordinator
 
 `ProviderDuplicationBridge` is the production handoff around the accepted
 provider close adapter and `ClosedDimensionCopier`. It admits an operation only
@@ -10,7 +10,7 @@ level disappearance are not terminals.
 
 The coordinator centrally consumes the terminal identity and claims each
 destination once. Mapping, fence, and copier failures leave a claimed
-destination unavailable; no retry, destination load, or publication method
+destination unavailable; no retry or publication method
 exists here. On successful copy the bridge restores only the original source.
 
 ## Implemented supported bridge

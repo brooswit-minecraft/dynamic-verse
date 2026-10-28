@@ -12,6 +12,8 @@ class ManagedVerseListingTest {
         assertDoesNotThrow(() -> new ManagedVerseListing("dynamicverse:pending", ManagedVerseListing.State.PENDING, Optional.empty(), Optional.empty()));
         assertDoesNotThrow(() -> new ManagedVerseListing("dynamicverse:failed", ManagedVerseListing.State.QUARANTINED, Optional.empty(), Optional.empty()));
         assertThrows(IllegalArgumentException.class, () -> new ManagedVerseListing("dynamicverse:pending", ManagedVerseListing.State.PENDING, Optional.of("level"), Optional.of(1L)));
+        assertThrows(IllegalArgumentException.class, () -> new ManagedVerseListing("dynamicverse:pending", ManagedVerseListing.State.PENDING, Optional.of("level"), Optional.empty()));
+        assertThrows(IllegalArgumentException.class, () -> new ManagedVerseListing("dynamicverse:pending", ManagedVerseListing.State.PENDING, Optional.empty(), Optional.of(1L)));
         assertThrows(IllegalArgumentException.class, () -> new ManagedVerseListing("dynamicverse:ready", ManagedVerseListing.State.READY, Optional.empty(), Optional.empty()));
     }
 }

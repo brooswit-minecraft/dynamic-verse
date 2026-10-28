@@ -46,8 +46,8 @@ public final class DynamicVerse {
     private void registerCommands(RegisterCommandsEvent event) {
         NeoForgeVerseCommands.register(event.getDispatcher(), facade, lease -> runtime == null ? null : runtime.resolve(lease), facade);
     }
-    private void afterServerTick(ServerTickEvent.Post event) { if (runtime != null && event.getServer() != null) runtime.tick(); }
-    private void serverStopping(ServerStoppingEvent event) { if (runtime != null) { runtime.close(); runtime = null; } }
+    private void afterServerTick(ServerTickEvent.Post event) { if (runtime != null && runtime.owns(event.getServer())) runtime.tick(); }
+    private void serverStopping(ServerStoppingEvent event) { if (runtime != null && runtime.owns(event.getServer())) { runtime.close(); runtime = null; } }
 
     /** Stateless delegation prevents command-event ordering from fabricating a runtime/catalog. */
     private final class BootstrapFacade implements VerseAccessService, VerseLifecycleCommandService {

@@ -13,7 +13,7 @@ Build the fixture with:
 JAVA_HOME=/path/to/jdk-21 ./gradlew test --no-daemon
 ```
 
-The first experiment must pin DynamicDimensions source or artifact evidence
-before adding an integration. See `docs/feasibility-provenance.md`. Explicit-
-seed creation, duplicate, and delete remain fail-closed until the
-MINECRAFT-469 v5 capability requirements are proven.
+The reviewed provider path has demonstrated one initially-loaded normal
+close→confined-copy→source-restore→destination-load operation. See
+`docs/feasibility-provenance.md`. Explicit-seed creation, arbitrary enrollment,
+failed-close recovery, restart reconstruction, and delete remain fail-closed.
