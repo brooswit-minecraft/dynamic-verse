@@ -75,7 +75,7 @@ neoForge {
         register("providerCreateGameTest") {
             type = "gameTestServer"
             // Dedicated, disposable native-create fixture root. Preparation must
-            // create it fail-if-absent; never point a run at an existing world.
+            // create it only when absent and fail if it already exists.
             gameDirectory = layout.projectDirectory.dir("run/providerCreateGameTest-native-omitted-seed-create")
             // Reuse the reviewed provider-enabled source set, but select only
             // the native CreateGateway integration fixture below.

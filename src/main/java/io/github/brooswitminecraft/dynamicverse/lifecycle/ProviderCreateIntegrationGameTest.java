@@ -8,10 +8,13 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import net.minecraft.core.registries.Registries;
+import net.minecraft.core.Holder;
+import net.minecraft.core.HolderSet;
 import net.minecraft.gametest.framework.GameTest;
 import net.minecraft.gametest.framework.GameTestHelper;
 import net.minecraft.resources.ResourceKey;
@@ -21,12 +24,15 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.biome.MultiNoiseBiomeSource;
 import net.minecraft.world.level.biome.MultiNoiseBiomeSourceParameterLists;
+import net.minecraft.world.level.biome.BiomeGenerationSettings;
 import net.minecraft.world.level.chunk.ChunkGenerator;
 import net.minecraft.world.level.dimension.DimensionType;
 import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
 import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
 import net.minecraft.world.level.levelgen.FlatLevelSource;
 import net.minecraft.world.level.levelgen.flat.FlatLevelGeneratorSettings;
+import net.minecraft.world.level.levelgen.flat.FlatLayerInfo;
+import net.minecraft.world.level.levelgen.structure.StructureSet;
 import net.minecraft.world.level.storage.LevelResource;
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate;
 
@@ -154,15 +160,47 @@ public final class ProviderCreateIntegrationGameTest {
                 fixture.server.registryAccess().lookupOrThrow(Registries.BIOME),
                 fixture.server.registryAccess().lookupOrThrow(Registries.STRUCTURE_SET),
                 fixture.server.registryAccess().lookupOrThrow(Registries.PLACED_FEATURE));
-        require(helper, generator instanceof FlatLevelSource flat
-                        && flat.settings().getBiome().equals(defaults.getBiome())
-                        && flat.settings().getLayersInfo().equals(defaults.getLayersInfo()),
+        require(helper, generator instanceof FlatLevelSource flat && sameDefaultSuperflat(flat.settings(), defaults),
                 "superflat uses the default FlatLevelSource configuration");
         require(helper, superflat.getSeed() == fixture.sharedSeed
                 && fixture.runtime.recordedEffectiveSeed(fixture.superflatKey.location().toString()).orElseThrow() == fixture.sharedSeed,
                 "superflat records the actual shared save seed");
         require(helper, listing(fixture.runtime, fixture.superflatKey.location().toString()).state() == ManagedVerseListing.State.READY,
                 "superflat is READY only after current registration observation");
+    }
+
+    /** Public semantic comparison: FlatLayerInfo has no value equality in the pinned runtime. */
+    private static boolean sameDefaultSuperflat(FlatLevelGeneratorSettings actual, FlatLevelGeneratorSettings expected) {
+        if (!actual.getBiome().equals(expected.getBiome()) || !sameLayers(actual.getLayersInfo(), expected.getLayersInfo())) return false;
+        if (!holderKeys(actual.structureOverrides()).equals(holderKeys(expected.structureOverrides()))) return false;
+        // adjustGenerationSettings exposes the default decoration/lake result without
+        // relying on its private flags or on independently allocated holder lists.
+        return featureKeys(actual.adjustGenerationSettings(actual.getBiome()))
+                .equals(featureKeys(expected.adjustGenerationSettings(expected.getBiome())));
+    }
+
+    private static boolean sameLayers(List<FlatLayerInfo> actual, List<FlatLayerInfo> expected) {
+        if (actual.size() != expected.size()) return false;
+        for (int index = 0; index < actual.size(); index++) {
+            FlatLayerInfo actualLayer = actual.get(index);
+            FlatLayerInfo expectedLayer = expected.get(index);
+            if (actualLayer.getHeight() != expectedLayer.getHeight()
+                    || !actualLayer.getBlockState().equals(expectedLayer.getBlockState())) return false;
+        }
+        return true;
+    }
+
+    private static List<String> holderKeys(Optional<HolderSet<StructureSet>> holders) {
+        return holders.stream().flatMap(HolderSet::stream).map(ProviderCreateIntegrationGameTest::holderKey).toList();
+    }
+
+    private static List<List<String>> featureKeys(BiomeGenerationSettings settings) {
+        return settings.features().stream().map(features -> features.stream()
+                .map(ProviderCreateIntegrationGameTest::holderKey).toList()).toList();
+    }
+
+    private static <T> String holderKey(Holder<T> holder) {
+        return holder.unwrapKey().map(key -> key.location().toString()).orElseGet(() -> holder.value().toString());
     }
 
     private static void verifyListingsAndBareAccess(GameTestHelper helper, Fixture fixture, ServerLevel superflat) {
