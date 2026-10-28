@@ -2,6 +2,8 @@ package io.github.brooswitminecraft.dynamicverse.lifecycle.copy;
 
 import dev.galacticraft.dynamicdimensions.api.DynamicDimensionProperties;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseOperationGate;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.ServerVerseRuntime;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseLifecycleCommandService;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.gametest.framework.GameTest;
 import net.minecraft.gametest.framework.GameTestHelper;
@@ -191,6 +193,48 @@ public final class ProviderDuplicationBridgeGameTest {
         wrong.provider.deliver(success(wrong.source.id(), 7));
         wrong.provider.completeDestinationObservation(false);
         assertSourceOnlyRestored(wrong, "wrong/timeout destination registration", 1);
+        helper.succeed();
+    }
+
+    /** Compiled-only facade-to-real-bridge composition: controlled ports, no native provider or world lifecycle. */
+    @GameTest(templateNamespace = "dynamicverse", template = "empty")
+    @PrefixGameTestTemplate(false)
+    public void controlledRuntimeFacadeRetiresActualBridgeAdmission(GameTestHelper helper) throws Exception {
+        ServerLevel level = helper.getLevel();
+        OwnedDimensionDescriptor source = descriptor("runtime-source", level);
+        AtomicReference<ControlledProvider> controlledProvider = new AtomicReference<>();
+        ServerVerseRuntime runtime = ServerVerseRuntime.controlled(level.getServer(), descriptor -> descriptor.id().equals(source.id())
+                        ? new ServerVerseRuntime.CurrentLevelEvidence(descriptor.key(), level, descriptor.generator(), descriptor.type(),
+                        descriptor.id() + "@" + Integer.toHexString(System.identityHashCode(level))) : null,
+                (catalog, gate) -> {
+                    ControlledProvider provider = new ControlledProvider(gate, source.id(), "dynamicverse:runtime-copy");
+                    controlledProvider.set(provider);
+                    ProviderDuplicationBridge bridge = new ProviderDuplicationBridge(catalog, gate, provider,
+                            intent -> new ClosedDimensionCopyRequest(Path.of("/tmp"), Path.of("runtime-source"), Path.of("runtime-copy"), intent.sourceKey(), intent.generation()),
+                            (request, receipt, fence) -> { });
+                    return new ServerVerseRuntime.BridgeGateway() {
+                        @Override public void registerReady(String key, String identity, long generation) throws ClosedDimensionCopyException { bridge.registerReady(key, identity, generation); }
+                        @Override public ProviderDuplicationBridge.BridgeAdmission beginDuplicate(String sourceKey, String destinationKey,
+                                                                                                   java.util.function.Consumer<ProviderDuplicationBridge.BridgeOutcome> completion) throws ClosedDimensionCopyException {
+                            return bridge.beginDuplicate(sourceKey, destinationKey, completion);
+                        }
+                    };
+                });
+        String identity = source.id() + "@" + Integer.toHexString(System.identityHashCode(level));
+        runtime.enrollVerifiedReady(new ServerVerseRuntime.EnrollmentProvenance(source, level, 1, identity));
+        AtomicReference<VerseLifecycleCommandService.DuplicateOutcome> terminal = new AtomicReference<>();
+        AtomicInteger terminalCount = new AtomicInteger();
+        require(runtime.beginDuplicate(source.id(), "dynamicverse:runtime-copy", outcome -> { terminal.set(outcome); terminalCount.incrementAndGet(); })
+                        == VerseLifecycleCommandService.DuplicateAdmission.ADMITTED, "facade admits through actual bridge");
+        require(runtime.beginDuplicate(source.id(), "dynamicverse:runtime-copy", ignored -> { })
+                        == VerseLifecycleCommandService.DuplicateAdmission.ERR_VERSE_BUSY, "actual bridge converts busy gate to refusal");
+        runtime.close();
+        require(terminal.get() == VerseLifecycleCommandService.DuplicateOutcome.QUARANTINED && terminalCount.get() == 1,
+                "runtime retirement terminates admitted facade callback once");
+        controlledProvider.get().deliver(success(source.id(), 7));
+        runtime.tick();
+        require(terminalCount.get() == 1 && runtime.listManaged().stream().noneMatch(item -> item.state() == io.github.brooswitminecraft.dynamicverse.lifecycle.ManagedVerseListing.State.READY),
+                "late real bridge completion cannot restore closed facade readiness or callback");
         helper.succeed();
     }
 

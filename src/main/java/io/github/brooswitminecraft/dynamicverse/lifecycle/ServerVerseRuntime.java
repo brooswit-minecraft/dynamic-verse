@@ -118,6 +118,7 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         return catalog.descriptors().stream().map(descriptor -> listing(descriptor.id())).sorted(Comparator.comparing(ManagedVerseListing::name)).toList();
     }
     private ManagedVerseListing listing(String key) {
+        if (closed) return new ManagedVerseListing(key, ManagedVerseListing.State.QUARANTINED, Optional.empty(), Optional.empty());
         VerseOperationGate.Readiness readiness = gate.readiness(key);
         return switch (readiness.state()) {
             case READY -> new ManagedVerseListing(key, ManagedVerseListing.State.READY, Optional.of(readiness.identity()), Optional.of(readiness.generation()));
@@ -126,7 +127,7 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         };
     }
     public ServerLevel resolve(ReadyVerseLease lease) {
-        if (lease == null || lease.isClosed() || !lease.isOwnedBy(access)) return null;
+        if (closed || lease == null || lease.isClosed() || !lease.isOwnedBy(access)) return null;
         VerseOperationGate.Readiness current = gate.readiness(lease.verseName());
         if (current.state() != VerseOperationGate.Readiness.State.READY || !lease.levelIdentity().equals(current.identity()) || lease.generation() != current.generation()) return null;
         try {
