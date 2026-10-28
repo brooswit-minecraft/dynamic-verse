@@ -6,6 +6,7 @@ import io.github.brooswitminecraft.dynamicverse.lifecycle.ServerVerseRuntime;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseLifecycleCommandService;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.InMemoryManagedVerseStateStore;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ManagedVerseStateStore;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.ManagedVerseListing;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.gametest.framework.GameTest;
 import net.minecraft.gametest.framework.GameTestHelper;
@@ -337,6 +338,31 @@ public final class ProviderDuplicationBridgeGameTest {
         helper.succeed();
     }
 
+    /** Compiled-only fresh-runtime replay: storage must exist and current evidence must agree before READY. */
+    @GameTest(templateNamespace = "dynamicverse", template = "empty")
+    @PrefixGameTestTemplate(false)
+    public void controlledRuntimeReplaysOnlyVerifiedRetainedReadyState(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        String key = "dynamicverse:replayed";
+        ManagedVerseStateStore.ReadyVerse ready = new ManagedVerseStateStore.ReadyVerse(key, VerseLifecycleCommandService.CreateType.NORMAL,
+                level.getSeed(), 9L, "OVERWORLD_RECONSTRUCTED", "DEFAULT_DYNAMIC_PROPERTIES");
+        InMemoryManagedVerseStateStore state = new InMemoryManagedVerseStateStore();
+        state.write(new ManagedVerseStateStore.State(java.util.Map.of(key, ready), java.util.Map.of()));
+        ControlledCreate retained = new ControlledCreate(level); retained.storedData = true; retained.reloads = true;
+        ServerVerseRuntime replayed = controlledCreateRuntime(level, retained, false, state);
+        require(retained.reloadCalls.get() == 1 && replayed.listManaged().stream().anyMatch(e -> e.name().equals(key) && e.state() == ManagedVerseListing.State.READY),
+                "fresh runtime publishes only after controlled load/current evidence");
+        AtomicReference<io.github.brooswitminecraft.dynamicverse.lifecycle.VerseReservationSnapshot> read = new AtomicReference<>();
+        replayed.beginAcquireReadyRead(key, read::set); replayed.tick();
+        require(read.get().lease().isPresent() && replayed.resolve(read.get().lease().orElseThrow()) == level, "verified replay alone admits travel");
+        read.get().lease().orElseThrow().close();
+        ControlledCreate absent = new ControlledCreate(level);
+        ServerVerseRuntime missing = controlledCreateRuntime(level, absent, false, state);
+        require(absent.reloadCalls.get() == 0 && missing.listManaged().stream().anyMatch(e -> e.name().equals(key) && e.state() == ManagedVerseListing.State.QUARANTINED),
+                "missing path refuses provider load and stays unavailable");
+        helper.succeed();
+    }
+
     private static ServerVerseRuntime controlledCreateRuntime(ServerLevel level, ControlledCreate create, boolean wrongSeed) {
         return controlledCreateRuntime(level, create, wrongSeed, new InMemoryManagedVerseStateStore());
     }
@@ -452,6 +478,9 @@ public final class ProviderDuplicationBridgeGameTest {
         private boolean visible;
         private boolean visibleAfterCreate = true;
         private boolean returnNull;
+        private boolean storedData;
+        private boolean reloads;
+        private final AtomicInteger reloadCalls = new AtomicInteger();
         private ControlledCreate(ServerLevel level) { this.level = level; }
         @Override public boolean canCreate(ResourceLocation id) { return true; }
         @Override public boolean storageExists(OwnedDimensionDescriptor descriptor) { return storageExists; }
@@ -461,6 +490,8 @@ public final class ProviderDuplicationBridgeGameTest {
             visible = visibleAfterCreate;
             return returnNull ? null : level;
         }
+        @Override public boolean hasStoredData(OwnedDimensionDescriptor descriptor) { return storedData; }
+        @Override public ServerLevel reload(OwnedDimensionDescriptor descriptor) { reloadCalls.incrementAndGet(); return reloads ? level : null; }
     }
 
     private static final class ControlledProvider implements ProviderDuplicationPort {
