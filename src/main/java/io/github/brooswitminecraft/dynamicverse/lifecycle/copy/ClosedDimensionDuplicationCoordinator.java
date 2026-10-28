@@ -4,6 +4,9 @@ import java.util.HashSet;
 import java.util.Objects;
 import java.util.Set;
 
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
 /**
  * One-shot production coordinator between a provider close terminal and the
  * confined copier. It has no provider, filesystem, load, or publication
@@ -11,6 +14,7 @@ import java.util.Set;
  * destination unavailable for this coordinator instance.
  */
 public final class ClosedDimensionDuplicationCoordinator {
+    private static final Logger LOGGER = Logger.getLogger(ClosedDimensionDuplicationCoordinator.class.getName());
     private final DimensionStoragePathResolver paths;
     private final ClosedDimensionCopyPort copier;
     private final SourceWriteReloadFence fence;
@@ -55,10 +59,16 @@ public final class ClosedDimensionDuplicationCoordinator {
         }
 
         try {
+            LOGGER.info("Closed dimension copier entered source=" + intent.sourceKey() + " destination=" + intent.destinationKey()
+                    + " generation=" + intent.generation());
             copier.copy(request, terminal.receipt(), operationFence);
+            LOGGER.info("Closed dimension copier completed source=" + intent.sourceKey() + " destination=" + intent.destinationKey()
+                    + " generation=" + intent.generation());
             return new ClosedDimensionDuplicationResult(ClosedDimensionDuplicationResult.Outcome.COPIED,
                     "Exact close terminal copied; separate ordered load wiring is still required");
         } catch (ClosedDimensionCopyException | RuntimeException e) {
+            LOGGER.log(Level.WARNING, "Closed dimension copier failed source=" + intent.sourceKey() + " destination="
+                    + intent.destinationKey() + " generation=" + intent.generation(), e);
             return unavailable(intent.destinationKey(), "Copy failed; retained destination must not load or publish: " + e.getMessage(), e);
         }
     }

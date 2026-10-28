@@ -2,18 +2,18 @@ package io.github.brooswitminecraft.dynamicverse.lifecycle.copy;
 
 import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseOperationGate;
 import net.minecraft.server.MinecraftServer;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.util.Objects;
 import java.util.function.Consumer;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
  * Production operation bridge: provider admission -> exact terminal -> confined
  * copier -> normal source load. The shared operation gate stays held throughout.
  */
 public final class ProviderDuplicationBridge {
-    private static final Logger LOGGER = LoggerFactory.getLogger(ProviderDuplicationBridge.class);
+    private static final Logger LOGGER = Logger.getLogger(ProviderDuplicationBridge.class.getName());
     private final OwnedDimensionCatalog catalog;
     private final VerseOperationGate gate;
     private final ProviderDuplicationPort provider;
@@ -73,37 +73,47 @@ public final class ProviderDuplicationBridge {
         long generation = terminal == null ? Long.MIN_VALUE : terminal.generation();
         if (!operation.claimTerminal(generation)) return;
         BridgeOutcome outcome = BridgeOutcome.QUARANTINED;
+        String phase = "terminal evaluation";
         try {
             if (terminal != null) {
-                LOGGER.info("Provider duplicate terminal source={} destination={} generation={} initiallyLoaded={} status={} failurePresent={} failureStage={} cause={}",
-                        source.id(), destinationKey, terminal.generation(), terminal.initiallyLoaded(), terminal.status(),
-                        terminal.failurePresent(), terminal.failureStage(), terminal.cause());
+                LOGGER.info("Provider duplicate terminal expectedSource=" + source.id() + " terminalSource=" + terminal.sourceKey()
+                        + " destination=" + destinationKey + " generation=" + terminal.generation() + " initiallyLoaded="
+                        + terminal.initiallyLoaded() + " status=" + terminal.status() + " failurePresent=" + terminal.failurePresent()
+                        + " failureStage=" + terminal.failureStage() + " cause=" + terminal.cause());
+                if (terminal.cause() != null) {
+                    LOGGER.log(Level.WARNING, "Provider duplicate terminal cause expectedSource=" + source.id() + " terminalSource="
+                            + terminal.sourceKey() + " destination=" + destinationKey + " generation=" + terminal.generation(), terminal.cause());
+                }
                 ClosedDimensionDuplicationIntent intent = new ClosedDimensionDuplicationIntent(source.id(), destinationKey, terminal.generation());
-                LOGGER.info("Provider duplicate copy entered source={} destination={} generation={}", source.id(), destinationKey, terminal.generation());
+                phase = "coordinator evaluation";
                 ClosedDimensionDuplicationResult copied = coordinator.duplicate(intent, terminal, operation.copierFence());
+                LOGGER.info("Provider duplicate coordinator result source=" + source.id() + " destination=" + destinationKey
+                        + " generation=" + terminal.generation() + " outcome=" + copied.outcome() + " detail=" + copied.detail()
+                        + " cause=" + copied.cause());
                 if (copied.outcome() == ClosedDimensionDuplicationResult.Outcome.COPIED) {
-                    LOGGER.info("Provider duplicate copy completed source={} destination={} generation={}", source.id(), destinationKey, terminal.generation());
-                    LOGGER.info("Provider duplicate restoration entered source={} generation={}", source.id(), terminal.generation());
+                    phase = "restoration";
+                    LOGGER.info("Provider duplicate restoration entered source=" + source.id() + " generation=" + terminal.generation());
                     ProviderDuplicationPort.RestoredSource restored = provider.loadOriginalSource(source, terminal.generation());
                     if (restored != null && restored.instanceIdentity() != null && !restored.instanceIdentity().isBlank()) {
-                        LOGGER.info("Provider duplicate restoration returned source={} generation={} identity={}", source.id(), restored.generation(), restored.instanceIdentity());
+                        LOGGER.info("Provider duplicate restoration returned source=" + source.id() + " generation=" + restored.generation()
+                                + " identity=" + restored.instanceIdentity());
                         operation.restored(restored.instanceIdentity(), restored.generation());
                         outcome = BridgeOutcome.RESTORED;
                     } else {
-                        LOGGER.warn("Provider duplicate restoration returned null/invalid source={} generation={}", source.id(), terminal.generation());
+                        LOGGER.warning("Provider duplicate restoration returned null/invalid source=" + source.id()
+                                + " generation=" + terminal.generation());
                     }
-                } else {
-                    LOGGER.warn("Provider duplicate copy failed source={} destination={} generation={} outcome={} detail={} cause={}",
-                            source.id(), destinationKey, terminal.generation(), copied.outcome(), copied.detail(), copied.cause());
                 }
             } else {
-                LOGGER.warn("Provider duplicate terminal absent source={} destination={}", source.id(), destinationKey);
+                LOGGER.warning("Provider duplicate terminal absent source=" + source.id() + " destination=" + destinationKey);
             }
         } catch (RuntimeException e) {
-            LOGGER.warn("Provider duplicate restoration failed source={} destination={} generation={}", source.id(), destinationKey, generation, e);
+            LOGGER.log(Level.WARNING, "Provider duplicate pipeline failure phase=" + phase + " source=" + source.id()
+                    + " destination=" + destinationKey + " generation=" + generation, e);
         } finally {
             operation.close();
-            LOGGER.info("Provider duplicate final source={} destination={} generation={} outcome={}", source.id(), destinationKey, generation, outcome);
+            LOGGER.info("Provider duplicate final source=" + source.id() + " destination=" + destinationKey
+                    + " generation=" + generation + " outcome=" + outcome);
             try { completion.accept(outcome); } catch (RuntimeException ignored) { }
         }
     }

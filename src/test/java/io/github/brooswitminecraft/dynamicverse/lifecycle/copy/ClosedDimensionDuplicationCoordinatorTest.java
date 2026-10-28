@@ -42,6 +42,19 @@ class ClosedDimensionDuplicationCoordinatorTest {
     }
 
     @Test
+    void terminalStageOrCauseCannotContradictFalseFailureFlagAndReachCopier() {
+        RecordingCopier copier = new RecordingCopier(false);
+        ClosedDimensionDuplicationCoordinator coordinator = coordinator(copier, this::request);
+        ClosedDimensionDuplicationIntent intent = intent(12);
+
+        assertRejected(coordinator.duplicate(intent, new ProviderQuiesceCloseTerminal("source", 12, true,
+                ClosedDimensionStatus.SAVED_AND_CLOSED, false, "SAVE", null)));
+        assertRejected(coordinator.duplicate(intent, new ProviderQuiesceCloseTerminal("source", 12, true,
+                ClosedDimensionStatus.SAVED_AND_CLOSED, false, null, new IllegalStateException("close failed"))));
+        assertEquals(0, copier.calls.get());
+    }
+
+    @Test
     void resolverIdentityMismatchAndDifferentGenerationForClaimedDestinationNeverReachCopy() {
         RecordingCopier mismatchCopier = new RecordingCopier(false);
         ClosedDimensionDuplicationCoordinator mismatch = coordinator(mismatchCopier,

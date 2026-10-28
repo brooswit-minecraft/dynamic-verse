@@ -24,6 +24,7 @@ public record ProviderQuiesceCloseTerminal(
     public ProviderQuiesceCloseTerminal {
         Objects.requireNonNull(sourceKey);
         Objects.requireNonNull(status);
+        failurePresent |= failureStage != null || cause != null;
     }
 
     ClosedDimensionReceipt receipt() {
