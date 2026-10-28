@@ -10,6 +10,8 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Queue;
+import java.util.LinkedHashSet;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import net.minecraft.server.MinecraftServer;
@@ -22,6 +24,7 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
     private final VerseOperationGate gate;
     private final GatedVerseAccessService access;
     private final Queue<Runnable> terminalFeedback = new ArrayDeque<>();
+    private final Set<Consumer<DuplicateOutcome>> admittedCompletions = new LinkedHashSet<>();
     private final ProviderDuplicationBridge bridge;
     private final String providerUnavailable;
     private boolean closed;
@@ -70,12 +73,15 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         if (!catalog.contains(destination)) return DuplicateAdmission.ERR_VERSE_NOT_FOUND;
         if (source.equals(destination)) return DuplicateAdmission.ERR_VERSE_ALREADY_EXISTS;
         AtomicBoolean once = new AtomicBoolean();
+        admittedCompletions.add(completion);
         try {
             ProviderDuplicationBridge.BridgeAdmission admission = bridge.beginDuplicate(source, destination, outcome -> {
-                if (once.compareAndSet(false, true)) terminalFeedback.add(() -> completion.accept(map(outcome)));
+                if (once.compareAndSet(false, true)) terminalFeedback.add(() -> { admittedCompletions.remove(completion); completion.accept(map(outcome)); });
             });
-            return admission == ProviderDuplicationBridge.BridgeAdmission.ADMITTED ? DuplicateAdmission.ADMITTED : DuplicateAdmission.ERR_VERSE_BUSY;
-        } catch (ClosedDimensionCopyException e) { return DuplicateAdmission.ERR_VERSE_NOT_FOUND; }
+            if (admission == ProviderDuplicationBridge.BridgeAdmission.ADMITTED) return DuplicateAdmission.ADMITTED;
+            admittedCompletions.remove(completion);
+            return DuplicateAdmission.ERR_VERSE_BUSY;
+        } catch (ClosedDimensionCopyException e) { admittedCompletions.remove(completion); return DuplicateAdmission.ERR_VERSE_NOT_FOUND; }
     }
 
     @Override public List<ManagedVerseListing> listManaged() {
@@ -102,7 +108,15 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
     /** Cooperating server tick; callback feedback is dispatched after access revalidation. */
     public void tick() { if (!closed) { access.tick(); while (!terminalFeedback.isEmpty()) terminalFeedback.remove().run(); } }
     public boolean owns(MinecraftServer candidate) { return server == candidate; }
-    @Override public void close() { if (!closed) { closed = true; access.retire(); terminalFeedback.clear(); } }
+    @Override public void close() {
+        if (!closed) {
+            closed = true;
+            access.retire();
+            terminalFeedback.clear();
+            for (Consumer<DuplicateOutcome> completion : List.copyOf(admittedCompletions)) completion.accept(DuplicateOutcome.QUARANTINED);
+            admittedCompletions.clear();
+        }
+    }
     private static String identity(ServerLevel level) { return level.dimension().location() + "@" + Integer.toHexString(System.identityHashCode(level)); }
     private static DuplicateOutcome map(ProviderDuplicationBridge.BridgeOutcome outcome) {
         return switch (outcome) { case LOADED -> DuplicateOutcome.LOADED; case RESTORED -> DuplicateOutcome.RESTORED; case QUARANTINED -> DuplicateOutcome.QUARANTINED; };
