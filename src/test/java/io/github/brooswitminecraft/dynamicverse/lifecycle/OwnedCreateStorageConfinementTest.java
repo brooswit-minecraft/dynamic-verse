@@ -35,6 +35,13 @@ class OwnedCreateStorageConfinementTest {
         assertFalse(OwnedCreateStorageConfinement.isFreshConfined(root, key("linked")));
     }
 
+    @Test void acceptsOnlyAnExistingConfinedOwnedDirectoryForRecovery() throws Exception {
+        Path root = Files.createDirectory(sandbox.resolve("world"));
+        assertFalse(OwnedCreateStorageConfinement.isExistingConfined(root, key("retained")));
+        Files.createDirectories(root.resolve("dimensions/dynamicverse/retained"));
+        assertTrue(OwnedCreateStorageConfinement.isExistingConfined(root, key("retained")));
+    }
+
     private static ResourceKey<Level> key(String path) {
         return ResourceKey.create(Registries.DIMENSION, ResourceLocation.fromNamespaceAndPath("dynamicverse", path));
     }

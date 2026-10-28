@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.UUID;
 import java.util.Queue;
 import java.util.Map;
 import java.util.HashMap;
@@ -49,6 +50,7 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
     private final Map<String, Long> effectiveSeeds = new HashMap<>();
     private final BridgeGateway bridge;
     private final CreateGateway creates;
+    private final ManagedVerseStateStore state;
     private final String providerUnavailable;
     private boolean closed;
 
@@ -62,28 +64,36 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
                             @Override public void registerReady(String key, String identity, long generation) throws ClosedDimensionCopyException { bridge.registerReady(key, identity, generation); }
                             @Override public ProviderDuplicationBridge.BridgeAdmission beginDuplicate(String source, String destination, Consumer<ProviderDuplicationBridge.BridgeOutcome> completion) throws ClosedDimensionCopyException { return bridge.beginDuplicate(source, destination, completion); }
                         };
-                    }, CreateGateway.minecraft(server), null);
+                    }, CreateGateway.minecraft(server), ManagedVerseStateFileStore.minecraft(server), null);
         } catch (LinkageError | RuntimeException unavailable) {
-            return new ServerVerseRuntime(server, descriptor -> CurrentLevelEvidence.observed(server.getLevel(descriptor.key())), null, null, unavailable.getClass().getSimpleName());
+            return new ServerVerseRuntime(server, descriptor -> CurrentLevelEvidence.observed(server.getLevel(descriptor.key())), null, null,
+                    new InMemoryManagedVerseStateStore(), unavailable.getClass().getSimpleName());
         }
     }
 
     public static ServerVerseRuntime controlled(MinecraftServer server, BridgeGatewayFactory factory) {
-        return controlled(server, descriptor -> CurrentLevelEvidence.observed(server.getLevel(descriptor.key())), factory, null);
+        return controlled(server, descriptor -> CurrentLevelEvidence.observed(server.getLevel(descriptor.key())), factory, null, new InMemoryManagedVerseStateStore());
     }
     public static ServerVerseRuntime controlled(MinecraftServer server, LevelLookup lookup, BridgeGatewayFactory factory) {
-        return controlled(server, lookup, factory, null);
+        return controlled(server, lookup, factory, null, new InMemoryManagedVerseStateStore());
     }
     public static ServerVerseRuntime controlled(MinecraftServer server, LevelLookup lookup, BridgeGatewayFactory factory, CreateGateway creates) {
-        return new ServerVerseRuntime(server, lookup, factory, creates, null);
+        return controlled(server, lookup, factory, creates, new InMemoryManagedVerseStateStore());
+    }
+    public static ServerVerseRuntime controlled(MinecraftServer server, LevelLookup lookup, BridgeGatewayFactory factory,
+                                                CreateGateway creates, ManagedVerseStateStore state) {
+        return new ServerVerseRuntime(server, lookup, factory, creates, state, null);
     }
 
-    private ServerVerseRuntime(MinecraftServer server, LevelLookup levels, BridgeGatewayFactory factory, CreateGateway creates, String providerUnavailable) {
+    private ServerVerseRuntime(MinecraftServer server, LevelLookup levels, BridgeGatewayFactory factory, CreateGateway creates,
+                               ManagedVerseStateStore state, String providerUnavailable) {
         this.server = Objects.requireNonNull(server); this.levels = Objects.requireNonNull(levels); this.providerUnavailable = providerUnavailable;
         this.catalog = new OwnedDimensionCatalog(); this.gate = new VerseOperationGate();
         this.bridge = factory == null ? null : Objects.requireNonNull(factory.create(catalog, gate));
         this.creates = creates;
+        this.state = Objects.requireNonNull(state);
         this.access = new GatedVerseAccessService(gate);
+        recoverManagedState();
     }
 
     /** A successful authorized producer result: retained provenance plus an exact current instance/generation. */
@@ -107,6 +117,12 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         boolean alreadyOwned = catalog.contains(descriptor.id());
         if (alreadyOwned && catalog.require(descriptor.id()) != descriptor) {
             throw new IllegalArgumentException("Verified ownership descriptor differs from the staged descriptor");
+        }
+        if (createReservation == null) {
+            // A duplicate/other authorized producer has already observed the
+            // exact current instance. Persist before publishing it as READY.
+            persist(state.read().withReady(persistedDescriptor(descriptor, current.effectiveSeed(), provenance.generation())));
+            effectiveSeeds.put(descriptor.id(), current.effectiveSeed());
         }
         if (!alreadyOwned) catalog.register(descriptor);
         try {
@@ -140,14 +156,25 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
             catch (IllegalArgumentException | ClosedDimensionCopyException rejected) { return DuplicateAdmission.ERR_VERSE_NOT_FOUND; }
         }
         if (source.equals(destination)) return DuplicateAdmission.ERR_VERSE_ALREADY_EXISTS;
-        AdmittedCompletion admitted = new AdmittedCompletion(completion);
+        UUID operationId = UUID.randomUUID();
+        try {
+            OwnedDimensionDescriptor destinationDescriptor = catalog.require(destination);
+            OwnedDimensionDescriptor sourceDescriptor = catalog.require(source);
+            ManagedVerseStateStore.ReadyVerse destinationState = persistedDescriptor(destinationDescriptor, 0, 0);
+            persist(state.read().withOperation(new ManagedVerseStateStore.OperationIntent(operationId,
+                    ManagedVerseStateStore.OperationKind.DUPLICATE, source, destination, levels.current(sourceDescriptor) != null,
+                    destinationState, ManagedVerseStateStore.OperationPhase.PENDING, null)));
+        } catch (ClosedDimensionCopyException | RuntimeException persistenceUnavailable) {
+            return DuplicateAdmission.ERR_PROVIDER_UNAVAILABLE;
+        }
+        AdmittedCompletion admitted = new AdmittedCompletion(completion, operationId);
         admittedCompletions.add(admitted);
         try {
             ProviderDuplicationBridge.BridgeAdmission admission = bridge.beginDuplicate(source, destination, outcome -> {
                 if (admitted.claimTerminal() && !closed) terminalFeedback.add(() -> admitted.complete(map(outcome)));
             });
             if (admission == ProviderDuplicationBridge.BridgeAdmission.ADMITTED) return DuplicateAdmission.ADMITTED;
-            admittedCompletions.remove(admitted);
+            admittedCompletions.remove(admitted); persist(state.read().withoutOperation(operationId));
             return DuplicateAdmission.ERR_VERSE_BUSY;
         } catch (ClosedDimensionCopyException e) { admittedCompletions.remove(admitted); return DuplicateAdmission.ERR_VERSE_NOT_FOUND; }
     }
@@ -178,6 +205,12 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
             reservation.close();
             return CreateAdmission.ERR_VERSE_ALREADY_EXISTS;
         }
+        UUID operationId = UUID.randomUUID();
+        ManagedVerseStateStore.ReadyVerse durableDescriptor = persistedDescriptor(descriptor, sharedSaveSeed(), 0);
+        try { persist(state.read().withOperation(new ManagedVerseStateStore.OperationIntent(operationId,
+                ManagedVerseStateStore.OperationKind.CREATE, null, key, false, durableDescriptor,
+                ManagedVerseStateStore.OperationPhase.PENDING, null))); }
+        catch (RuntimeException persistenceUnavailable) { reservation.close(); return CreateAdmission.ERR_PROVIDER_UNAVAILABLE; }
         AdmittedCreate admitted = new AdmittedCreate(completion);
         admittedCreates.add(admitted);
         try {
@@ -186,7 +219,7 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
             if (returned == null) {
                 reservation.close(); admitted.complete(CreateOutcome.QUARANTINED); return CreateAdmission.ADMITTED;
             }
-            pendingCreates.put(key, new PendingCreate(descriptor, returned, reservation, admitted, sharedSaveSeed()));
+            pendingCreates.put(key, new PendingCreate(descriptor, returned, reservation, admitted, sharedSaveSeed(), operationId));
             return CreateAdmission.ADMITTED;
         } catch (RuntimeException failed) {
             reservation.close();
@@ -198,7 +231,7 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
     @Override public List<ManagedVerseListing> listManaged() {
         return catalog.descriptors().stream().map(descriptor -> listing(descriptor.id())).sorted(Comparator.comparing(ManagedVerseListing::name)).toList();
     }
-    /** Runtime-retained observed save seed for an omitted-seed READY create; persistence is intentionally not claimed. */
+    /** Actual omitted-seed value, also recorded in the managed READY descriptor before publication. */
     public OptionalLong recordedEffectiveSeed(String verseId) {
         Long seed = effectiveSeeds.get(verseId);
         return seed == null ? OptionalLong.empty() : OptionalLong.of(seed);
@@ -252,6 +285,52 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
     }
     private void observeCreates() {
         for (PendingCreate pending : List.copyOf(pendingCreates.values())) pending.observe();
+    }
+    private void recoverManagedState() {
+        ManagedVerseStateStore.State recovered = state.read();
+        ManagedVerseStateStore.State updated = ManagedVerseRestartReconciler.interruptNonterminal(recovered, intent -> {
+            registerUnavailable(intent.destinationDescriptor());
+            gate.quarantine(intent.destination());
+        });
+        if (!updated.equals(recovered)) persist(updated);
+        if (creates == null || bridge == null) return;
+        for (ManagedVerseStateStore.ReadyVerse ready : updated.ready().values()) replayReady(ready);
+    }
+    private void replayReady(ManagedVerseStateStore.ReadyVerse ready) {
+        OwnedDimensionDescriptor descriptor;
+        try { descriptor = descriptorFromPersisted(ready); }
+        catch (RuntimeException unsupported) { gate.quarantine(ready.id()); return; }
+        if (!creates.hasStoredData(descriptor)) { registerUnavailable(ready); gate.quarantine(ready.id()); return; }
+        try {
+            ServerLevel loaded = creates.reload(descriptor);
+            CurrentLevelEvidence current = levels.current(descriptor);
+            if (loaded == null || current == null || !current.matchesObservable(descriptor) || current.level() != loaded
+                    || current.effectiveSeed() != ready.effectiveSeed()) throw new IllegalStateException("READY replay did not observe the retained level");
+            if (!catalog.contains(ready.id())) catalog.register(descriptor);
+            enrollVerifiedReady(new EnrollmentProvenance(descriptor, loaded, ready.generation(), current.identity()));
+            effectiveSeeds.put(ready.id(), ready.effectiveSeed());
+        } catch (RuntimeException | ClosedDimensionCopyException failed) { registerUnavailable(descriptor); gate.quarantine(ready.id()); }
+    }
+    private void registerUnavailable(ManagedVerseStateStore.ReadyVerse ready) {
+        try { registerUnavailable(descriptorFromPersisted(ready)); } catch (RuntimeException ignored) { }
+    }
+    private void registerUnavailable(OwnedDimensionDescriptor descriptor) {
+        if (!catalog.contains(descriptor.id())) catalog.register(descriptor);
+    }
+    private void persist(ManagedVerseStateStore.State next) { state.write(next); }
+    private ManagedVerseStateStore.ReadyVerse persistedDescriptor(OwnedDimensionDescriptor descriptor, long effectiveSeed, long generation) {
+        if (!(descriptor.generator() instanceof NoiseBasedChunkGenerator) && !(descriptor.generator() instanceof FlatLevelSource)) {
+            throw new IllegalArgumentException("Unsupported descriptor generator provenance");
+        }
+        return new ManagedVerseStateStore.ReadyVerse(descriptor.id(), descriptor.generator() instanceof FlatLevelSource ? CreateType.SUPERFLAT : CreateType.NORMAL,
+                effectiveSeed, generation, "OVERWORLD_RECONSTRUCTED", "DEFAULT_DYNAMIC_PROPERTIES");
+    }
+    private OwnedDimensionDescriptor descriptorFromPersisted(ManagedVerseStateStore.ReadyVerse ready) {
+        ResourceLocation id = ResourceLocation.tryParse(ready.id());
+        if (id == null || !id.getNamespace().equals("dynamicverse") || !id.getPath().matches("[a-z0-9_-]{1,32}")) {
+            throw new IllegalArgumentException("Persisted descriptor id is unsupported");
+        }
+        return createDescriptor(id, ready.generator());
     }
     private long sharedSaveSeed() { return server.getWorldData().worldGenOptions().seed(); }
     private static ResourceLocation ownedCreateId(String name) {
@@ -319,10 +398,10 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
                 type.infiniburn(), type.effectsLocation(), type.ambientLight(), type.monsterSettings());
     }
     private final class AdmittedCompletion {
-        private final Consumer<DuplicateOutcome> completion; private final AtomicBoolean terminalClaimed = new AtomicBoolean(); private final AtomicBoolean delivered = new AtomicBoolean();
-        private AdmittedCompletion(Consumer<DuplicateOutcome> completion) { this.completion = Objects.requireNonNull(completion); }
+        private final Consumer<DuplicateOutcome> completion; private final UUID operationId; private final AtomicBoolean terminalClaimed = new AtomicBoolean(); private final AtomicBoolean delivered = new AtomicBoolean();
+        private AdmittedCompletion(Consumer<DuplicateOutcome> completion, UUID operationId) { this.completion = Objects.requireNonNull(completion); this.operationId = operationId; }
         private boolean claimTerminal() { return terminalClaimed.compareAndSet(false, true); }
-        private void complete(DuplicateOutcome outcome) { if (delivered.compareAndSet(false, true)) { admittedCompletions.remove(this); completion.accept(outcome); } }
+        private void complete(DuplicateOutcome outcome) { if (delivered.compareAndSet(false, true)) { admittedCompletions.remove(this); persist(state.read().withoutOperation(operationId)); completion.accept(outcome); } }
     }
     private final class AdmittedCreate {
         private final Consumer<CreateOutcome> completion;
@@ -354,11 +433,12 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         private final VerseOperationGate.CreateReservation reservation;
         private final AdmittedCreate completion;
         private final long expectedSeed;
+        private final UUID operationId;
         private int observations;
         private PendingCreate(OwnedDimensionDescriptor descriptor, ServerLevel returned, VerseOperationGate.CreateReservation reservation,
-                              AdmittedCreate completion, long expectedSeed) {
+                              AdmittedCreate completion, long expectedSeed, UUID operationId) {
             this.descriptor = descriptor; this.returned = returned; this.reservation = reservation;
-            this.completion = completion; this.expectedSeed = expectedSeed;
+            this.completion = completion; this.expectedSeed = expectedSeed; this.operationId = operationId;
         }
         private void observe() {
             if (closed) { fail(); return; }
@@ -366,7 +446,9 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
             if (current != null && current.matchesObservable(descriptor) && current.level() == returned
                     && current.effectiveSeed() == expectedSeed) {
                 try {
-                    enrollVerifiedReady(new EnrollmentProvenance(descriptor, returned, nextCreateGeneration(), current.identity()), reservation);
+                    long generation = nextCreateGeneration();
+                    persist(state.read().withReady(persistedDescriptor(descriptor, current.effectiveSeed(), generation)).withoutOperation(operationId));
+                    enrollVerifiedReady(new EnrollmentProvenance(descriptor, returned, generation, current.identity()), reservation);
                     effectiveSeeds.put(descriptor.id(), current.effectiveSeed());
                     pendingCreates.remove(descriptor.id());
                     completion.complete(CreateOutcome.READY);
@@ -389,6 +471,8 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         boolean canCreate(ResourceLocation id);
         boolean storageExists(OwnedDimensionDescriptor descriptor);
         ServerLevel create(OwnedDimensionDescriptor descriptor);
+        default boolean hasStoredData(OwnedDimensionDescriptor descriptor) { return false; }
+        default ServerLevel reload(OwnedDimensionDescriptor descriptor) { return null; }
         static CreateGateway minecraft(MinecraftServer server) {
             DynamicDimensionRegistry registry = DynamicDimensionRegistry.from(server);
             return new CreateGateway() {
@@ -399,6 +483,13 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
                 }
                 @Override public ServerLevel create(OwnedDimensionDescriptor descriptor) {
                     return registry.createDynamicDimension(descriptor.key().location(), descriptor.generator(), descriptor.type(), descriptor.properties());
+                }
+                @Override public boolean hasStoredData(OwnedDimensionDescriptor descriptor) {
+                    java.nio.file.Path root = server.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT).toAbsolutePath().normalize();
+                    return OwnedCreateStorageConfinement.isExistingConfined(root, descriptor.key());
+                }
+                @Override public ServerLevel reload(OwnedDimensionDescriptor descriptor) {
+                    return registry.loadDynamicDimension(descriptor.key().location(), descriptor.generator(), descriptor.type(), descriptor.properties());
                 }
             };
         }

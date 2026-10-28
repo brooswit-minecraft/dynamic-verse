@@ -65,6 +65,14 @@ public final class VerseOperationGate {
         return entry.quarantined ? Readiness.quarantined() : Readiness.pending();
     }
 
+    /** Recovery never guesses that retained disk state is safe to travel. */
+    public synchronized void quarantine(String key) {
+        Entry entry = entries.computeIfAbsent(key, ignored -> new Entry());
+        if (entry.reads != 0 || entry.operating) throw new IllegalStateException("Cannot quarantine an active verse: " + key);
+        entry.ready = false;
+        entry.quarantined = true;
+    }
+
     public record Readiness(State state, String identity, long generation) {
         public static Readiness ready(String identity, long generation) { return new Readiness(State.READY, identity, generation); }
         public static Readiness pending() { return new Readiness(State.PENDING, null, 0); }
