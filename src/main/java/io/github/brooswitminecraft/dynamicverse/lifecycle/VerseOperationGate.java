@@ -68,7 +68,8 @@ public final class VerseOperationGate {
     /** Recovery never guesses that retained disk state is safe to travel. */
     public synchronized void quarantine(String key) {
         Entry entry = entries.computeIfAbsent(key, ignored -> new Entry());
-        if (entry.reads != 0 || entry.operating) throw new IllegalStateException("Cannot quarantine an active verse: " + key);
+        // A persistence/recovery failure revokes future readiness even if a
+        // stale lease exists; resolve rechecks this state before handing out a level.
         entry.ready = false;
         entry.quarantined = true;
     }

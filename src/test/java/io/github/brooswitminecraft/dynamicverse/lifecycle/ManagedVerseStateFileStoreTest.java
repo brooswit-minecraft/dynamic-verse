@@ -2,6 +2,7 @@ package io.github.brooswitminecraft.dynamicverse.lifecycle;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Files;
@@ -50,6 +51,42 @@ class ManagedVerseStateFileStoreTest {
         assertEquals(ManagedVerseStateStore.OperationPhase.FAILED, failed.phase());
         assertEquals("ERR_OPERATION_INTERRUPTED", failed.error());
         assertTrue(after.ready().isEmpty(), "interrupted destinations never become READY during recovery");
+    }
+
+    @Test void retainedTemporaryStateFileBlocksReplacementButPreservesTheLastReadableState() throws Exception {
+        Path data = Files.createDirectory(temporary.resolve("data"));
+        Path file = data.resolve("managed.properties");
+        ManagedVerseStateFileStore store = new ManagedVerseStateFileStore(file);
+        ManagedVerseStateStore.ReadyVerse first = ready("dynamicverse:first", VerseLifecycleCommandService.CreateType.NORMAL, 9L, 1L);
+        store.write(new ManagedVerseStateStore.State(Map.of(first.id(), first), Map.of()));
+        Files.writeString(data.resolve("managed.properties.tmp"), "interrupted replacement");
+
+        assertThrows(IllegalStateException.class, () -> store.write(ManagedVerseStateStore.State.empty()));
+        assertEquals(first, store.read().ready().get(first.id()));
+        assertTrue(Files.exists(data.resolve("managed.properties.tmp")), "interrupted evidence is retained, never deleted automatically");
+    }
+
+    @Test void duplicatePublicationRemovesIntentOnlyWithDurableReadyAndQuarantinesOnStoreFailure() {
+        UUID id = UUID.randomUUID();
+        ManagedVerseStateStore.ReadyVerse destination = ready("dynamicverse:copied", VerseLifecycleCommandService.CreateType.NORMAL, 12L, 3L);
+        ManagedVerseStateStore.OperationIntent pending = new ManagedVerseStateStore.OperationIntent(id,
+                ManagedVerseStateStore.OperationKind.DUPLICATE, "dynamicverse:source", destination.id(), true, destination,
+                ManagedVerseStateStore.OperationPhase.PENDING, null);
+        InMemoryManagedVerseStateStore good = new InMemoryManagedVerseStateStore();
+        good.write(new ManagedVerseStateStore.State(Map.of(), Map.of(id, pending)));
+        VerseOperationGate goodGate = new VerseOperationGate();
+        assertTrue(ManagedVerseDurablePublication.publishDuplicate(good, goodGate, id, destination));
+        assertEquals(destination, good.read().ready().get(destination.id()));
+        assertFalse(good.read().operations().containsKey(id));
+
+        ManagedVerseStateStore failing = new ManagedVerseStateStore() {
+            @Override public State read() { return new State(Map.of(), Map.of(id, pending)); }
+            @Override public void write(State ignored) { throw new IllegalStateException("injected store failure"); }
+        };
+        VerseOperationGate failedGate = new VerseOperationGate();
+        assertFalse(ManagedVerseDurablePublication.publishDuplicate(failing, failedGate, id, destination));
+        assertEquals(VerseOperationGate.Readiness.State.QUARANTINED, failedGate.readiness(destination.id()).state());
+        assertTrue(failing.read().operations().containsKey(id), "failure retains conservative interrupted intent");
     }
 
     private static ManagedVerseStateStore.ReadyVerse ready(String id, VerseLifecycleCommandService.CreateType type, long seed, long generation) {

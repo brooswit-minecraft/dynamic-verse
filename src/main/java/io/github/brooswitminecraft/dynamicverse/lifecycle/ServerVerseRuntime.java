@@ -48,6 +48,8 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
     private final Set<AdmittedCreate> admittedCreates = new LinkedHashSet<>();
     private final Map<String, PendingCreate> pendingCreates = new HashMap<>();
     private final Map<String, Long> effectiveSeeds = new HashMap<>();
+    /** Provenance is admitted only from our supported producer or durable replay, never inferred from a class. */
+    private final Map<String, ManagedVerseStateStore.ReadyVerse> supportedProvenance = new HashMap<>();
     private final BridgeGateway bridge;
     private final CreateGateway creates;
     private final ManagedVerseStateStore state;
@@ -121,7 +123,11 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         if (createReservation == null) {
             // A duplicate/other authorized producer has already observed the
             // exact current instance. Persist before publishing it as READY.
-            persist(state.read().withReady(persistedDescriptor(descriptor, current.effectiveSeed(), provenance.generation())));
+            ManagedVerseStateStore.ReadyVerse supported = supportedProvenance.get(descriptor.id());
+            if (supported == null || catalog.contains(descriptor.id()) && catalog.require(descriptor.id()) != descriptor) {
+                throw new IllegalArgumentException("Descriptor has no supported durable provenance");
+            }
+            persist(state.read().withReady(withObservedSeed(supported, current.effectiveSeed(), provenance.generation())));
             effectiveSeeds.put(descriptor.id(), current.effectiveSeed());
         }
         if (!alreadyOwned) catalog.register(descriptor);
@@ -151,6 +157,7 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         destination = normalizeOwnedName(destination);
         if (source == null || destination == null) return DuplicateAdmission.ERR_VERSE_NOT_FOUND;
         if (!catalog.contains(source)) return DuplicateAdmission.ERR_VERSE_NOT_FOUND;
+        if (!supportedProvenance.containsKey(source)) return DuplicateAdmission.ERR_PROVIDER_UNAVAILABLE;
         if (!catalog.contains(destination)) {
             try { reserveDuplicateDestination(source, destination); }
             catch (IllegalArgumentException | ClosedDimensionCopyException rejected) { return DuplicateAdmission.ERR_VERSE_NOT_FOUND; }
@@ -160,18 +167,21 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         try {
             OwnedDimensionDescriptor destinationDescriptor = catalog.require(destination);
             OwnedDimensionDescriptor sourceDescriptor = catalog.require(source);
-            ManagedVerseStateStore.ReadyVerse destinationState = persistedDescriptor(destinationDescriptor, 0, 0);
+            ManagedVerseStateStore.ReadyVerse sourceState = supportedProvenance.get(source);
+            if (sourceState == null) return DuplicateAdmission.ERR_PROVIDER_UNAVAILABLE;
+            ManagedVerseStateStore.ReadyVerse destinationState = copiedProvenance(destination, sourceState);
+            supportedProvenance.put(destination, destinationState);
             persist(state.read().withOperation(new ManagedVerseStateStore.OperationIntent(operationId,
                     ManagedVerseStateStore.OperationKind.DUPLICATE, source, destination, levels.current(sourceDescriptor) != null,
                     destinationState, ManagedVerseStateStore.OperationPhase.PENDING, null)));
         } catch (ClosedDimensionCopyException | RuntimeException persistenceUnavailable) {
             return DuplicateAdmission.ERR_PROVIDER_UNAVAILABLE;
         }
-        AdmittedCompletion admitted = new AdmittedCompletion(completion, operationId);
+        AdmittedCompletion admitted = new AdmittedCompletion(completion, operationId, destination);
         admittedCompletions.add(admitted);
         try {
             ProviderDuplicationBridge.BridgeAdmission admission = bridge.beginDuplicate(source, destination, outcome -> {
-                if (admitted.claimTerminal() && !closed) terminalFeedback.add(() -> admitted.complete(map(outcome)));
+                if (!closed) admitted.terminal(outcome);
             });
             if (admission == ProviderDuplicationBridge.BridgeAdmission.ADMITTED) return DuplicateAdmission.ADMITTED;
             admittedCompletions.remove(admitted); persist(state.read().withoutOperation(operationId));
@@ -206,11 +216,13 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
             return CreateAdmission.ERR_VERSE_ALREADY_EXISTS;
         }
         UUID operationId = UUID.randomUUID();
-        ManagedVerseStateStore.ReadyVerse durableDescriptor = persistedDescriptor(descriptor, sharedSaveSeed(), 0);
+        ManagedVerseStateStore.ReadyVerse durableDescriptor = new ManagedVerseStateStore.ReadyVerse(key, type, sharedSaveSeed(), 0,
+                "OVERWORLD_RECONSTRUCTED", "DEFAULT_DYNAMIC_PROPERTIES");
         try { persist(state.read().withOperation(new ManagedVerseStateStore.OperationIntent(operationId,
                 ManagedVerseStateStore.OperationKind.CREATE, null, key, false, durableDescriptor,
                 ManagedVerseStateStore.OperationPhase.PENDING, null))); }
         catch (RuntimeException persistenceUnavailable) { reservation.close(); return CreateAdmission.ERR_PROVIDER_UNAVAILABLE; }
+        supportedProvenance.put(key, durableDescriptor);
         AdmittedCreate admitted = new AdmittedCreate(completion);
         admittedCreates.add(admitted);
         try {
@@ -307,6 +319,7 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
             if (loaded == null || current == null || !current.matchesObservable(descriptor) || current.level() != loaded
                     || current.effectiveSeed() != ready.effectiveSeed()) throw new IllegalStateException("READY replay did not observe the retained level");
             if (!catalog.contains(ready.id())) catalog.register(descriptor);
+            supportedProvenance.put(ready.id(), ready);
             enrollVerifiedReady(new EnrollmentProvenance(descriptor, loaded, ready.generation(), current.identity()));
             effectiveSeeds.put(ready.id(), ready.effectiveSeed());
         } catch (RuntimeException | ClosedDimensionCopyException failed) { registerUnavailable(descriptor); gate.quarantine(ready.id()); }
@@ -318,12 +331,13 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         if (!catalog.contains(descriptor.id())) catalog.register(descriptor);
     }
     private void persist(ManagedVerseStateStore.State next) { state.write(next); }
-    private ManagedVerseStateStore.ReadyVerse persistedDescriptor(OwnedDimensionDescriptor descriptor, long effectiveSeed, long generation) {
-        if (!(descriptor.generator() instanceof NoiseBasedChunkGenerator) && !(descriptor.generator() instanceof FlatLevelSource)) {
-            throw new IllegalArgumentException("Unsupported descriptor generator provenance");
-        }
-        return new ManagedVerseStateStore.ReadyVerse(descriptor.id(), descriptor.generator() instanceof FlatLevelSource ? CreateType.SUPERFLAT : CreateType.NORMAL,
-                effectiveSeed, generation, "OVERWORLD_RECONSTRUCTED", "DEFAULT_DYNAMIC_PROPERTIES");
+    private static ManagedVerseStateStore.ReadyVerse withObservedSeed(ManagedVerseStateStore.ReadyVerse value, long seed, long generation) {
+        return new ManagedVerseStateStore.ReadyVerse(value.id(), value.generator(), seed, generation,
+                value.typeProvenance(), value.propertiesProvenance());
+    }
+    private static ManagedVerseStateStore.ReadyVerse copiedProvenance(String destination, ManagedVerseStateStore.ReadyVerse source) {
+        return new ManagedVerseStateStore.ReadyVerse(destination, source.generator(), source.effectiveSeed(), 0,
+                source.typeProvenance(), source.propertiesProvenance());
     }
     private OwnedDimensionDescriptor descriptorFromPersisted(ManagedVerseStateStore.ReadyVerse ready) {
         ResourceLocation id = ResourceLocation.tryParse(ready.id());
@@ -398,10 +412,37 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
                 type.infiniburn(), type.effectsLocation(), type.ambientLight(), type.monsterSettings());
     }
     private final class AdmittedCompletion {
-        private final Consumer<DuplicateOutcome> completion; private final UUID operationId; private final AtomicBoolean terminalClaimed = new AtomicBoolean(); private final AtomicBoolean delivered = new AtomicBoolean();
-        private AdmittedCompletion(Consumer<DuplicateOutcome> completion, UUID operationId) { this.completion = Objects.requireNonNull(completion); this.operationId = operationId; }
-        private boolean claimTerminal() { return terminalClaimed.compareAndSet(false, true); }
-        private void complete(DuplicateOutcome outcome) { if (delivered.compareAndSet(false, true)) { admittedCompletions.remove(this); persist(state.read().withoutOperation(operationId)); completion.accept(outcome); } }
+        private final Consumer<DuplicateOutcome> completion; private final UUID operationId; private final String destination;
+        private final AtomicBoolean terminalClaimed = new AtomicBoolean(); private final AtomicBoolean delivered = new AtomicBoolean();
+        private AdmittedCompletion(Consumer<DuplicateOutcome> completion, UUID operationId, String destination) {
+            this.completion = Objects.requireNonNull(completion); this.operationId = operationId; this.destination = destination;
+        }
+        private void terminal(ProviderDuplicationBridge.BridgeOutcome bridgeOutcome) {
+            if (!terminalClaimed.compareAndSet(false, true)) return;
+            DuplicateOutcome outcome = map(bridgeOutcome);
+            if (outcome == DuplicateOutcome.LOADED) {
+                try {
+                    OwnedDimensionDescriptor descriptor = catalog.require(destination);
+                    CurrentLevelEvidence current = levels.current(descriptor);
+                    VerseOperationGate.Readiness readiness = gate.readiness(destination);
+                    ManagedVerseStateStore.ReadyVerse supported = supportedProvenance.get(destination);
+                    if (current == null || !current.matchesObservable(descriptor) || readiness.state() != VerseOperationGate.Readiness.State.READY
+                            || supported == null || readiness.generation() <= 0) throw new IllegalStateException("Duplicate destination is not durably verifiable");
+                    ManagedVerseStateStore.ReadyVerse ready = withObservedSeed(supported, current.effectiveSeed(), readiness.generation());
+                    if (!ManagedVerseDurablePublication.publishDuplicate(state, gate, operationId, ready)) {
+                        outcome = DuplicateOutcome.QUARANTINED;
+                    } else {
+                        effectiveSeeds.put(destination, current.effectiveSeed());
+                    }
+                } catch (RuntimeException | ClosedDimensionCopyException persistenceFailed) {
+                    gate.quarantine(destination);
+                    outcome = DuplicateOutcome.QUARANTINED;
+                }
+            }
+            DuplicateOutcome terminal = outcome;
+            terminalFeedback.add(() -> complete(terminal));
+        }
+        private void complete(DuplicateOutcome outcome) { if (delivered.compareAndSet(false, true)) { admittedCompletions.remove(this); completion.accept(outcome); } }
     }
     private final class AdmittedCreate {
         private final Consumer<CreateOutcome> completion;
@@ -447,7 +488,9 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
                     && current.effectiveSeed() == expectedSeed) {
                 try {
                     long generation = nextCreateGeneration();
-                    persist(state.read().withReady(persistedDescriptor(descriptor, current.effectiveSeed(), generation)).withoutOperation(operationId));
+                    ManagedVerseStateStore.ReadyVerse supported = supportedProvenance.get(descriptor.id());
+                    if (supported == null) throw new IllegalStateException("Create descriptor lost supported provenance");
+                    persist(state.read().withReady(withObservedSeed(supported, current.effectiveSeed(), generation)).withoutOperation(operationId));
                     enrollVerifiedReady(new EnrollmentProvenance(descriptor, returned, generation, current.identity()), reservation);
                     effectiveSeeds.put(descriptor.id(), current.effectiveSeed());
                     pendingCreates.remove(descriptor.id());
