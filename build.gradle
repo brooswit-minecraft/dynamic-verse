@@ -27,6 +27,8 @@ neoForge {
     runs {
         register("bridgeGameTest") {
             type = "gameTestServer"
+            // Isolated disposable run state; do not point this at an existing world.
+            gameDirectory = layout.projectDirectory.dir("run/bridgeGameTest")
             systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
         }
     }
