@@ -70,6 +70,12 @@ public final class NeoForgeVerseCommandsGameTest {
         dispatcher.execute("verse list", operator);
         helper.assertTrue(feedback.successes.equals(List.of("managed verses: dynamicverse:alpha=READY, dynamicverse:pending=PENDING")), "list must expose state without a live identity");
         feedback.clear();
+        try {
+            dispatcher.execute("verse duplicate dynamicverse:alpha dynamicverse:bad?", operator);
+            throw new AssertionError("malformed duplicate identifier unexpectedly executed");
+        } catch (CommandSyntaxException expected) {
+            helper.assertTrue(lifecycle.admissions == 0, "malformed identifier must not admit lifecycle work");
+        }
         dispatcher.execute("verse duplicate dynamicverse:alpha dynamicverse:copy", operator);
         helper.assertTrue(feedback.successes.equals(List.of("duplicate accepted/pending")), "admission must not claim terminal success");
         lifecycle.complete(VerseLifecycleCommandService.DuplicateOutcome.LOADED);
@@ -119,7 +125,12 @@ public final class NeoForgeVerseCommandsGameTest {
         helper.assertTrue(runtime.resolve(foreign) == null, "foreign lease is unavailable");
         current[0] = false;
         final VerseReservationSnapshot[] stale = new VerseReservationSnapshot[1]; runtime.beginAcquireReadyRead(source.id(), result -> stale[0] = result); runtime.tick();
-        helper.assertTrue(runtime.resolve(stale[0].lease().orElseThrow()) == null, "replaced/absent current instance is unavailable");
+        ReadyVerseLease staleLease = stale[0].lease().orElseThrow();
+        try {
+            helper.assertTrue(runtime.resolve(staleLease) == null, "replaced/absent current instance is unavailable");
+        } finally {
+            staleLease.close();
+        }
         final List<VerseLifecycleCommandService.DuplicateOutcome> outcomes = new ArrayList<>();
         helper.assertTrue(runtime.beginDuplicate(source.id(), "dynamicverse:copy", outcomes::add) == VerseLifecycleCommandService.DuplicateAdmission.ADMITTED, "fresh descriptor reservation reaches controlled bridge admission");
         runtime.tick();
@@ -427,8 +438,9 @@ public final class NeoForgeVerseCommandsGameTest {
     private static final class ControlledLifecycle implements VerseLifecycleCommandService {
         private java.util.function.Consumer<DuplicateOutcome> completion;
         private DuplicateAdmission admission = DuplicateAdmission.ADMITTED;
+        private int admissions;
         @Override public DuplicateAdmission beginDuplicate(String source, String destination, java.util.function.Consumer<DuplicateOutcome> callback) {
-            completion = callback; return admission;
+            admissions++; completion = callback; return admission;
         }
         @Override public List<ManagedVerseListing> listManaged() {
             return List.of(new ManagedVerseListing("dynamicverse:alpha", ManagedVerseListing.State.READY, java.util.Optional.of("identity"), java.util.Optional.of(1L)),
