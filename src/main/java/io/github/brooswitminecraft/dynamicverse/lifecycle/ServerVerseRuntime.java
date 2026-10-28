@@ -16,10 +16,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.world.level.Level;
 
 /** One server-owned catalog/gate/bridge/access owner. It starts empty and never adopts existing worlds. */
 public final class ServerVerseRuntime implements VerseAccessService, VerseLifecycleCommandService, AutoCloseable {
     private final MinecraftServer server;
+    private final LevelLookup levels;
     private final OwnedDimensionCatalog catalog;
     private final VerseOperationGate gate;
     private final GatedVerseAccessService access;
@@ -35,29 +40,32 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
             OwnedDimensionCatalog catalog = new OwnedDimensionCatalog();
             VerseOperationGate gate = new VerseOperationGate();
             ProviderDuplicationBridge bridge = ProviderDuplicationBridge.forMinecraftServer(server, catalog, gate);
-            return new ServerVerseRuntime(server, new BridgeGateway() {
+            return new ServerVerseRuntime(server, descriptor -> server.getLevel(descriptor.key()), new BridgeGateway() {
                 @Override public void registerReady(String key, String identity, long generation) throws ClosedDimensionCopyException { bridge.registerReady(key, identity, generation); }
                 @Override public ProviderDuplicationBridge.BridgeAdmission beginDuplicate(String source, String destination, Consumer<ProviderDuplicationBridge.BridgeOutcome> completion) throws ClosedDimensionCopyException { return bridge.beginDuplicate(source, destination, completion); }
             }, null, catalog, gate);
         } catch (LinkageError | RuntimeException unavailable) {
-            return new ServerVerseRuntime(server, null, unavailable.getClass().getSimpleName(), new OwnedDimensionCatalog(), new VerseOperationGate());
+            return new ServerVerseRuntime(server, descriptor -> server.getLevel(descriptor.key()), null, unavailable.getClass().getSimpleName(), new OwnedDimensionCatalog(), new VerseOperationGate());
         }
     }
 
     public static ServerVerseRuntime controlled(MinecraftServer server, BridgeGateway bridge) {
-        return new ServerVerseRuntime(server, bridge, null, new OwnedDimensionCatalog(), new VerseOperationGate());
+        return controlled(server, descriptor -> server.getLevel(descriptor.key()), bridge);
+    }
+    public static ServerVerseRuntime controlled(MinecraftServer server, LevelLookup lookup, BridgeGateway bridge) {
+        return new ServerVerseRuntime(server, lookup, bridge, null, new OwnedDimensionCatalog(), new VerseOperationGate());
     }
 
-    private ServerVerseRuntime(MinecraftServer server, BridgeGateway bridge, String providerUnavailable,
+    private ServerVerseRuntime(MinecraftServer server, LevelLookup levels, BridgeGateway bridge, String providerUnavailable,
                                OwnedDimensionCatalog catalog, VerseOperationGate gate) {
-        this.server = Objects.requireNonNull(server); this.bridge = bridge; this.providerUnavailable = providerUnavailable;
+        this.server = Objects.requireNonNull(server); this.levels = Objects.requireNonNull(levels); this.bridge = bridge; this.providerUnavailable = providerUnavailable;
         this.catalog = catalog; this.gate = gate; this.access = new GatedVerseAccessService(gate);
     }
 
     /** Future authorized ownership producer only: it must supply an exact live identity after successful enrollment. */
     public void enrollVerifiedReady(OwnedDimensionDescriptor descriptor, long generation) throws ClosedDimensionCopyException {
         if (closed || bridge == null) throw new IllegalStateException("Provider is unavailable: " + providerUnavailable);
-        ServerLevel level = server.getLevel(descriptor.key());
+        ServerLevel level = levels.current(descriptor);
         if (level == null || level.getChunkSource().getGenerator() != descriptor.generator()) {
             throw new IllegalArgumentException("Verified ownership enrollment requires the current descriptor instance");
         }
@@ -77,7 +85,10 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
     @Override public DuplicateAdmission beginDuplicate(String source, String destination, Consumer<DuplicateOutcome> completion) {
         if (closed || bridge == null) return DuplicateAdmission.ERR_PROVIDER_UNAVAILABLE;
         if (!catalog.contains(source)) return DuplicateAdmission.ERR_VERSE_NOT_FOUND;
-        if (!catalog.contains(destination)) return DuplicateAdmission.ERR_VERSE_NOT_FOUND;
+        if (!catalog.contains(destination)) {
+            try { reserveDuplicateDestination(source, destination); }
+            catch (IllegalArgumentException | ClosedDimensionCopyException rejected) { return DuplicateAdmission.ERR_VERSE_NOT_FOUND; }
+        }
         if (source.equals(destination)) return DuplicateAdmission.ERR_VERSE_ALREADY_EXISTS;
         AtomicBoolean once = new AtomicBoolean();
         admittedCompletions.add(completion);
@@ -107,7 +118,7 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         VerseOperationGate.Readiness current = gate.readiness(lease.verseName());
         if (current.state() != VerseOperationGate.Readiness.State.READY || !lease.levelIdentity().equals(current.identity()) || lease.generation() != current.generation()) return null;
         try {
-            ServerLevel level = server.getLevel(catalog.require(lease.verseName()).key());
+            ServerLevel level = levels.current(catalog.require(lease.verseName()));
             return level != null && identity(level).equals(lease.levelIdentity()) ? level : null;
         }
         catch (ClosedDimensionCopyException ignored) { return null; }
@@ -125,6 +136,15 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         }
     }
     private static String identity(ServerLevel level) { return level.dimension().location() + "@" + Integer.toHexString(System.identityHashCode(level)); }
+    private void reserveDuplicateDestination(String source, String destination) throws ClosedDimensionCopyException {
+        OwnedDimensionDescriptor retained = catalog.require(source);
+        ResourceLocation id = ResourceLocation.tryParse(destination);
+        if (id == null || !id.getNamespace().equals("dynamicverse") || id.getPath().isBlank()) throw new IllegalArgumentException("destination must be a Dynamic Verse identifier");
+        ResourceKey<Level> key = ResourceKey.create(Registries.DIMENSION, id);
+        if (levels.current(new OwnedDimensionDescriptor(key, retained.generator(), retained.type(), retained.properties())) != null) throw new IllegalArgumentException("destination level already exists");
+        catalog.register(new OwnedDimensionDescriptor(key, retained.generator(), retained.type(), retained.properties()));
+    }
+    @FunctionalInterface public interface LevelLookup { ServerLevel current(OwnedDimensionDescriptor descriptor); }
     public interface BridgeGateway {
         void registerReady(String key, String identity, long generation) throws ClosedDimensionCopyException;
         ProviderDuplicationBridge.BridgeAdmission beginDuplicate(String source, String destination, Consumer<ProviderDuplicationBridge.BridgeOutcome> completion) throws ClosedDimensionCopyException;
