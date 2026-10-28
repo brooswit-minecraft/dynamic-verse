@@ -5,6 +5,7 @@ import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseOperationGate;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.gametest.framework.GameTest;
 import net.minecraft.gametest.framework.GameTestHelper;
+import net.neoforged.neoforge.gametest.PrefixGameTestTemplate;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
@@ -16,7 +17,8 @@ import java.util.function.Consumer;
 
 /** Source-only ModDev GameTest harness; do not execute without serialized runtime approval. */
 public final class ProviderDuplicationBridgeGameTest {
-    @GameTest(template = "dynamicverse:empty")
+    @GameTest(templateNamespace = "dynamicverse", template = "empty")
+    @PrefixGameTestTemplate(false)
     public void controlledBridgeCallback(GameTestHelper helper) throws Exception {
         ServerLevel level = helper.getLevel();
         OwnedDimensionCatalog catalog = new OwnedDimensionCatalog();
