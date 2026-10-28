@@ -2,6 +2,8 @@ package io.github.brooswitminecraft.dynamicverse.lifecycle.copy;
 
 import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseOperationGate;
 import net.minecraft.server.MinecraftServer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Objects;
 import java.util.function.Consumer;
@@ -11,6 +13,7 @@ import java.util.function.Consumer;
  * copier -> normal source load. The shared operation gate stays held throughout.
  */
 public final class ProviderDuplicationBridge {
+    private static final Logger LOGGER = LoggerFactory.getLogger(ProviderDuplicationBridge.class);
     private final OwnedDimensionCatalog catalog;
     private final VerseOperationGate gate;
     private final ProviderDuplicationPort provider;
@@ -72,19 +75,35 @@ public final class ProviderDuplicationBridge {
         BridgeOutcome outcome = BridgeOutcome.QUARANTINED;
         try {
             if (terminal != null) {
+                LOGGER.info("Provider duplicate terminal source={} destination={} generation={} initiallyLoaded={} status={} failurePresent={} failureStage={} cause={}",
+                        source.id(), destinationKey, terminal.generation(), terminal.initiallyLoaded(), terminal.status(),
+                        terminal.failurePresent(), terminal.failureStage(), terminal.cause());
                 ClosedDimensionDuplicationIntent intent = new ClosedDimensionDuplicationIntent(source.id(), destinationKey, terminal.generation());
+                LOGGER.info("Provider duplicate copy entered source={} destination={} generation={}", source.id(), destinationKey, terminal.generation());
                 ClosedDimensionDuplicationResult copied = coordinator.duplicate(intent, terminal, operation.copierFence());
                 if (copied.outcome() == ClosedDimensionDuplicationResult.Outcome.COPIED) {
+                    LOGGER.info("Provider duplicate copy completed source={} destination={} generation={}", source.id(), destinationKey, terminal.generation());
+                    LOGGER.info("Provider duplicate restoration entered source={} generation={}", source.id(), terminal.generation());
                     ProviderDuplicationPort.RestoredSource restored = provider.loadOriginalSource(source, terminal.generation());
                     if (restored != null && restored.instanceIdentity() != null && !restored.instanceIdentity().isBlank()) {
+                        LOGGER.info("Provider duplicate restoration returned source={} generation={} identity={}", source.id(), restored.generation(), restored.instanceIdentity());
                         operation.restored(restored.instanceIdentity(), restored.generation());
                         outcome = BridgeOutcome.RESTORED;
+                    } else {
+                        LOGGER.warn("Provider duplicate restoration returned null/invalid source={} generation={}", source.id(), terminal.generation());
                     }
+                } else {
+                    LOGGER.warn("Provider duplicate copy failed source={} destination={} generation={} outcome={} detail={} cause={}",
+                            source.id(), destinationKey, terminal.generation(), copied.outcome(), copied.detail(), copied.cause());
                 }
+            } else {
+                LOGGER.warn("Provider duplicate terminal absent source={} destination={}", source.id(), destinationKey);
             }
-        } catch (RuntimeException ignored) {
+        } catch (RuntimeException e) {
+            LOGGER.warn("Provider duplicate restoration failed source={} destination={} generation={}", source.id(), destinationKey, generation, e);
         } finally {
             operation.close();
+            LOGGER.info("Provider duplicate final source={} destination={} generation={} outcome={}", source.id(), destinationKey, generation, outcome);
             try { completion.accept(outcome); } catch (RuntimeException ignored) { }
         }
     }

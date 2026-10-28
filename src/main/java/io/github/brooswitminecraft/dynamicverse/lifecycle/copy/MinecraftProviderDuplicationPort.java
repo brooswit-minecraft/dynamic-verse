@@ -42,6 +42,7 @@ public final class MinecraftProviderDuplicationPort implements ProviderDuplicati
             case FAILED_CLOSE -> ClosedDimensionStatus.FAILED_CLOSE;
         };
         return new ProviderQuiesceCloseTerminal(result.key().location().toString(), result.generation(), result.initiallyLoaded(),
-                status, result.failureStage() != null || result.cause() != null);
+                status, result.failureStage() != null || result.cause() != null,
+                result.failureStage() == null ? null : result.failureStage().name(), result.cause());
     }
 }

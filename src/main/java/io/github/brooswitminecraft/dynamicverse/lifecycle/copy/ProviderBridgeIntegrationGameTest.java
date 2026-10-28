@@ -47,10 +47,10 @@ public final class ProviderBridgeIntegrationGameTest {
         Path root = server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize();
         Path sourcePath = DimensionType.getStorageFolder(sourceKey, root).toAbsolutePath().normalize();
         Path destinationPath = DimensionType.getStorageFolder(destinationKey, root).toAbsolutePath().normalize();
-        requireFresh(registry, server, sourceKey, destinationKey, sourcePath, destinationPath);
+        requireFresh(helper, registry, server, sourceKey, destinationKey, sourcePath, destinationPath);
 
         DynamicDimensionProperties sourceProperties = properties();
-        ServerLevel original = requireNonNull(registry.createDynamicDimension(SOURCE_ID,
+        ServerLevel original = requireNonNull(helper, registry.createDynamicDimension(SOURCE_ID,
                 server.overworld().getChunkSource().getGenerator(), freshType(), sourceProperties), "source create");
         helper.runAfterDelay(1, () -> awaitRegistration(helper, server, sourceKey, destinationKey, sourcePath, destinationPath,
                 original, sourceProperties, 0));
@@ -65,7 +65,7 @@ public final class ProviderBridgeIntegrationGameTest {
                     original, sourceProperties, waited + 1));
             return;
         }
-        require(original.dimension().equals(sourceKey) && original.players().isEmpty(), "registered source key/players");
+        require(helper, original.dimension().equals(sourceKey) && original.players().isEmpty(), "registered source key/players");
         original.setBlock(MARKER, Blocks.REDSTONE_LAMP.defaultBlockState(), 3);
 
         OwnedDimensionDescriptor source = new OwnedDimensionDescriptor(sourceKey, original.getChunkSource().getGenerator(),
@@ -80,14 +80,14 @@ public final class ProviderBridgeIntegrationGameTest {
         ClosedDimensionCopier productionCopier = new ClosedDimensionCopier();
         ClosedDimensionCopyPort observingCopier = (request, receipt, fence) -> {
             productionCopier.copy(request, receipt, fence);
-            require(gate.tryAcquireReadyRead(source.id()) == null, "source read released before copied-data observation");
+            copyRequire(gate.tryAcquireReadyRead(source.id()) == null, "source read released before copied-data observation");
             Path relative = Path.of("region", "r.0.0.mca");
             Path copiedSource = request.storageRoot().resolve(request.sourceRelative()).resolve(relative);
             Path copiedDestination = request.storageRoot().resolve(request.destinationRelative()).resolve(relative);
-            require(Files.isRegularFile(copiedSource, LinkOption.NOFOLLOW_LINKS), "saved marker region source file");
-            require(Files.isRegularFile(copiedDestination, LinkOption.NOFOLLOW_LINKS), "saved marker region destination file");
+            copyRequire(Files.isRegularFile(copiedSource, LinkOption.NOFOLLOW_LINKS), "saved marker region source file");
+            copyRequire(Files.isRegularFile(copiedDestination, LinkOption.NOFOLLOW_LINKS), "saved marker region destination file");
             try {
-                require(Files.mismatch(copiedSource, copiedDestination) == -1L, "marker-bearing region copied byte-for-byte");
+                copyRequire(Files.mismatch(copiedSource, copiedDestination) == -1L, "marker-bearing region copied byte-for-byte");
             } catch (java.io.IOException e) {
                 throw new ClosedDimensionCopyException("marker-bearing region comparison failed", e);
             }
@@ -100,9 +100,9 @@ public final class ProviderBridgeIntegrationGameTest {
 
             AtomicReference<ProviderDuplicationBridge.BridgeOutcome> completion = new AtomicReference<>();
             AtomicInteger completionCount = new AtomicInteger();
-            require(bridge.beginDuplicate(source.id(), destination.id(), outcome -> { completion.set(outcome); completionCount.incrementAndGet(); })
+            require(helper, bridge.beginDuplicate(source.id(), destination.id(), outcome -> { completion.set(outcome); completionCount.incrementAndGet(); })
                     == ProviderDuplicationBridge.BridgeAdmission.ADMITTED, "provider close admission");
-            require(gate.tryAcquireReadyRead(source.id()) == null, "source read must close at admission");
+            require(helper, gate.tryAcquireReadyRead(source.id()) == null, "source read must close at admission");
             helper.runAfterDelay(1, () -> awaitTerminal(helper, server, gate, source, destination, original, sourcePath, destinationPath,
                     completion, completionCount, markerRegion, 0));
         } catch (ClosedDimensionCopyException e) {
@@ -116,32 +116,37 @@ public final class ProviderBridgeIntegrationGameTest {
                                       AtomicReference<ProviderDuplicationBridge.BridgeOutcome> completion, AtomicInteger completionCount,
                                       AtomicReference<Path> markerRegion, int waited) {
         if (completion.get() == null) {
-            if (waited >= 120) throw new AssertionError("provider close did not publish a terminal outcome");
+            if (waited >= 120) {
+                helper.fail("provider close did not publish a terminal outcome; "
+                        + terminalDiagnostics(server, gate, source, destination, completion, completionCount));
+                return;
+            }
             helper.runAfterDelay(1, () -> awaitTerminal(helper, server, gate, source, destination, original, sourcePath, destinationPath,
                     completion, completionCount, markerRegion, waited + 1));
             return;
         }
-        require(completion.get() == ProviderDuplicationBridge.BridgeOutcome.RESTORED && completionCount.get() == 1,
-                "one successful close/copy/restore outcome");
-        ServerLevel restored = requireNonNull(server.getLevel(source.key()), "restored source level");
-        require(restored != original, "restoration must produce a new source instance");
-        require(restored.getBlockState(MARKER).is(Blocks.REDSTONE_LAMP), "persisted source marker");
+        require(helper, completion.get() == ProviderDuplicationBridge.BridgeOutcome.RESTORED && completionCount.get() == 1,
+                "one successful close/copy/restore outcome; "
+                        + terminalDiagnostics(server, gate, source, destination, completion, completionCount));
+        ServerLevel restored = requireNonNull(helper, server.getLevel(source.key()), "restored source level");
+        require(helper, restored != original, "restoration must produce a new source instance");
+        require(helper, restored.getBlockState(MARKER).is(Blocks.REDSTONE_LAMP), "persisted source marker");
         VerseOperationGate.ReadyRead ready = gate.tryAcquireReadyRead(source.id());
-        try { require(ready != null && ready.identity().equals(identity(restored)), "restored identity/readiness"); }
+        try { require(helper, ready != null && ready.identity().equals(identity(restored)), "restored identity/readiness"); }
         finally { if (ready != null) ready.close(); }
-        require(server.getLevel(destination.key()) == null, "destination remains unloaded");
-        require(gate.tryAcquireReadyRead(destination.id()) == null, "destination remains unreadable");
-        require(markerRegion.get() != null && Files.isRegularFile(destinationPath.resolve(markerRegion.get()), LinkOption.NOFOLLOW_LINKS),
+        require(helper, server.getLevel(destination.key()) == null, "destination remains unloaded");
+        require(helper, gate.tryAcquireReadyRead(destination.id()) == null, "destination remains unreadable");
+        require(helper, markerRegion.get() != null && Files.isRegularFile(destinationPath.resolve(markerRegion.get()), LinkOption.NOFOLLOW_LINKS),
                 "observed copied marker region");
-        require(Files.isDirectory(sourcePath, LinkOption.NOFOLLOW_LINKS), "source directory retained");
+        require(helper, Files.isDirectory(sourcePath, LinkOption.NOFOLLOW_LINKS), "source directory retained");
         helper.succeed();
     }
 
-    private static void requireFresh(DynamicDimensionRegistry registry, MinecraftServer server, ResourceKey<Level> source,
+    private static void requireFresh(GameTestHelper helper, DynamicDimensionRegistry registry, MinecraftServer server, ResourceKey<Level> source,
                                      ResourceKey<Level> destination, Path sourcePath, Path destinationPath) {
-        require(!registry.anyDimensionExists(source.location()) && !registry.anyDimensionExists(destination.location()), "owned key already exists");
-        require(server.getLevel(source) == null && server.getLevel(destination) == null, "owned key already loaded");
-        require(!Files.exists(sourcePath, LinkOption.NOFOLLOW_LINKS) && !Files.exists(destinationPath, LinkOption.NOFOLLOW_LINKS),
+        require(helper, !registry.anyDimensionExists(source.location()) && !registry.anyDimensionExists(destination.location()), "owned key already exists");
+        require(helper, server.getLevel(source) == null && server.getLevel(destination) == null, "owned key already loaded");
+        require(helper, !Files.exists(sourcePath, LinkOption.NOFOLLOW_LINKS) && !Files.exists(destinationPath, LinkOption.NOFOLLOW_LINKS),
                 "existing source/destination path is refused");
     }
 
@@ -162,12 +167,36 @@ public final class ProviderBridgeIntegrationGameTest {
                 new DimensionType.MonsterSettings(false, true, UniformInt.of(0, 7), 0));
     }
 
-    private static <T> T requireNonNull(T value, String message) {
-        if (value == null) throw new AssertionError(message);
+    private static String terminalDiagnostics(MinecraftServer server, VerseOperationGate gate,
+                                              OwnedDimensionDescriptor source, OwnedDimensionDescriptor destination,
+                                              AtomicReference<ProviderDuplicationBridge.BridgeOutcome> completion,
+                                              AtomicInteger completionCount) {
+        VerseOperationGate.ReadyRead sourceRead = gate.tryAcquireReadyRead(source.id());
+        VerseOperationGate.ReadyRead destinationRead = gate.tryAcquireReadyRead(destination.id());
+        try {
+            ServerLevel sourceLevel = server.getLevel(source.key());
+            ServerLevel destinationLevel = server.getLevel(destination.key());
+            return "outcome=" + completion.get() + ", completionCount=" + completionCount.get()
+                    + ", sourceLevel=" + (sourceLevel == null ? "null" : identity(sourceLevel))
+                    + ", sourceGate=" + (sourceRead == null ? "unavailable" : sourceRead.identity() + "@" + sourceRead.generation())
+                    + ", destinationLevel=" + (destinationLevel == null ? "null" : identity(destinationLevel))
+                    + ", destinationGate=" + (destinationRead == null ? "unavailable" : destinationRead.identity() + "@" + destinationRead.generation());
+        } finally {
+            if (sourceRead != null) sourceRead.close();
+            if (destinationRead != null) destinationRead.close();
+        }
+    }
+
+    private static <T> T requireNonNull(GameTestHelper helper, T value, String message) {
+        if (value == null) helper.fail(message);
         return value;
     }
 
-    private static void require(boolean condition, String message) {
-        if (!condition) throw new AssertionError(message);
+    private static void require(GameTestHelper helper, boolean condition, String message) {
+        if (!condition) helper.fail(message);
+    }
+
+    private static void copyRequire(boolean condition, String message) throws ClosedDimensionCopyException {
+        if (!condition) throw new ClosedDimensionCopyException(message);
     }
 }

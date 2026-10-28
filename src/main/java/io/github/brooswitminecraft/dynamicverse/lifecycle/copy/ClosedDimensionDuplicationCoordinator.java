@@ -51,7 +51,7 @@ public final class ClosedDimensionDuplicationCoordinator {
                 throw new ClosedDimensionCopyException("Storage mapping identity does not match admitted source");
             }
         } catch (ClosedDimensionCopyException | RuntimeException e) {
-            return unavailable(intent.destinationKey(), "Storage mapping/fence boundary refused copy: " + e.getMessage());
+            return unavailable(intent.destinationKey(), "Storage mapping/fence boundary refused copy: " + e.getMessage(), e);
         }
 
         try {
@@ -59,7 +59,7 @@ public final class ClosedDimensionDuplicationCoordinator {
             return new ClosedDimensionDuplicationResult(ClosedDimensionDuplicationResult.Outcome.COPIED,
                     "Exact close terminal copied; separate ordered load wiring is still required");
         } catch (ClosedDimensionCopyException | RuntimeException e) {
-            return unavailable(intent.destinationKey(), "Copy failed; retained destination must not load or publish: " + e.getMessage());
+            return unavailable(intent.destinationKey(), "Copy failed; retained destination must not load or publish: " + e.getMessage(), e);
         }
     }
 
@@ -67,9 +67,9 @@ public final class ClosedDimensionDuplicationCoordinator {
         return unavailableDestinations.contains(destinationKey);
     }
 
-    private ClosedDimensionDuplicationResult unavailable(String destinationKey, String detail) {
+    private ClosedDimensionDuplicationResult unavailable(String destinationKey, String detail, Throwable cause) {
         unavailableDestinations.add(destinationKey);
-        return new ClosedDimensionDuplicationResult(ClosedDimensionDuplicationResult.Outcome.UNAVAILABLE, detail);
+        return new ClosedDimensionDuplicationResult(ClosedDimensionDuplicationResult.Outcome.UNAVAILABLE, detail, cause);
     }
 
     private static ClosedDimensionDuplicationResult rejected(String detail) {

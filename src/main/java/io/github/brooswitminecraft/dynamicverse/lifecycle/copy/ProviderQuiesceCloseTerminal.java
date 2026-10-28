@@ -13,7 +13,14 @@ public record ProviderQuiesceCloseTerminal(
         long generation,
         boolean initiallyLoaded,
         ClosedDimensionStatus status,
-        boolean failurePresent) {
+        boolean failurePresent,
+        String failureStage,
+        Throwable cause) {
+    public ProviderQuiesceCloseTerminal(String sourceKey, long generation, boolean initiallyLoaded,
+                                        ClosedDimensionStatus status, boolean failurePresent) {
+        this(sourceKey, generation, initiallyLoaded, status, failurePresent, null, null);
+    }
+
     public ProviderQuiesceCloseTerminal {
         Objects.requireNonNull(sourceKey);
         Objects.requireNonNull(status);
