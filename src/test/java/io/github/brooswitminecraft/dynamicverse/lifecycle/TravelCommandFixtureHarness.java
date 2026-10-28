@@ -77,5 +77,67 @@ final class TravelCommandFixtureHarness {
             assertFalse(TravelCoordinates.isValid(new VerseTravelService.Position(coordinates[0], coordinates[1], coordinates[2])));
         }
     }
+
+    @Test
+    void sendAndTpReportPendingBeforeInlineCompletion() throws Exception {
+        Directory directory = new Directory();
+        var caller = new VerseTravelService.Player(UUID.randomUUID(), new VerseTravelService.Position(1, 64, 1));
+        var target = new VerseTravelService.Player(UUID.randomUUID(), new VerseTravelService.Position(2, 64, 2));
+        directory.players.put(caller.id(), caller);
+        directory.players.put(target.id(), target);
+        var dispatcher = new CommandDispatcher<Source>();
+        new TravelCommandFixtureRegistrar<>(inlineContext(directory, caller, target, false)).register(dispatcher);
+
+        Source send = new Source(true, false, false, new ArrayList<>());
+        dispatcher.execute("verse send target moon", send);
+        assertPendingThen(send, "travel moved");
+
+        Source tp = new Source(true, true, false, new ArrayList<>());
+        dispatcher.execute("verse tp moon", tp);
+        assertPendingThen(tp, "travel moved");
+    }
+
+    @Test
+    void sendAndTpReportPendingBeforeInlineFailure() throws Exception {
+        Directory directory = new Directory();
+        var caller = new VerseTravelService.Player(UUID.randomUUID(), new VerseTravelService.Position(1, 64, 1));
+        var target = new VerseTravelService.Player(UUID.randomUUID(), new VerseTravelService.Position(2, 64, 2));
+        directory.players.put(caller.id(), caller);
+        directory.players.put(target.id(), target);
+        var dispatcher = new CommandDispatcher<Source>();
+        new TravelCommandFixtureRegistrar<>(inlineContext(directory, caller, target, true)).register(dispatcher);
+
+        Source send = new Source(true, false, false, new ArrayList<>());
+        dispatcher.execute("verse send target moon", send);
+        assertPendingThen(send, "travel failed: VERSE_NOT_FOUND");
+
+        Source tp = new Source(true, true, false, new ArrayList<>());
+        dispatcher.execute("verse tp moon", tp);
+        assertPendingThen(tp, "travel failed: VERSE_NOT_FOUND");
+    }
+
+    private static TravelCommandFixtureRegistrar.Context<Source> inlineContext(
+            Directory directory, VerseTravelService.Player caller, VerseTravelService.Player target, boolean fail) {
+        VerseAccessService access = (name, callback) -> {
+            VerseReservationId id = VerseReservationId.newId();
+            callback.complete(fail
+                    ? VerseReservationSnapshot.failed(id, name, VerseAccessError.ERR_VERSE_NOT_FOUND)
+                    : VerseReservationSnapshot.acquired(id, new ReadyVerseLease(name, "level", 1L, id, () -> { })));
+            return VerseReservationSnapshot.pending(id, name);
+        };
+        VerseTravelService service = new VerseTravelService(access, directory, (player, destination, lease) -> { });
+        return new TravelCommandFixtureRegistrar.Context<>() {
+            public boolean permitted(Source source) { return source.permitted(); }
+            public VerseTravelService.Player caller(Source source) { return source.player() ? caller : null; }
+            public VerseTravelService.Player player(String name) { return name.equals("target") ? target : null; }
+            public VerseTravelService travel(Source source) { return service; }
+            public void success(Source source, String message) { source.messages().add(message); }
+            public void failure(Source source, String message) { source.messages().add(message); }
+        };
+    }
     static void assertMessages(Source source, String... expected) { if (!source.messages().equals(List.of(expected))) throw new AssertionError(source.messages()); }
+    static void assertPendingThen(Source source, String terminal) {
+        if (source.messages().size() != 2 || !source.messages().get(0).startsWith("travel accepted/pending ")
+                || !source.messages().get(1).equals(terminal)) throw new AssertionError(source.messages());
+    }
 }
