@@ -57,6 +57,9 @@ neoForge {
             type = "gameTestServer"
             // Isolated disposable run state; do not point this at an existing world.
             gameDirectory = layout.projectDirectory.dir("run/bridgeGameTest-controlled-observation")
+            // Test output carries the compiled facade cases and its main runtime
+            // dependency; the dynamicverse mod mapping below includes both outputs.
+            sourceSet = sourceSets.test
             systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
         }
         register("providerBridgeGameTest") {
