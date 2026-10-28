@@ -45,8 +45,8 @@ neoForge {
         }
         register("providerBridgeGameTest") {
             type = "gameTestServer"
-            // Never reuse the preserved failed-provider run root.
-            gameDirectory = layout.projectDirectory.dir("run/providerBridgeGameTest-runtime-mods")
+            // Dedicated fresh root for a later reviewed diagnostic attempt; never reuse either failed root.
+            gameDirectory = layout.projectDirectory.dir("run/providerBridgeGameTest-diagnostics")
             sourceSet = sourceSets.providerBridgeGameTest
             systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
             systemProperty "dynamicverse.providerBridgeIntegration", "true"
