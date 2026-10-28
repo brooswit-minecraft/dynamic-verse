@@ -60,7 +60,10 @@ public final class ProviderBridgeIntegrationGameTest {
                                           ResourceKey<Level> destinationKey, Path sourcePath, Path destinationPath,
                                           ServerLevel original, DynamicDimensionProperties sourceProperties, int waited) {
         if (server.getLevel(sourceKey) != original) {
-            if (waited >= 40) throw new AssertionError("created source did not register as its returned instance");
+            if (waited >= 40) {
+                helper.fail("created source did not register as its returned instance");
+                return;
+            }
             helper.runAfterDelay(1, () -> awaitRegistration(helper, server, sourceKey, destinationKey, sourcePath, destinationPath,
                     original, sourceProperties, waited + 1));
             return;
@@ -106,7 +109,7 @@ public final class ProviderBridgeIntegrationGameTest {
             helper.runAfterDelay(1, () -> awaitTerminal(helper, server, gate, source, destination, original, sourcePath, destinationPath,
                     completion, completionCount, markerRegion, 0));
         } catch (ClosedDimensionCopyException e) {
-            throw new AssertionError("provider bridge refused owned fixture", e);
+            helper.fail("provider bridge refused owned fixture: " + e);
         }
     }
 
