@@ -6,5 +6,11 @@ import java.util.function.Consumer;
 public interface ProviderDuplicationPort {
     boolean beginQuiesceAndClose(OwnedDimensionDescriptor source, Consumer<ProviderQuiesceCloseTerminal> terminal);
     RestoredSource loadOriginalSource(OwnedDimensionDescriptor source, long restorationGeneration);
-    record RestoredSource(String instanceIdentity, long generation) { }
+    LoadedDestination loadCopiedDestination(OwnedDimensionDescriptor destination, long generation);
+    boolean isCurrent(OwnedDimensionDescriptor descriptor, Object instance);
+    boolean isAbsent(OwnedDimensionDescriptor descriptor);
+    boolean hasCopiedDestination(ClosedDimensionCopyRequest request);
+
+    record RestoredSource(Object instance, String instanceIdentity, long generation) { }
+    record LoadedDestination(Object instance, String instanceIdentity, long generation) { }
 }

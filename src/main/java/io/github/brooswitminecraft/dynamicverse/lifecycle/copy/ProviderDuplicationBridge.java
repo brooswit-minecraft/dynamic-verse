@@ -45,7 +45,7 @@ public final class ProviderDuplicationBridge {
     public BridgeAdmission beginDuplicate(String sourceKey, String destinationKey, Consumer<BridgeOutcome> completion)
             throws ClosedDimensionCopyException {
         OwnedDimensionDescriptor source = catalog.require(sourceKey);
-        catalog.require(destinationKey);
+        OwnedDimensionDescriptor destination = catalog.require(destinationKey);
         if (sourceKey.equals(destinationKey)) throw new ClosedDimensionCopyException("Source and destination must differ");
         VerseOperationGate.Operation operation;
         try {
@@ -55,7 +55,7 @@ public final class ProviderDuplicationBridge {
         }
         boolean admitted;
         try {
-            admitted = provider.beginQuiesceAndClose(source, terminal -> finish(source, destinationKey, operation, terminal, completion));
+            admitted = provider.beginQuiesceAndClose(source, terminal -> finish(source, destination, operation, terminal, completion));
         } catch (RuntimeException e) {
             operation.close();
             return BridgeAdmission.REJECTED;
@@ -68,8 +68,9 @@ public final class ProviderDuplicationBridge {
         return BridgeAdmission.ADMITTED;
     }
 
-    private void finish(OwnedDimensionDescriptor source, String destinationKey, VerseOperationGate.Operation operation,
+    private void finish(OwnedDimensionDescriptor source, OwnedDimensionDescriptor destination, VerseOperationGate.Operation operation,
                         ProviderQuiesceCloseTerminal terminal, Consumer<BridgeOutcome> completion) {
+        String destinationKey = destination.id();
         long generation = terminal == null ? Long.MIN_VALUE : terminal.generation();
         if (!operation.claimTerminal(generation)) return;
         BridgeOutcome outcome = BridgeOutcome.QUARANTINED;
@@ -90,15 +91,35 @@ public final class ProviderDuplicationBridge {
                 LOGGER.info("Provider duplicate coordinator result source=" + source.id() + " destination=" + destinationKey
                         + " generation=" + terminal.generation() + " outcome=" + copied.outcome() + " detail=" + copied.detail()
                         + " cause=" + copied.cause());
-                if (copied.outcome() == ClosedDimensionDuplicationResult.Outcome.COPIED) {
+                if (copied.outcome() == ClosedDimensionDuplicationResult.Outcome.COPIED && copied.copyRequest() != null) {
+                    VerseOperationGate.CopyReservation reservation = operation.reserveCopied(source.id(), destinationKey,
+                            terminal.generation(), copied.copyRequest());
                     phase = "restoration";
                     LOGGER.info("Provider duplicate restoration entered source=" + source.id() + " generation=" + terminal.generation());
                     ProviderDuplicationPort.RestoredSource restored = provider.loadOriginalSource(source, terminal.generation());
-                    if (restored != null && restored.instanceIdentity() != null && !restored.instanceIdentity().isBlank()) {
+                    if (valid(restored) && restored.generation() == terminal.generation() && provider.isCurrent(source, restored.instance())) {
                         LOGGER.info("Provider duplicate restoration returned source=" + source.id() + " generation=" + restored.generation()
                                 + " identity=" + restored.instanceIdentity());
                         operation.restored(restored.instanceIdentity(), restored.generation());
                         outcome = BridgeOutcome.RESTORED;
+                        phase = "destination load";
+                        if (!provider.hasCopiedDestination(reservation.request())) {
+                            LOGGER.warning("Provider duplicate copied destination directory is absent/unusable destination=" + destinationKey
+                                    + " path=" + reservation.request().destinationRelative());
+                        } else if (!provider.isAbsent(destination)) {
+                            LOGGER.warning("Provider duplicate destination was registered before load destination=" + destinationKey);
+                        } else {
+                            ProviderDuplicationPort.LoadedDestination loaded = provider.loadCopiedDestination(destination, terminal.generation());
+                            if (valid(loaded) && loaded.generation() == terminal.generation() && provider.isCurrent(source, restored.instance())
+                                    && provider.isCurrent(destination, loaded.instance())) {
+                                operation.publishDestination(reservation, loaded.instanceIdentity(), loaded.generation());
+                                outcome = BridgeOutcome.LOADED;
+                                LOGGER.info("Provider duplicate destination loaded destination=" + destinationKey + " generation="
+                                        + loaded.generation() + " identity=" + loaded.instanceIdentity());
+                            } else {
+                                LOGGER.warning("Provider duplicate destination load returned null/foreign/stale identity destination=" + destinationKey);
+                            }
+                        }
                     } else {
                         LOGGER.warning("Provider duplicate restoration returned null/invalid source=" + source.id()
                                 + " generation=" + terminal.generation());
@@ -118,6 +139,14 @@ public final class ProviderDuplicationBridge {
         }
     }
 
+    private static boolean valid(ProviderDuplicationPort.RestoredSource source) {
+        return source != null && source.instance() != null && source.instanceIdentity() != null && !source.instanceIdentity().isBlank();
+    }
+
+    private static boolean valid(ProviderDuplicationPort.LoadedDestination destination) {
+        return destination != null && destination.instance() != null && destination.instanceIdentity() != null && !destination.instanceIdentity().isBlank();
+    }
+
     public enum BridgeAdmission { ADMITTED, REJECTED }
-    public enum BridgeOutcome { RESTORED, QUARANTINED }
+    public enum BridgeOutcome { RESTORED, LOADED, QUARANTINED }
 }

@@ -30,11 +30,11 @@ public final class ProviderDuplicationBridgeGameTest {
                 == ProviderDuplicationBridge.BridgeAdmission.ADMITTED, "admission");
         scenario.provider.deliver(success(scenario.source.id(), 7));
 
-        require(scenario.outcome.get() == ProviderDuplicationBridge.BridgeOutcome.RESTORED, "restored outcome");
-        require(scenario.copies.get() == 1 && scenario.provider.loads.get() == 1 && scenario.completions.get() == 1,
+        require(scenario.outcome.get() == ProviderDuplicationBridge.BridgeOutcome.LOADED, "loaded outcome");
+        require(scenario.copies.get() == 1 && scenario.provider.loads.get() == 1 && scenario.provider.destinationLoads.get() == 1 && scenario.completions.get() == 1,
                 "exact success counts");
         assertReady(scenario.gate, scenario.source.id(), "restored", 7);
-        require(scenario.gate.tryAcquireReadyRead(scenario.destination.id()) == null, "destination must remain unpublished");
+        assertReady(scenario.gate, scenario.destination.id(), "destination", 7);
         helper.succeed();
     }
 
@@ -89,9 +89,35 @@ public final class ProviderDuplicationBridgeGameTest {
         scenario.provider.deliver(terminal);
         scenario.provider.deliver(terminal);
 
-        require(scenario.copies.get() == 1 && scenario.provider.loads.get() == 1 && scenario.completions.get() == 1,
+        require(scenario.copies.get() == 1 && scenario.provider.loads.get() == 1 && scenario.provider.destinationLoads.get() == 1 && scenario.completions.get() == 1,
                 "replay or callback replay");
         assertReady(scenario.gate, scenario.source.id(), "restored", 7);
+        assertReady(scenario.gate, scenario.destination.id(), "destination", 7);
+        helper.succeed();
+    }
+
+    @GameTest(templateNamespace = "dynamicverse", template = "empty")
+    @PrefixGameTestTemplate(false)
+    public void controlledBridgeDestinationRefusalsRetainOnlyRestoredSource(GameTestHelper helper) throws Exception {
+        Scenario absent = admittedScenario(helper.getLevel());
+        absent.provider.copiedDirectory = false;
+        absent.provider.deliver(success(absent.source.id(), 7));
+        assertSourceOnlyRestored(absent, "missing copied directory", 0);
+
+        Scenario foreign = admittedScenario(helper.getLevel());
+        foreign.provider.foreignDestination = true;
+        foreign.provider.deliver(success(foreign.source.id(), 7));
+        assertSourceOnlyRestored(foreign, "foreign destination", 1);
+
+        Scenario wrongGeneration = admittedScenario(helper.getLevel());
+        wrongGeneration.provider.wrongDestinationGeneration = true;
+        wrongGeneration.provider.deliver(success(wrongGeneration.source.id(), 7));
+        assertSourceOnlyRestored(wrongGeneration, "wrong destination generation", 1);
+
+        Scenario staleRestore = admittedScenario(helper.getLevel());
+        staleRestore.provider.wrongRestoreGeneration = true;
+        staleRestore.provider.deliver(success(staleRestore.source.id(), 7));
+        assertQuarantinedOnce(staleRestore, "wrong restored source generation", 1, 1);
         helper.succeed();
     }
 
@@ -125,7 +151,7 @@ public final class ProviderDuplicationBridgeGameTest {
         catalog.register(source);
         catalog.register(destination);
         VerseOperationGate gate = new VerseOperationGate();
-        ControlledProvider provider = new ControlledProvider(gate, source.id());
+        ControlledProvider provider = new ControlledProvider(gate, source.id(), destination.id());
         AtomicInteger copies = new AtomicInteger();
         AtomicReference<ProviderDuplicationBridge.BridgeOutcome> outcome = new AtomicReference<>();
         AtomicInteger completions = new AtomicInteger();
@@ -150,6 +176,14 @@ public final class ProviderDuplicationBridgeGameTest {
                 && scenario.completions.get() == 1, detail + " exact terminal counts");
         require(scenario.gate.tryAcquireReadyRead(scenario.source.id()) == null, detail + " source must quarantine");
         require(scenario.gate.tryAcquireReadyRead(scenario.destination.id()) == null, detail + " destination must quarantine");
+    }
+
+    private static void assertSourceOnlyRestored(Scenario scenario, String detail, int expectedDestinationLoads) {
+        require(scenario.outcome.get() == ProviderDuplicationBridge.BridgeOutcome.RESTORED, detail + " outcome");
+        require(scenario.provider.destinationLoads.get() == expectedDestinationLoads && scenario.completions.get() == 1,
+                detail + " destination completion count");
+        assertReady(scenario.gate, scenario.source.id(), "restored", 7);
+        require(scenario.gate.tryAcquireReadyRead(scenario.destination.id()) == null, detail + " destination unavailable");
     }
 
     private static void assertReady(VerseOperationGate gate, String key, String identity, long generation) {
@@ -196,13 +230,23 @@ public final class ProviderDuplicationBridgeGameTest {
     private static final class ControlledProvider implements ProviderDuplicationPort {
         private final VerseOperationGate gate;
         private final String sourceKey;
+        private final String destinationKey;
         private java.util.function.Consumer<ProviderQuiesceCloseTerminal> terminal;
         private final AtomicInteger loads = new AtomicInteger();
+        private final AtomicInteger destinationLoads = new AtomicInteger();
+        private final Object sourceInstance = new Object();
+        private final Object destinationInstance = new Object();
         private boolean admit = true;
         private boolean throwRestore;
         private boolean nullRestore;
+        private boolean copiedDirectory = true;
+        private boolean foreignDestination;
+        private boolean wrongRestoreGeneration;
+        private boolean wrongDestinationGeneration;
 
-        private ControlledProvider(VerseOperationGate gate, String sourceKey) { this.gate = gate; this.sourceKey = sourceKey; }
+        private ControlledProvider(VerseOperationGate gate, String sourceKey, String destinationKey) {
+            this.gate = gate; this.sourceKey = sourceKey; this.destinationKey = destinationKey;
+        }
         public boolean beginQuiesceAndClose(OwnedDimensionDescriptor source, java.util.function.Consumer<ProviderQuiesceCloseTerminal> terminal) {
             if (admit) this.terminal = terminal;
             return admit;
@@ -211,8 +255,19 @@ public final class ProviderDuplicationBridgeGameTest {
             require(gate.tryAcquireReadyRead(sourceKey) == null, "source read released before restoration");
             loads.incrementAndGet();
             if (throwRestore) throw new IllegalStateException("controlled restore failure");
-            return nullRestore ? null : new RestoredSource("restored", generation);
+            return nullRestore ? null : new RestoredSource(sourceInstance, "restored", wrongRestoreGeneration ? generation + 1 : generation);
         }
+        public LoadedDestination loadCopiedDestination(OwnedDimensionDescriptor destination, long generation) {
+            require(gate.tryAcquireReadyRead(destinationKey) == null, "destination published before load");
+            destinationLoads.incrementAndGet();
+            return new LoadedDestination(foreignDestination ? new Object() : destinationInstance, "destination",
+                    wrongDestinationGeneration ? generation + 1 : generation);
+        }
+        public boolean isCurrent(OwnedDimensionDescriptor descriptor, Object instance) {
+            return descriptor.id().equals(sourceKey) ? instance == sourceInstance : instance == destinationInstance;
+        }
+        public boolean isAbsent(OwnedDimensionDescriptor descriptor) { return descriptor.id().equals(destinationKey); }
+        public boolean hasCopiedDestination(ClosedDimensionCopyRequest request) { return copiedDirectory; }
         private void deliver(ProviderQuiesceCloseTerminal value) { terminal.accept(value); }
     }
 }

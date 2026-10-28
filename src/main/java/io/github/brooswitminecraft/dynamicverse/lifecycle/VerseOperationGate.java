@@ -1,6 +1,7 @@
 package io.github.brooswitminecraft.dynamicverse.lifecycle;
 
 import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.SourceWriteReloadFence;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ClosedDimensionCopyRequest;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -60,6 +61,8 @@ public final class VerseOperationGate {
         private long sourceGeneration;
         private Long terminalGeneration;
         private boolean restored;
+        private boolean destinationPublished;
+        private CopyReservation reservation;
         private boolean closed;
         private Operation(String source, String destination, String sourceIdentity, long sourceGeneration) {
             this.source = source; this.destination = destination; this.sourceIdentity = sourceIdentity; this.sourceGeneration = sourceGeneration;
@@ -78,6 +81,34 @@ public final class VerseOperationGate {
             }};
         }
         public synchronized void restored(String identity, long generation) { sourceIdentity = Objects.requireNonNull(identity); sourceGeneration = generation; restored = true; }
+        /** Binds one copied directory to this exact admitted close generation. */
+        public synchronized CopyReservation reserveCopied(String expectedSource, String expectedDestination, long generation,
+                                                          ClosedDimensionCopyRequest request) {
+            Objects.requireNonNull(request);
+            if (closed || reservation != null || terminalGeneration == null || terminalGeneration != generation
+                    || !source.equals(expectedSource) || !destination.equals(expectedDestination)
+                    || !request.sourceKey().equals(source) || request.generation() != generation
+                    || request.sourceRelative().equals(request.destinationRelative())) {
+                throw new IllegalStateException("Copied directory is not bound to the admitted operation/generation");
+            }
+            reservation = new CopyReservation(source, destination, generation, request);
+            return reservation;
+        }
+        /** The bridge alone may publish a destination after an unconsumed reservation and verified identities. */
+        public synchronized void publishDestination(CopyReservation claimed, String identity, long generation) {
+            if (closed || claimed == null || claimed != reservation || claimed.consumed || !restored || generation != terminalGeneration) {
+                throw new IllegalStateException("Destination publication is not authorized by the copied operation");
+            }
+            synchronized (VerseOperationGate.this) {
+                Entry destinationEntry = entries.get(destination);
+                destinationEntry.identity = Objects.requireNonNull(identity);
+                destinationEntry.generation = generation;
+                destinationEntry.ready = true;
+                destinationEntry.quarantined = false;
+                destinationPublished = true;
+                claimed.consumed = true;
+            }
+        }
         /** Admission was refused before any provider close ticket existed. */
         public synchronized void admissionRefused() { restored = true; }
         @Override public void close() { synchronized (VerseOperationGate.this) {
@@ -90,12 +121,28 @@ public final class VerseOperationGate {
                 sourceEntry.identity = sourceIdentity;
                 sourceEntry.generation = sourceGeneration;
                 sourceEntry.ready = true;
+                if (!destinationPublished) destinationEntry.quarantined = true;
             } else {
                 sourceEntry.quarantined = true;
                 destinationEntry.quarantined = true;
             }
             closed = true;
         }}
+    }
+
+    public static final class CopyReservation {
+        private final String sourceKey;
+        private final String destinationKey;
+        private final long generation;
+        private final ClosedDimensionCopyRequest request;
+        private boolean consumed;
+        private CopyReservation(String sourceKey, String destinationKey, long generation, ClosedDimensionCopyRequest request) {
+            this.sourceKey = sourceKey; this.destinationKey = destinationKey; this.generation = generation; this.request = request;
+        }
+        public String sourceKey() { return sourceKey; }
+        public String destinationKey() { return destinationKey; }
+        public long generation() { return generation; }
+        public ClosedDimensionCopyRequest request() { return request; }
     }
 
     private static final class Entry { String identity; long generation; int reads; boolean ready; boolean operating; boolean quarantined; }

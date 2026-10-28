@@ -65,7 +65,7 @@ public final class ClosedDimensionDuplicationCoordinator {
             LOGGER.info("Closed dimension copier completed source=" + intent.sourceKey() + " destination=" + intent.destinationKey()
                     + " generation=" + intent.generation());
             return new ClosedDimensionDuplicationResult(ClosedDimensionDuplicationResult.Outcome.COPIED,
-                    "Exact close terminal copied; separate ordered load wiring is still required");
+                    "Exact close terminal copied", null, request);
         } catch (ClosedDimensionCopyException | RuntimeException e) {
             LOGGER.log(Level.WARNING, "Closed dimension copier failed source=" + intent.sourceKey() + " destination="
                     + intent.destinationKey() + " generation=" + intent.generation(), e);

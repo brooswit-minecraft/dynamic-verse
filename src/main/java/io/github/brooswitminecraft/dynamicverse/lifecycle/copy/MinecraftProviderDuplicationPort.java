@@ -7,6 +7,8 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 
 import java.util.Objects;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.util.function.Consumer;
 
 /** Actual pinned-provider adapter. It uses only DynamicDimensionRegistry's public close/load methods. */
@@ -32,7 +34,32 @@ public final class MinecraftProviderDuplicationPort implements ProviderDuplicati
     @Override
     public RestoredSource loadOriginalSource(OwnedDimensionDescriptor source, long restorationGeneration) {
         ServerLevel restored = registry.loadDynamicDimension(source.key().location(), source.generator(), source.type(), source.properties());
-        return restored == null ? null : new RestoredSource(source.id() + "@" + Integer.toHexString(System.identityHashCode(restored)), restorationGeneration);
+        return restored == null ? null : new RestoredSource(restored, identity(restored), restorationGeneration);
+    }
+
+    @Override
+    public LoadedDestination loadCopiedDestination(OwnedDimensionDescriptor destination, long generation) {
+        ServerLevel loaded = registry.loadDynamicDimension(destination.key().location(), destination.generator(), destination.type(), destination.properties());
+        return loaded == null ? null : new LoadedDestination(loaded, identity(loaded), generation);
+    }
+
+    @Override
+    public boolean isCurrent(OwnedDimensionDescriptor descriptor, Object instance) {
+        return instance instanceof ServerLevel level && server.getLevel(descriptor.key()) == level;
+    }
+
+    @Override
+    public boolean isAbsent(OwnedDimensionDescriptor descriptor) {
+        return server.getLevel(descriptor.key()) == null;
+    }
+
+    @Override
+    public boolean hasCopiedDestination(ClosedDimensionCopyRequest request) {
+        return Files.isDirectory(request.storageRoot().resolve(request.destinationRelative()).normalize(), LinkOption.NOFOLLOW_LINKS);
+    }
+
+    private static String identity(ServerLevel level) {
+        return level.dimension().location() + "@" + Integer.toHexString(System.identityHashCode(level));
     }
 
     private static ProviderQuiesceCloseTerminal map(QuiesceAndCloseResult result) {

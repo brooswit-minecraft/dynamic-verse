@@ -39,7 +39,7 @@ public final class ProviderBridgeIntegrationGameTest {
 
     @GameTest(templateNamespace = "dynamicverse", template = "empty", timeoutTicks = 160)
     @PrefixGameTestTemplate(false)
-    public void closesCopiesAndRestoresOwnedSource(GameTestHelper helper) throws Exception {
+    public void closesCopiesRestoresAndLoadsOwnedDestination(GameTestHelper helper) throws Exception {
         MinecraftServer server = helper.getLevel().getServer();
         DynamicDimensionRegistry registry = DynamicDimensionRegistry.from(server);
         ResourceKey<Level> sourceKey = ResourceKey.create(Registries.DIMENSION, SOURCE_ID);
@@ -75,6 +75,7 @@ public final class ProviderBridgeIntegrationGameTest {
                 original.dimensionType(), sourceProperties);
         OwnedDimensionDescriptor destination = new OwnedDimensionDescriptor(destinationKey, original.getChunkSource().getGenerator(),
                 freshType(), properties());
+        require(helper, source.type() != destination.type(), "destination requires a distinct provider DimensionType identity");
         OwnedDimensionCatalog catalog = new OwnedDimensionCatalog();
         catalog.register(source);
         catalog.register(destination);
@@ -128,8 +129,8 @@ public final class ProviderBridgeIntegrationGameTest {
                     completion, completionCount, markerRegion, waited + 1));
             return;
         }
-        require(helper, completion.get() == ProviderDuplicationBridge.BridgeOutcome.RESTORED && completionCount.get() == 1,
-                "one successful close/copy/restore outcome; "
+        require(helper, completion.get() == ProviderDuplicationBridge.BridgeOutcome.LOADED && completionCount.get() == 1,
+                "one successful close/copy/restore/destination-load outcome; "
                         + terminalDiagnostics(server, gate, source, destination, completion, completionCount));
         ServerLevel restored = requireNonNull(helper, server.getLevel(source.key()), "restored source level");
         require(helper, restored != original, "restoration must produce a new source instance");
@@ -137,8 +138,15 @@ public final class ProviderBridgeIntegrationGameTest {
         VerseOperationGate.ReadyRead ready = gate.tryAcquireReadyRead(source.id());
         try { require(helper, ready != null && ready.identity().equals(identity(restored)), "restored identity/readiness"); }
         finally { if (ready != null) ready.close(); }
-        require(helper, server.getLevel(destination.key()) == null, "destination remains unloaded");
-        require(helper, gate.tryAcquireReadyRead(destination.id()) == null, "destination remains unreadable");
+        ServerLevel loadedDestination = requireNonNull(helper, server.getLevel(destination.key()), "loaded destination level");
+        require(helper, loadedDestination != original && loadedDestination != restored, "destination has a distinct loaded identity");
+        require(helper, loadedDestination.dimension().equals(destination.key()), "destination registered with the owned key");
+        require(helper, loadedDestination.getBlockState(MARKER).is(Blocks.REDSTONE_LAMP), "copied destination marker");
+        VerseOperationGate.ReadyRead destinationReady = gate.tryAcquireReadyRead(destination.id());
+        try { require(helper, destinationReady != null && destinationReady.identity().equals(identity(loadedDestination)), "destination identity/readiness"); }
+        finally { if (destinationReady != null) destinationReady.close(); }
+        loadedDestination.setBlock(new BlockPos(2, 64, 1), Blocks.GLOWSTONE.defaultBlockState(), 3);
+        require(helper, !restored.getBlockState(new BlockPos(2, 64, 1)).is(Blocks.GLOWSTONE), "source/destination mutations are independent");
         require(helper, markerRegion.get() != null && Files.isRegularFile(destinationPath.resolve(markerRegion.get()), LinkOption.NOFOLLOW_LINKS),
                 "observed copied marker region");
         require(helper, Files.isDirectory(sourcePath, LinkOption.NOFOLLOW_LINKS), "source directory retained");
