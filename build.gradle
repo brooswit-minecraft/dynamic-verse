@@ -45,8 +45,8 @@ neoForge {
         }
         register("providerBridgeGameTest") {
             type = "gameTestServer"
-            // Dedicated fresh root for a later reviewed diagnostic attempt; never reuse either failed root.
-            gameDirectory = layout.projectDirectory.dir("run/providerBridgeGameTest-diagnostics")
+            // Reserved fresh root for the reviewed top-level-save-adapter candidate; never reuse a prior root.
+            gameDirectory = layout.projectDirectory.dir("run/providerBridgeGameTest-top-level-save-adapter")
             sourceSet = sourceSets.providerBridgeGameTest
             systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
             systemProperty "dynamicverse.providerBridgeIntegration", "true"
@@ -60,9 +60,9 @@ repositories {
 }
 
 def dynamicDimensionsJar = layout.projectDirectory.file("local-artifacts/dynamicdimensions-neoforge.jar")
-// Must be built from the accepted 04341e14 provider source; do not substitute the older local artifact.
-def acceptedDynamicDimensionsJar = file("/tmp/dynamicdimensions-composite/neoforge/build/libs/dynamicdimensions-neoforge-0.10.0+04341e14-dirty.jar")
-// 04341e14 classes include the reviewed close API; the older local jar intentionally remains untouched.
+// Must be built from reviewed provider candidate 4b09389; do not substitute the preserved older artifact.
+def acceptedDynamicDimensionsJar = file("/tmp/dynamicdimensions-composite/neoforge/build/libs/dynamicdimensions-neoforge-0.10.0+4b09389e-dirty.jar")
+// 4b09389 classes include the reviewed top-level save adapter; older artifacts intentionally remain untouched.
 def reviewedDynamicDimensionsClasses = file("/tmp/dynamicdimensions-composite/neoforge/build/classes/java/main")
 def dynamicDimensionsSha256 = "b25aefb589ae1c8635679373230d536c6c77bd21942f65d0f9765436e5046d79"
 
