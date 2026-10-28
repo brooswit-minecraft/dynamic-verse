@@ -13,6 +13,9 @@ import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseReservationId;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseReservationSnapshot;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ManagedVerseListing;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.VerseLifecycleCommandService;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.ServerVerseRuntime;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ProviderDuplicationBridge;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ClosedDimensionCopyException;
 import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.List;
@@ -66,6 +69,26 @@ public final class NeoForgeVerseCommandsGameTest {
         feedback.clear(); lifecycle.admission = VerseLifecycleCommandService.DuplicateAdmission.ERR_PROVIDER_UNAVAILABLE;
         dispatcher.execute("verse duplicate dynamicverse:alpha dynamicverse:copy", operator);
         helper.assertTrue(feedback.successes.equals(List.of("duplicate failed: ERR_PROVIDER_UNAVAILABLE")), "unavailable provider must fail closed without a pending claim");
+        helper.succeed();
+    }
+
+    /** Compiled-only facade coverage: same runtime/gate/access path, controlled bridge, no provider invocation. */
+    @GameTest(templateNamespace = "minecraft", template = "bastion/mobs/empty")
+    public static void runtimeRetiresPendingAccessWithoutProviderRun(GameTestHelper helper) {
+        ServerVerseRuntime runtime = ServerVerseRuntime.controlled(helper.getLevel().getServer(), new ServerVerseRuntime.BridgeGateway() {
+            @Override public void registerReady(String key, String identity, long generation) { }
+            @Override public ProviderDuplicationBridge.BridgeAdmission beginDuplicate(String source, String destination, java.util.function.Consumer<ProviderDuplicationBridge.BridgeOutcome> callback) { return ProviderDuplicationBridge.BridgeAdmission.REJECTED; }
+        });
+        AtomicInteger completions = new AtomicInteger();
+        runtime.beginAcquireReadyRead("dynamicverse:missing", result -> {
+            helper.assertTrue(result.phase() == io.github.brooswitminecraft.dynamicverse.lifecycle.VerseReservationPhase.FAILED, "close must settle pending acquire");
+            completions.incrementAndGet();
+        });
+        runtime.close();
+        helper.assertTrue(completions.get() == 1, "pending acquire must complete exactly once on close");
+        runtime.beginAcquireReadyRead("dynamicverse:missing", result -> completions.incrementAndGet());
+        helper.assertTrue(completions.get() == 2, "post-close acquire must refuse immediately");
+        helper.assertTrue(runtime.listManaged().isEmpty(), "rejected enrollment cannot publish catalog state");
         helper.succeed();
     }
 
