@@ -60,25 +60,35 @@ public final class ProviderDuplicationBridge {
         Objects.requireNonNull(seed);
         OwnedDimensionDescriptor source = catalog.require(sourceKey);
         OwnedDimensionDescriptor destination = catalog.require(destinationKey);
-        if (seed.isPresent() && !supportsSeededReload()) return BridgeAdmission.REJECTED;
+        // Pre-provider rejections (seed support, gate exclusivity) are known to
+        // have no provider-side effect: the caller may safely undo a provisional
+        // destination reservation. A rejection reached only after the provider
+        // was actually invoked is uncertain and must preserve quarantine instead.
+        if (seed.isPresent() && !supportsSeededReload()) return BridgeAdmission.REJECTED_NO_EFFECT;
         if (sourceKey.equals(destinationKey)) throw new ClosedDimensionCopyException("Source and destination must differ");
         VerseOperationGate.Operation operation;
         try {
             operation = gate.beginOperation(sourceKey, destinationKey);
         } catch (IllegalStateException e) {
-            return BridgeAdmission.REJECTED;
+            return BridgeAdmission.REJECTED_NO_EFFECT;
         }
         boolean admitted;
         try {
             admitted = provider.beginQuiesceAndClose(source, terminal -> finish(source, destination, operation, terminal, seed, completion));
         } catch (RuntimeException | LinkageError e) {
+            // The provider was invoked and failed with no known outcome; the
+            // gate's own close() quarantines both identities, so the caller must
+            // not release the destination reservation for reuse.
             operation.close();
-            return BridgeAdmission.REJECTED;
+            return BridgeAdmission.REJECTED_UNCERTAIN;
         }
         if (!admitted) {
+            // A synchronous decline is the provider's documented no-effect
+            // contract: admissionRefused() restores source readiness and leaves
+            // the destination unquarantined, so the reservation may be released.
             operation.admissionRefused();
             operation.close();
-            return BridgeAdmission.REJECTED;
+            return BridgeAdmission.REJECTED_NO_EFFECT;
         }
         return BridgeAdmission.ADMITTED;
     }
@@ -186,6 +196,6 @@ public final class ProviderDuplicationBridge {
         return destination != null && destination.instance() != null && destination.instanceIdentity() != null && !destination.instanceIdentity().isBlank();
     }
 
-    public enum BridgeAdmission { ADMITTED, REJECTED }
+    public enum BridgeAdmission { ADMITTED, REJECTED_NO_EFFECT, REJECTED_UNCERTAIN }
     public enum BridgeOutcome { RESTORED, LOADED, QUARANTINED }
 }

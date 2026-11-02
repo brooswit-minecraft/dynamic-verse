@@ -11,10 +11,13 @@ lease release.
 
 The first focused command/service run passed 11 unit tests. After reconciling to the exact
 published executor, the complete non-server suite passed **64 unit tests in 14 suites**, with
-zero failures/errors/skips and process exit 0 on 2026-11-02. Reproduce with:
+zero failures/errors/skips and process exit 0 on 2026-11-02. This ordinary unit build needs the
+reviewed provider's compiled classes exactly like the native profiles do (see Portability below);
+it is not README's `local-artifacts` jar alone. Reproduce with:
 
 ```sh
-./gradlew compileJava compileTestJava test --offline --no-daemon
+./gradlew compileJava compileTestJava test --offline --no-daemon \
+  -PreviewedDynamicDimensionsClasses=/path/to/reviewed/classes
 ```
 
 The ordinary-restart O1/O2 acceptance receipts remain retained from the earlier successful run;
@@ -22,9 +25,14 @@ this continuation does not repeat them or claim a new provider GameTest run.
 
 ## Portability
 
-Follow README for the pinned `local-artifacts/dynamicdimensions-neoforge.jar` input. Native
-provider profiles additionally require the reviewed provider candidate jar and compiled API classes.
-Their existing local defaults can be overridden on another computer without editing source:
+See README's "Provider setup" section for the exact pinned provider repository/ref, why its
+reviewed classes are a pinned-artifact checksum rather than a cleanly rebuildable source ref today,
+and the ordinary `compileJava`/`compileTestJava`/`test` command with the required
+`reviewedDynamicDimensionsClasses` property. Run once with network access before adding `--offline`:
+a cold Gradle dependency/toolchain cache cannot resolve anything while offline.
+
+Native provider profiles additionally require the reviewed provider candidate jar. Both existing
+local defaults can be overridden on another computer without editing source:
 
 ```sh
 ./gradlew <provider-task> \

@@ -43,7 +43,7 @@ public final class ProviderDuplicationBridgeGameTest {
     @GameTest(templateNamespace = "dynamicverse", template = "empty") @PrefixGameTestTemplate(false)
     public void controlledBridgeSeededCapabilityAndObservedSeedFailuresFailClosed(GameTestHelper helper) throws Exception {
         Scenario unsupported = scenario(helper.getLevel()); unsupported.provider.seededCapability = false;
-        require(unsupported.bridge.beginDuplicate(unsupported.source.id(), unsupported.destination.id(), OptionalLong.of(9), unsupported.completion()) == ProviderDuplicationBridge.BridgeAdmission.REJECTED && unsupported.provider.admissions.get() == 0, "seed capability rejects before close");
+        require(unsupported.bridge.beginDuplicate(unsupported.source.id(), unsupported.destination.id(), OptionalLong.of(9), unsupported.completion()) == ProviderDuplicationBridge.BridgeAdmission.REJECTED_NO_EFFECT && unsupported.provider.admissions.get() == 0, "seed capability rejects before close");
         Scenario sourceWrong = scenario(helper.getLevel()); sourceWrong.provider.sourceObservedSeed = 8; sourceWrong.bridge.registerReady(sourceWrong.source.id(), "old", 1);
         require(sourceWrong.bridge.beginDuplicate(sourceWrong.source.id(), sourceWrong.destination.id(), OptionalLong.of(9), sourceWrong.completion()) == ProviderDuplicationBridge.BridgeAdmission.ADMITTED, "source admitted"); sourceWrong.provider.deliver(success(sourceWrong.source.id(), 7)); require(sourceWrong.outcome.get() == ProviderDuplicationBridge.BridgeOutcome.QUARANTINED, "wrong source seed quarantines");
         Scenario destinationWrong = scenario(helper.getLevel()); destinationWrong.provider.sourceObservedSeed = 9; destinationWrong.provider.destinationObservedSeed = 8; destinationWrong.bridge.registerReady(destinationWrong.source.id(), "old", 1);
@@ -62,7 +62,7 @@ public final class ProviderDuplicationBridgeGameTest {
     public void controlledBridgeCapabilityLinkageAndThrowingCurrentFailClosed(GameTestHelper helper) throws Exception {
         Scenario capability = scenario(helper.getLevel()); capability.provider.throwCapabilityLinkage = true;
         require(!capability.bridge.supportsSeededReload(), "public runtime-facing capability probe fails closed");
-        require(capability.bridge.beginDuplicate(capability.source.id(), capability.destination.id(), OptionalLong.of(9), capability.completion()) == ProviderDuplicationBridge.BridgeAdmission.REJECTED && capability.provider.admissions.get() == 0, "capability linkage before close");
+        require(capability.bridge.beginDuplicate(capability.source.id(), capability.destination.id(), OptionalLong.of(9), capability.completion()) == ProviderDuplicationBridge.BridgeAdmission.REJECTED_NO_EFFECT && capability.provider.admissions.get() == 0, "capability linkage before close");
         Scenario current = admittedScenario(helper.getLevel()); current.provider.delayDestinationObservation = true; current.provider.deliver(success(current.source.id(), 7));
         require(current.provider.pendingDestinationObservation != null && current.outcome.get() == null, "destination observation is delayed");
         current.provider.throwCurrent = true; current.provider.completeDestinationObservation(true);
@@ -194,7 +194,7 @@ public final class ProviderDuplicationBridgeGameTest {
         scenario.bridge.registerReady(scenario.source.id(), "old", 1);
 
         require(scenario.bridge.beginDuplicate(scenario.source.id(), scenario.destination.id(), scenario.completion())
-                == ProviderDuplicationBridge.BridgeAdmission.REJECTED, "admission must refuse");
+                == ProviderDuplicationBridge.BridgeAdmission.REJECTED_NO_EFFECT, "admission must refuse");
         require(scenario.provider.terminal == null && scenario.copies.get() == 0 && scenario.provider.loads.get() == 0
                 && scenario.completions.get() == 0, "refusal must have no terminal work");
         assertReady(scenario.gate, scenario.source.id(), "old", 1);
@@ -208,7 +208,7 @@ public final class ProviderDuplicationBridgeGameTest {
         scenario.bridge.registerReady(scenario.source.id(), "old", 1);
         scenario.provider.admit = false;
         require(scenario.bridge.beginDuplicate(scenario.source.id(), scenario.destination.id(), scenario.completion())
-                == ProviderDuplicationBridge.BridgeAdmission.REJECTED, "first admission refused");
+                == ProviderDuplicationBridge.BridgeAdmission.REJECTED_NO_EFFECT, "first admission refused");
         scenario.provider.admit = true;
         require(scenario.bridge.beginDuplicate(scenario.source.id(), scenario.destination.id(), scenario.completion())
                 == ProviderDuplicationBridge.BridgeAdmission.ADMITTED, "same destination retry admitted");
@@ -287,6 +287,8 @@ public final class ProviderDuplicationBridgeGameTest {
                 "fresh destination reaches bridge busy gate expected ERR_VERSE_BUSY actual=" + busySource);
         require(controlledProvider.get().admissions.get() == 1 && refusedCallbacks.get() == 0,
                 "refused duplicate requests do not enter provider work or invoke completion callbacks");
+        require(runtime.listManaged().stream().noneMatch(item -> item.name().equals("dynamicverse:runtime-busy-copy")),
+                "a gate-busy rejection reached before any provider invocation releases the provisional destination reservation");
         runtime.close();
         require(terminal.get() == VerseLifecycleCommandService.DuplicateOutcome.QUARANTINED && terminalCount.get() == 1,
                 "runtime retirement terminates admitted facade callback once");
@@ -794,7 +796,7 @@ public final class ProviderDuplicationBridgeGameTest {
                 (catalog, gate) -> new ServerVerseRuntime.BridgeGateway() {
                     @Override public void registerReady(String key, String identity, long generation) { gate.publishReady(key, identity, generation); }
                     @Override public ProviderDuplicationBridge.BridgeAdmission beginDuplicate(String s, String d, java.util.function.Consumer<ProviderDuplicationBridge.BridgeOutcome> done) {
-                        bridgeAdmissions.incrementAndGet(); return ProviderDuplicationBridge.BridgeAdmission.REJECTED;
+                        bridgeAdmissions.incrementAndGet(); return ProviderDuplicationBridge.BridgeAdmission.REJECTED_NO_EFFECT;
                     }
                 }, create, state);
         runtime.tick();
@@ -971,7 +973,7 @@ public final class ProviderDuplicationBridgeGameTest {
 
     private static ServerVerseRuntime.BridgeGateway gatewayForReplay(VerseOperationGate gate) { return new ServerVerseRuntime.BridgeGateway() {
         @Override public void registerReady(String k, String i, long g) { gate.publishReady(k, i, g); }
-        @Override public ProviderDuplicationBridge.BridgeAdmission beginDuplicate(String s, String d, java.util.function.Consumer<ProviderDuplicationBridge.BridgeOutcome> done) { return ProviderDuplicationBridge.BridgeAdmission.REJECTED; }
+        @Override public ProviderDuplicationBridge.BridgeAdmission beginDuplicate(String s, String d, java.util.function.Consumer<ProviderDuplicationBridge.BridgeOutcome> done) { return ProviderDuplicationBridge.BridgeAdmission.REJECTED_NO_EFFECT; }
     }; }
 
     private static OwnedDimensionDescriptor nondefaultDescriptor(String path, ServerLevel level) {
@@ -993,7 +995,7 @@ public final class ProviderDuplicationBridgeGameTest {
                     @Override public void registerReady(String key, String identity, long generation) { throw new AssertionError("create must publish through its reservation"); }
                     @Override public ProviderDuplicationBridge.BridgeAdmission beginDuplicate(String source, String destination,
                                                                                                java.util.function.Consumer<ProviderDuplicationBridge.BridgeOutcome> completion) {
-                        return ProviderDuplicationBridge.BridgeAdmission.REJECTED;
+                        return ProviderDuplicationBridge.BridgeAdmission.REJECTED_NO_EFFECT;
                     }
                 }, create, state);
     }
