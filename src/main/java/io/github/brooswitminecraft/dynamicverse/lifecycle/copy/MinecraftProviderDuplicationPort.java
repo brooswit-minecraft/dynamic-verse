@@ -1,6 +1,7 @@
 package io.github.brooswitminecraft.dynamicverse.lifecycle.copy;
 
 import dev.galacticraft.dynamicdimensions.api.DynamicDimensionRegistry;
+import dev.galacticraft.dynamicdimensions.api.ExplicitSeedDimensionRegistry;
 import dev.galacticraft.dynamicdimensions.api.lifecycle.QuiesceAndCloseResult;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -14,6 +15,7 @@ import java.util.Objects;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.util.function.Consumer;
+import java.util.OptionalLong;
 
 /** Actual pinned-provider adapter. It uses only DynamicDimensionRegistry's public close/load methods. */
 public final class MinecraftProviderDuplicationPort implements ProviderDuplicationPort {
@@ -37,6 +39,8 @@ public final class MinecraftProviderDuplicationPort implements ProviderDuplicati
                 },
                 result -> terminal.accept(map(result)));
     }
+    @Override public boolean supportsSeededReload() { return registry instanceof ExplicitSeedDimensionRegistry; }
+    @Override public OptionalLong effectiveSeed(Object instance) { return instance instanceof ServerLevel level ? OptionalLong.of(level.getSeed()) : OptionalLong.empty(); }
 
     @Override
     public RestoredSource loadOriginalSource(OwnedDimensionDescriptor source, long restorationGeneration) {
@@ -48,6 +52,19 @@ public final class MinecraftProviderDuplicationPort implements ProviderDuplicati
     public LoadedDestination loadCopiedDestination(OwnedDimensionDescriptor destination, long generation) {
         ServerLevel loaded = registry.loadDynamicDimension(destination.key().location(), destination.generator(), destination.type(), destination.properties());
         return loaded == null ? null : new LoadedDestination(loaded, identity(loaded), generation);
+    }
+
+    @Override public RestoredSource loadOriginalSource(OwnedDimensionDescriptor source, long generation, OptionalLong seed) {
+        if (seed.isEmpty()) return loadOriginalSource(source, generation);
+        if (!(registry instanceof ExplicitSeedDimensionRegistry seeded)) throw new UnsupportedOperationException("seeded source reload unavailable");
+        ServerLevel level = seeded.loadExplicitSeedDimension(source.key().location(), source.generator(), source.type(), source.properties(), seed.getAsLong());
+        return level == null ? null : new RestoredSource(level, identity(level), generation);
+    }
+    @Override public LoadedDestination loadCopiedDestination(OwnedDimensionDescriptor destination, long generation, OptionalLong seed) {
+        if (seed.isEmpty()) return loadCopiedDestination(destination, generation);
+        if (!(registry instanceof ExplicitSeedDimensionRegistry seeded)) throw new UnsupportedOperationException("seeded destination reload unavailable");
+        ServerLevel level = seeded.loadExplicitSeedDimension(destination.key().location(), destination.generator(), destination.type(), destination.properties(), seed.getAsLong());
+        return level == null ? null : new LoadedDestination(level, identity(level), generation);
     }
 
     @Override

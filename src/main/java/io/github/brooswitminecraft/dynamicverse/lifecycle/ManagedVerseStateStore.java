@@ -2,6 +2,7 @@ package io.github.brooswitminecraft.dynamicverse.lifecycle;
 
 import java.util.Map;
 import java.util.Objects;
+import java.util.OptionalLong;
 import java.util.UUID;
 
 /**
@@ -38,13 +39,19 @@ public interface ManagedVerseStateStore {
     }
 
     /** Descriptor reconstruction is deliberately limited to our approved create forms. */
-    record ReadyVerse(String id, VerseLifecycleCommandService.CreateType generator, long effectiveSeed,
+    record ReadyVerse(String id, VerseLifecycleCommandService.CreateType generator, OptionalLong requestedSeed, long effectiveSeed,
                       long generation, String typeProvenance, String propertiesProvenance) {
         public ReadyVerse {
             Objects.requireNonNull(id); Objects.requireNonNull(generator);
+            Objects.requireNonNull(requestedSeed);
             if (!"OVERWORLD_RECONSTRUCTED".equals(typeProvenance) || !"DEFAULT_DYNAMIC_PROPERTIES".equals(propertiesProvenance)) {
                 throw new IllegalArgumentException("Unsupported persisted descriptor provenance");
             }
+        }
+        /** Legacy shared-save-seed entries did not have a requested per-verse seed. */
+        public ReadyVerse(String id, VerseLifecycleCommandService.CreateType generator, long effectiveSeed,
+                          long generation, String typeProvenance, String propertiesProvenance) {
+            this(id, generator, OptionalLong.empty(), effectiveSeed, generation, typeProvenance, propertiesProvenance);
         }
     }
 

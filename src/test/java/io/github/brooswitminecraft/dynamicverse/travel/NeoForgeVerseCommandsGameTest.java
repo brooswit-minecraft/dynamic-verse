@@ -73,6 +73,8 @@ public final class NeoForgeVerseCommandsGameTest {
         CommandSourceStack operator = source(feedback, null, helper, 2);
         CommandSourceStack denied = source(feedback, null, helper, 1);
         expectRejected(() -> dispatcher.execute("verse list", denied), CommandSyntaxException.BUILT_IN_EXCEPTIONS.dispatcherUnknownCommand(), "lifecycle permission denial");
+        expectRejected(() -> dispatcher.execute("verse delete dynamicverse:alpha", denied), CommandSyntaxException.BUILT_IN_EXCEPTIONS.dispatcherUnknownCommand(), "delete permission denial");
+        helper.assertTrue(lifecycle.deleteAdmissions == 0, "permission denial must not admit delete work");
         dispatcher.execute("verse list", operator);
         helper.assertTrue(feedback.successes.equals(List.of("managed verses: dynamicverse:alpha=READY, dynamicverse:pending=PENDING")), "list must expose state without a live identity");
         feedback.clear();
@@ -95,6 +97,22 @@ public final class NeoForgeVerseCommandsGameTest {
         dispatcher.execute("verse duplicate alpha copy", operator);
         helper.assertTrue(lifecycle.source.equals("alpha") && lifecycle.destination.equals("copy")
                 && feedback.successes.equals(List.of("duplicate accepted/pending")), "bare owned names must reach the same lifecycle service unchanged");
+        feedback.clear();
+        dispatcher.execute("verse delete dynamicverse:alpha", operator);
+        helper.assertTrue(lifecycle.deleteName.equals("dynamicverse:alpha")
+                        && feedback.successes.equals(List.of("delete failed: ERR_SAFE_DELETE_UNAVAILABLE")),
+                "eligible owned delete must fail closed before a delete success claim");
+        feedback.clear(); lifecycle.deleteAdmission = VerseLifecycleCommandService.DeleteAdmission.ERR_VERSE_NOT_MANAGED;
+        dispatcher.execute("verse delete orphan", operator);
+        helper.assertTrue(lifecycle.deleteName.equals("orphan")
+                        && feedback.successes.equals(List.of("delete failed: ERR_VERSE_NOT_MANAGED")),
+                "untracked owned spelling must be refused without a pending claim");
+        try {
+            dispatcher.execute("verse delete minecraft:overworld", operator);
+            throw new AssertionError("foreign delete identifier unexpectedly reached lifecycle service");
+        } catch (CommandSyntaxException expected) {
+            helper.assertTrue(lifecycle.deleteAdmissions == 2, "foreign vanilla identifier must not reach delete admission");
+        }
         helper.succeed();
     }
 
@@ -122,17 +140,18 @@ public final class NeoForgeVerseCommandsGameTest {
         final boolean[] current = {true};
         final AtomicInteger registrations = new AtomicInteger();
         final AtomicInteger duplicateCallbacks = new AtomicInteger();
-        OwnedDimensionDescriptor source = descriptor("source", helper);
-        ServerVerseRuntime runtime = ServerVerseRuntime.controlled(helper.getLevel().getServer(), descriptor -> current[0] && descriptor.id().equals(source.id()) ? evidence(descriptor, helper) : null,
-                gateway(registrations, duplicateCallbacks, ProviderDuplicationBridge.BridgeAdmission.ADMITTED, ProviderDuplicationBridge.BridgeOutcome.RESTORED));
-        runtime.enrollVerifiedReady(provenance(source, helper, 7L));
-        helper.assertTrue(registrations.get() == 1 && runtime.listManaged().size() == 1 && runtime.listManaged().get(0).state() == ManagedVerseListing.State.READY, "validated enrollment publishes exactly one READY source through the shared gate");
+        ProducedCreate create = new ProducedCreate(helper);
+        ServerVerseRuntime runtime = ServerVerseRuntime.controlled(helper.getLevel().getServer(), descriptor -> current[0] && descriptor == create.descriptor ? evidence(descriptor, helper) : null,
+                gateway(registrations, duplicateCallbacks, ProviderDuplicationBridge.BridgeAdmission.ADMITTED, ProviderDuplicationBridge.BridgeOutcome.RESTORED), create);
+        OwnedDimensionDescriptor source = createReady(runtime, create, helper, "source");
+        long sourceGeneration = runtime.listManaged().stream().filter(item -> item.name().equals(source.id())).findFirst().orElseThrow().generation().orElseThrow();
+        helper.assertTrue(registrations.get() == 0 && runtime.listManaged().size() == 1 && runtime.listManaged().get(0).state() == ManagedVerseListing.State.READY, "omitted-seed producer publishes exactly one READY source through its reservation");
         final VerseReservationSnapshot[] terminal = new VerseReservationSnapshot[1];
         runtime.beginAcquireReadyRead(source.id(), result -> terminal[0] = result); runtime.tick();
         ReadyVerseLease lease = terminal[0].lease().orElseThrow();
         helper.assertTrue(runtime.resolve(lease) == helper.getLevel(), "live owned matching lease resolves current instance");
         lease.close(); helper.assertTrue(runtime.resolve(lease) == null, "closed lease is unavailable");
-        ReadyVerseLease foreign = ReadyVerseLeaseFixtures.acquired(source.id(), helper.getLevel().dimension().location()+"@foreign", 7L, VerseReservationId.newId(), () -> { });
+        ReadyVerseLease foreign = ReadyVerseLeaseFixtures.acquired(source.id(), helper.getLevel().dimension().location()+"@foreign", sourceGeneration, VerseReservationId.newId(), () -> { });
         helper.assertTrue(runtime.resolve(foreign) == null, "foreign lease is unavailable");
         current[0] = false;
         final VerseReservationSnapshot[] stale = new VerseReservationSnapshot[1]; runtime.beginAcquireReadyRead(source.id(), result -> stale[0] = result); runtime.tick();
@@ -158,10 +177,10 @@ public final class NeoForgeVerseCommandsGameTest {
     /** Compiled-only held-lease and pending-request retirement evidence through the production facade. */
     @GameTest(templateNamespace = "minecraft", template = "bastion/mobs/empty")
     public static void runtimeRetiresOpenLeaseAndPendingAccess(GameTestHelper helper) throws Exception {
-        OwnedDimensionDescriptor source = descriptor("retire-source", helper);
-        ServerVerseRuntime runtime = ServerVerseRuntime.controlled(helper.getLevel().getServer(), descriptor -> descriptor.id().equals(source.id()) ? evidence(descriptor, helper) : null,
-                gateway(new AtomicInteger(), new AtomicInteger(), ProviderDuplicationBridge.BridgeAdmission.REJECTED, null));
-        runtime.enrollVerifiedReady(provenance(source, helper, 2L));
+        ProducedCreate create = new ProducedCreate(helper);
+        ServerVerseRuntime runtime = ServerVerseRuntime.controlled(helper.getLevel().getServer(), descriptor -> descriptor == create.descriptor ? evidence(descriptor, helper) : null,
+                gateway(new AtomicInteger(), new AtomicInteger(), ProviderDuplicationBridge.BridgeAdmission.REJECTED, null), create);
+        OwnedDimensionDescriptor source = createReady(runtime, create, helper, "retire-source");
         final VerseReservationSnapshot[] openRead = new VerseReservationSnapshot[1];
         runtime.beginAcquireReadyRead(source.id(), result -> openRead[0] = result); runtime.tick();
         ReadyVerseLease stillOpen = openRead[0].lease().orElseThrow();
@@ -178,6 +197,46 @@ public final class NeoForgeVerseCommandsGameTest {
         stillOpen.close();
         AtomicInteger postClose = new AtomicInteger(); runtime.beginAcquireReadyRead(source.id(), ignored -> postClose.incrementAndGet());
         helper.assertTrue(postClose.get() == 1, "post-close access refuses immediately");
+        helper.succeed();
+    }
+
+    /**
+     * Compiled-only actual-runtime proof of the current delete boundary.  The
+     * controlled ports expose counts solely to prove this admission did not
+     * invoke provider or storage operations.
+     */
+    @GameTest(templateNamespace = "minecraft", template = "bastion/mobs/empty")
+    public static void runtimeDeleteAdmissionIsSafeBeforeProviderOrStorageMutation(GameTestHelper helper) {
+        ProducedCreate create = new ProducedCreate(helper);
+        AtomicInteger bridgeCalls = new AtomicInteger();
+        ServerVerseRuntime runtime = ServerVerseRuntime.controlled(helper.getLevel().getServer(),
+                descriptor -> descriptor == create.descriptor ? evidence(descriptor, helper) : null,
+                (catalog, gate) -> new ServerVerseRuntime.BridgeGateway() {
+                    @Override public void registerReady(String key, String identity, long generation) {
+                        bridgeCalls.incrementAndGet(); gate.publishReady(key, identity, generation);
+                    }
+                    @Override public ProviderDuplicationBridge.BridgeAdmission beginDuplicate(String source, String destination,
+                                                                                               java.util.function.Consumer<ProviderDuplicationBridge.BridgeOutcome> completion) {
+                        bridgeCalls.incrementAndGet();
+                        return ProviderDuplicationBridge.BridgeAdmission.REJECTED;
+                    }
+                }, create);
+        OwnedDimensionDescriptor source = createReady(runtime, create, helper, "delete-source");
+        int providerBefore = bridgeCalls.get();
+        int canCreateBefore = create.canCreateCalls;
+        int storageBefore = create.storageChecks;
+        int createBefore = create.createCalls;
+
+        helper.assertTrue(runtime.beginDelete(source.id()) == VerseLifecycleCommandService.DeleteAdmission.ERR_SAFE_DELETE_UNAVAILABLE,
+                "a verified READY Dynamic Verse is admitted only to the fail-closed delete result");
+        helper.assertTrue(bridgeCalls.get() == providerBefore, "delete admission must not invoke the provider bridge");
+        helper.assertTrue(create.canCreateCalls == canCreateBefore && create.storageChecks == storageBefore
+                        && create.createCalls == createBefore,
+                "delete admission must not probe or mutate the provider/storage create boundary");
+        helper.assertTrue(runtime.listManaged().stream().anyMatch(item -> item.name().equals(source.id())
+                        && item.state() == ManagedVerseListing.State.READY),
+                "fail-closed delete admission must leave the READY catalog entry untouched");
+        runtime.close();
         helper.succeed();
     }
 
@@ -205,6 +264,32 @@ public final class NeoForgeVerseCommandsGameTest {
     private static ServerVerseRuntime.EnrollmentProvenance provenance(OwnedDimensionDescriptor descriptor, GameTestHelper helper, long generation) {
         ServerVerseRuntime.CurrentLevelEvidence evidence = evidence(descriptor, helper);
         return new ServerVerseRuntime.EnrollmentProvenance(descriptor, helper.getLevel(), generation, evidence.identity());
+    }
+    /** Controlled producer for positive Runtime setup; it never invokes a native provider or world lifecycle API. */
+    private static OwnedDimensionDescriptor createReady(ServerVerseRuntime runtime, ProducedCreate create, GameTestHelper helper, String name) {
+        AtomicInteger terminal = new AtomicInteger();
+        helper.assertTrue(runtime.beginCreate(name, VerseLifecycleCommandService.CreateType.NORMAL, java.util.OptionalLong.empty(), outcome -> {
+            helper.assertTrue(outcome == VerseLifecycleCommandService.CreateOutcome.READY, "controlled producer must publish READY");
+            terminal.incrementAndGet();
+        }) == VerseLifecycleCommandService.CreateAdmission.ADMITTED, "controlled producer create admitted");
+        runtime.tick();
+        helper.assertTrue(create.descriptor != null && terminal.get() == 1, "controlled producer exposes the exact created descriptor once");
+        return create.descriptor;
+    }
+    private static final class ProducedCreate implements ServerVerseRuntime.CreateGateway {
+        private final GameTestHelper helper;
+        private OwnedDimensionDescriptor descriptor;
+        private int canCreateCalls;
+        private int storageChecks;
+        private int createCalls;
+        private ProducedCreate(GameTestHelper helper) { this.helper = helper; }
+        @Override public boolean canCreate(ResourceLocation id) { canCreateCalls++; return true; }
+        @Override public boolean storageExists(OwnedDimensionDescriptor descriptor) { storageChecks++; return false; }
+        @Override public net.minecraft.server.level.ServerLevel create(OwnedDimensionDescriptor descriptor) {
+            createCalls++;
+            this.descriptor = descriptor;
+            return helper.getLevel();
+        }
     }
     private static OwnedDimensionDescriptor descriptor(String path, GameTestHelper helper) {
         return new OwnedDimensionDescriptor(ResourceKey.create(Registries.DIMENSION, ResourceLocation.fromNamespaceAndPath("dynamicverse", path)), helper.getLevel().getChunkSource().getGenerator(), helper.getLevel().dimensionType(), new DynamicDimensionProperties() {
@@ -450,14 +535,20 @@ public final class NeoForgeVerseCommandsGameTest {
         private java.util.function.Consumer<DuplicateOutcome> completion;
         private DuplicateAdmission admission = DuplicateAdmission.ADMITTED;
         private int admissions;
+        private int deleteAdmissions;
         private String source;
         private String destination;
+        private String deleteName;
+        private DeleteAdmission deleteAdmission = DeleteAdmission.ERR_SAFE_DELETE_UNAVAILABLE;
         @Override public DuplicateAdmission beginDuplicate(String source, String destination, java.util.function.Consumer<DuplicateOutcome> callback) {
             admissions++; this.source = source; this.destination = destination; completion = callback; return admission;
         }
         @Override public CreateAdmission beginCreate(String name, CreateType type, java.util.OptionalLong seed,
                                                       java.util.function.Consumer<CreateOutcome> callback) {
             return CreateAdmission.ERR_PROVIDER_UNAVAILABLE;
+        }
+        @Override public DeleteAdmission beginDelete(String name) {
+            deleteAdmissions++; deleteName = name; return deleteAdmission;
         }
         @Override public List<ManagedVerseListing> listManaged() {
             return List.of(new ManagedVerseListing("dynamicverse:alpha", ManagedVerseListing.State.READY, java.util.Optional.of("identity"), java.util.Optional.of(1L)),

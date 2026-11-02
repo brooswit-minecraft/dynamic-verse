@@ -30,6 +30,7 @@ public final class NeoForgeVerseCommands {
     private static final String BRING = "bring";
     private static final String DUPLICATE = "duplicate";
     private static final String CREATE = "create";
+    private static final String DELETE = "delete";
     private static final String LIST = "list";
     private static final String SOURCE = "source";
     private static final String NAME = "name";
@@ -63,7 +64,7 @@ public final class NeoForgeVerseCommands {
                 .then(tp(lifecycle, levels))
                 .then(send(lifecycle, levels))
                 .then(bring(lifecycle, levels));
-        if (commands != null) root.then(duplicate(commands)).then(create(commands)).then(list(commands));
+        if (commands != null) root.then(duplicate(commands)).then(create(commands)).then(delete(commands)).then(list(commands));
         dispatcher.register(root);
     }
 
@@ -152,6 +153,16 @@ public final class NeoForgeVerseCommands {
     private static void createTerminal(CommandSourceStack source, VerseLifecycleCommandService.CreateOutcome outcome) {
         if (outcome == VerseLifecycleCommandService.CreateOutcome.READY) source.sendSuccess(() -> Component.literal("create ready"), false);
         else source.sendFailure(Component.literal("create failed: " + outcome));
+    }
+
+    /** Admission only: an eligible managed verse still fails closed until safe deletion is proven. */
+    private static LiteralArgumentBuilder<CommandSourceStack> delete(VerseLifecycleCommandService lifecycle) {
+        return Commands.literal(DELETE).then(Commands.argument(NAME, ResourceLocationArgument.id()).executes(context -> {
+            CommandSourceStack source = context.getSource();
+            VerseLifecycleCommandService.DeleteAdmission result = lifecycle.beginDelete(ownedName(context, NAME));
+            source.sendFailure(Component.literal("delete failed: " + result));
+            return 0;
+        }));
     }
 
     private static LiteralArgumentBuilder<CommandSourceStack> list(VerseLifecycleCommandService lifecycle) {

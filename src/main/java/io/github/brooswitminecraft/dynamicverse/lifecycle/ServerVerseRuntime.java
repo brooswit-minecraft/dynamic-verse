@@ -47,6 +47,8 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
     private final Set<AdmittedCompletion> admittedCompletions = new LinkedHashSet<>();
     private final Set<AdmittedCreate> admittedCreates = new LinkedHashSet<>();
     private final Map<String, PendingCreate> pendingCreates = new HashMap<>();
+    /** Replay loads are observed on a later owned tick before any READY publication. */
+    private final Map<String, PendingReplay> pendingReplays = new HashMap<>();
     private final Map<String, Long> effectiveSeeds = new HashMap<>();
     /** Provenance is admitted only from our supported producer or durable replay, never inferred from a class. */
     private final Map<String, ManagedVerseStateStore.ReadyVerse> supportedProvenance = new HashMap<>();
@@ -65,6 +67,8 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
                         return new BridgeGateway() {
                             @Override public void registerReady(String key, String identity, long generation) throws ClosedDimensionCopyException { bridge.registerReady(key, identity, generation); }
                             @Override public ProviderDuplicationBridge.BridgeAdmission beginDuplicate(String source, String destination, Consumer<ProviderDuplicationBridge.BridgeOutcome> completion) throws ClosedDimensionCopyException { return bridge.beginDuplicate(source, destination, completion); }
+                            @Override public ProviderDuplicationBridge.BridgeAdmission beginDuplicate(String source, String destination, OptionalLong seed, Consumer<ProviderDuplicationBridge.BridgeOutcome> completion) throws ClosedDimensionCopyException { return bridge.beginDuplicate(source, destination, seed, completion); }
+                            @Override public boolean supportsSeededDuplicate() { return bridge.supportsSeededReload(); }
                         };
                     }, CreateGateway.minecraft(server), ManagedVerseStateFileStore.minecraft(server), null);
         } catch (LinkageError | RuntimeException unavailable) {
@@ -157,17 +161,25 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         destination = normalizeOwnedName(destination);
         if (source == null || destination == null) return DuplicateAdmission.ERR_VERSE_NOT_FOUND;
         if (!catalog.contains(source)) return DuplicateAdmission.ERR_VERSE_NOT_FOUND;
-        if (!supportedProvenance.containsKey(source)) return DuplicateAdmission.ERR_PROVIDER_UNAVAILABLE;
-        if (!catalog.contains(destination)) {
-            try { reserveDuplicateDestination(source, destination); }
-            catch (IllegalArgumentException | ClosedDimensionCopyException rejected) { return DuplicateAdmission.ERR_VERSE_NOT_FOUND; }
-        }
+        ManagedVerseStateStore.ReadyVerse sourceProvenance = supportedProvenance.get(source);
+        if (sourceProvenance == null) return DuplicateAdmission.ERR_PROVIDER_UNAVAILABLE;
+        // The bridge port has only legacy load methods. Do not close/copy an
+        // explicitly seeded source until both restoration and destination load
+        // take the retained seed through a reviewed provider path.
+        if (sourceProvenance.requestedSeed().isPresent() && (sourceProvenance.requestedSeed().getAsLong() != sourceProvenance.effectiveSeed() || !bridge.supportsSeededDuplicate())) return DuplicateAdmission.ERR_PER_VERSE_SEED_UNSUPPORTED;
+        // A duplicate owns a fresh descriptor reservation.  Reusing a staged
+        // destination could silently stamp source provenance over custom type,
+        // generator, or properties that we cannot reconstruct on restart.
+        if (catalog.contains(destination)) return DuplicateAdmission.ERR_VERSE_ALREADY_EXISTS;
+        try { reserveDuplicateDestination(source, destination); }
+        catch (IllegalArgumentException | ClosedDimensionCopyException rejected) { return DuplicateAdmission.ERR_VERSE_NOT_FOUND; }
         if (source.equals(destination)) return DuplicateAdmission.ERR_VERSE_ALREADY_EXISTS;
+        ManagedVerseStateStore.ReadyVerse sourceState;
         UUID operationId = UUID.randomUUID();
         try {
             OwnedDimensionDescriptor destinationDescriptor = catalog.require(destination);
             OwnedDimensionDescriptor sourceDescriptor = catalog.require(source);
-            ManagedVerseStateStore.ReadyVerse sourceState = supportedProvenance.get(source);
+            sourceState = supportedProvenance.get(source);
             if (sourceState == null) return DuplicateAdmission.ERR_PROVIDER_UNAVAILABLE;
             ManagedVerseStateStore.ReadyVerse destinationState = copiedProvenance(destination, sourceState);
             supportedProvenance.put(destination, destinationState);
@@ -180,7 +192,8 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         AdmittedCompletion admitted = new AdmittedCompletion(completion, operationId, destination);
         admittedCompletions.add(admitted);
         try {
-            ProviderDuplicationBridge.BridgeAdmission admission = bridge.beginDuplicate(source, destination, outcome -> {
+            OptionalLong duplicateSeed = sourceState.requestedSeed().isPresent() ? OptionalLong.of(sourceState.effectiveSeed()) : OptionalLong.empty();
+            ProviderDuplicationBridge.BridgeAdmission admission = bridge.beginDuplicate(source, destination, duplicateSeed, outcome -> {
                 if (!closed) admitted.terminal(outcome);
             });
             if (admission == ProviderDuplicationBridge.BridgeAdmission.ADMITTED) return DuplicateAdmission.ADMITTED;
@@ -197,8 +210,8 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
     @Override public CreateAdmission beginCreate(String name, CreateType type, java.util.OptionalLong requestedSeed,
                                                  Consumer<CreateOutcome> completion) {
         Objects.requireNonNull(type); Objects.requireNonNull(requestedSeed); Objects.requireNonNull(completion);
-        if (requestedSeed.isPresent()) return CreateAdmission.ERR_PER_VERSE_SEED_UNSUPPORTED;
         if (closed || bridge == null || creates == null) return CreateAdmission.ERR_PROVIDER_UNAVAILABLE;
+        if (requestedSeed.isPresent() && !creates.supportsExplicitSeeds()) return CreateAdmission.ERR_PER_VERSE_SEED_UNSUPPORTED;
         ResourceLocation id = ownedCreateId(name);
         if (id == null) return CreateAdmission.ERR_INVALID_NAME_OR_TYPE;
         String key = id.toString();
@@ -216,7 +229,8 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
             return CreateAdmission.ERR_VERSE_ALREADY_EXISTS;
         }
         UUID operationId = UUID.randomUUID();
-        ManagedVerseStateStore.ReadyVerse durableDescriptor = new ManagedVerseStateStore.ReadyVerse(key, type, sharedSaveSeed(), 0,
+        long expectedSeed = requestedSeed.orElseGet(this::sharedSaveSeed);
+        ManagedVerseStateStore.ReadyVerse durableDescriptor = new ManagedVerseStateStore.ReadyVerse(key, type, requestedSeed, expectedSeed, 0,
                 "OVERWORLD_RECONSTRUCTED", "DEFAULT_DYNAMIC_PROPERTIES");
         try { persist(state.read().withOperation(new ManagedVerseStateStore.OperationIntent(operationId,
                 ManagedVerseStateStore.OperationKind.CREATE, null, key, false, durableDescriptor,
@@ -227,17 +241,33 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         admittedCreates.add(admitted);
         try {
             catalog.register(descriptor); // retains owned exclusion if provider invocation becomes uncertain.
-            ServerLevel returned = creates.create(descriptor);
+            ServerLevel returned = requestedSeed.isPresent()
+                    ? creates.create(descriptor, requestedSeed.getAsLong()) : creates.create(descriptor);
             if (returned == null) {
                 reservation.close(); admitted.complete(CreateOutcome.QUARANTINED); return CreateAdmission.ADMITTED;
             }
-            pendingCreates.put(key, new PendingCreate(descriptor, returned, reservation, admitted, sharedSaveSeed(), operationId));
+            pendingCreates.put(key, new PendingCreate(descriptor, returned, reservation, admitted, expectedSeed, operationId));
             return CreateAdmission.ADMITTED;
-        } catch (RuntimeException failed) {
+        } catch (RuntimeException | LinkageError failed) {
             reservation.close();
             admitted.complete(CreateOutcome.QUARANTINED);
             return CreateAdmission.ADMITTED;
         }
+    }
+
+    /**
+     * Deliberately has no provider, filesystem, gate-reservation, or catalog
+     * mutation path.  A future delete state machine must replace this only
+     * after verified forced-save-and-close evidence is available.
+     */
+    @Override public DeleteAdmission beginDelete(String name) {
+        if (closed) return DeleteAdmission.ERR_VERSE_NOT_MANAGED;
+        return FailClosedDeleteAdmission.validate(name, new FailClosedDeleteAdmission.OwnedVerseLookup() {
+            @Override public boolean isOwned(String key) { return catalog.contains(key); }
+            @Override public boolean isReady(String key) {
+                return gate.readiness(key).state() == VerseOperationGate.Readiness.State.READY;
+            }
+        });
     }
 
     @Override public List<ManagedVerseListing> listManaged() {
@@ -269,7 +299,7 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         catch (ClosedDimensionCopyException ignored) { return null; }
     }
     /** Cooperating server tick; callback feedback is dispatched after access revalidation. */
-    public void tick() { if (!closed) { access.tick(); observeCreates(); while (!terminalFeedback.isEmpty()) terminalFeedback.remove().run(); } }
+    public void tick() { if (!closed) { access.tick(); observeCreates(); observeReplays(); while (!terminalFeedback.isEmpty()) terminalFeedback.remove().run(); } }
     public boolean owns(Object candidate) { return server == candidate; }
     @Override public void close() {
         if (!closed) {
@@ -278,6 +308,8 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
             terminalFeedback.clear();
             for (PendingCreate pending : List.copyOf(pendingCreates.values())) pending.fail();
             pendingCreates.clear();
+            for (PendingReplay pending : List.copyOf(pendingReplays.values())) pending.fail();
+            pendingReplays.clear();
             for (AdmittedCreate completion : List.copyOf(admittedCreates)) completion.forceQuarantine();
             admittedCreates.clear();
             for (AdmittedCompletion completion : List.copyOf(admittedCompletions)) completion.complete(DuplicateOutcome.QUARANTINED);
@@ -298,6 +330,9 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
     private void observeCreates() {
         for (PendingCreate pending : List.copyOf(pendingCreates.values())) pending.observe();
     }
+    private void observeReplays() {
+        for (PendingReplay pending : List.copyOf(pendingReplays.values())) pending.observe();
+    }
     private void recoverManagedState() {
         ManagedVerseStateStore.State recovered = state.read();
         ManagedVerseStateStore.State updated = ManagedVerseRestartReconciler.interruptNonterminal(recovered, intent -> {
@@ -309,20 +344,21 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         for (ManagedVerseStateStore.ReadyVerse ready : updated.ready().values()) replayReady(ready);
     }
     private void replayReady(ManagedVerseStateStore.ReadyVerse ready) {
+        if (!seedProvenanceConsistent(ready)) { registerUnavailable(ready); gate.quarantine(ready.id()); return; }
         OwnedDimensionDescriptor descriptor;
         try { descriptor = descriptorFromPersisted(ready); }
         catch (RuntimeException unsupported) { gate.quarantine(ready.id()); return; }
+        if (ready.requestedSeed().isPresent() && !creates.supportsExplicitSeeds()) {
+            registerUnavailable(descriptor); gate.quarantine(ready.id()); return;
+        }
         if (!creates.hasStoredData(descriptor)) { registerUnavailable(ready); gate.quarantine(ready.id()); return; }
         try {
-            ServerLevel loaded = creates.reload(descriptor);
-            CurrentLevelEvidence current = levels.current(descriptor);
-            if (loaded == null || current == null || !current.matchesObservable(descriptor) || current.level() != loaded
-                    || current.effectiveSeed() != ready.effectiveSeed()) throw new IllegalStateException("READY replay did not observe the retained level");
-            if (!catalog.contains(ready.id())) catalog.register(descriptor);
-            supportedProvenance.put(ready.id(), ready);
-            enrollVerifiedReady(new EnrollmentProvenance(descriptor, loaded, ready.generation(), current.identity()));
-            effectiveSeeds.put(ready.id(), ready.effectiveSeed());
-        } catch (RuntimeException | ClosedDimensionCopyException failed) { registerUnavailable(descriptor); gate.quarantine(ready.id()); }
+            ServerLevel loaded = ready.requestedSeed().isPresent()
+                    ? creates.reload(descriptor, ready.requestedSeed().getAsLong()) : creates.reload(descriptor);
+            if (loaded == null) throw new IllegalStateException("READY replay load returned null");
+            registerUnavailable(descriptor);
+            pendingReplays.put(ready.id(), new PendingReplay(descriptor, ready, loaded));
+        } catch (RuntimeException | LinkageError failed) { registerUnavailable(descriptor); gate.quarantine(ready.id()); }
     }
     private void registerUnavailable(ManagedVerseStateStore.ReadyVerse ready) {
         try { registerUnavailable(descriptorFromPersisted(ready)); } catch (RuntimeException ignored) { }
@@ -332,12 +368,15 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
     }
     private void persist(ManagedVerseStateStore.State next) { state.write(next); }
     private static ManagedVerseStateStore.ReadyVerse withObservedSeed(ManagedVerseStateStore.ReadyVerse value, long seed, long generation) {
-        return new ManagedVerseStateStore.ReadyVerse(value.id(), value.generator(), seed, generation,
+        return new ManagedVerseStateStore.ReadyVerse(value.id(), value.generator(), value.requestedSeed(), seed, generation,
                 value.typeProvenance(), value.propertiesProvenance());
     }
     private static ManagedVerseStateStore.ReadyVerse copiedProvenance(String destination, ManagedVerseStateStore.ReadyVerse source) {
-        return new ManagedVerseStateStore.ReadyVerse(destination, source.generator(), source.effectiveSeed(), 0,
+        return new ManagedVerseStateStore.ReadyVerse(destination, source.generator(), source.requestedSeed(), source.effectiveSeed(), 0,
                 source.typeProvenance(), source.propertiesProvenance());
+    }
+    private static boolean seedProvenanceConsistent(ManagedVerseStateStore.ReadyVerse ready) {
+        return ready.requestedSeed().isEmpty() || ready.requestedSeed().getAsLong() == ready.effectiveSeed();
     }
     private OwnedDimensionDescriptor descriptorFromPersisted(ManagedVerseStateStore.ReadyVerse ready) {
         ResourceLocation id = ResourceLocation.tryParse(ready.id());
@@ -402,6 +441,11 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
     public interface BridgeGateway {
         void registerReady(String key, String identity, long generation) throws ClosedDimensionCopyException;
         ProviderDuplicationBridge.BridgeAdmission beginDuplicate(String source, String destination, Consumer<ProviderDuplicationBridge.BridgeOutcome> completion) throws ClosedDimensionCopyException;
+        default boolean supportsSeededDuplicate() { return false; }
+        default ProviderDuplicationBridge.BridgeAdmission beginDuplicate(String source, String destination, OptionalLong seed, Consumer<ProviderDuplicationBridge.BridgeOutcome> completion) throws ClosedDimensionCopyException {
+            if (seed.isPresent()) throw new ClosedDimensionCopyException("seeded duplicate bridge unavailable");
+            return beginDuplicate(source, destination, completion);
+        }
     }
     private static DuplicateOutcome map(ProviderDuplicationBridge.BridgeOutcome outcome) {
         return switch (outcome) { case LOADED -> DuplicateOutcome.LOADED; case RESTORED -> DuplicateOutcome.RESTORED; case QUARANTINED -> DuplicateOutcome.QUARANTINED; };
@@ -483,7 +527,9 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         }
         private void observe() {
             if (closed) { fail(); return; }
-            CurrentLevelEvidence current = levels.current(descriptor);
+            CurrentLevelEvidence current;
+            try { current = levels.current(descriptor); }
+            catch (RuntimeException lookupFailed) { fail(); return; }
             if (current != null && current.matchesObservable(descriptor) && current.level() == returned
                     && current.effectiveSeed() == expectedSeed) {
                 try {
@@ -506,6 +552,39 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
             completion.complete(CreateOutcome.QUARANTINED);
         }
     }
+    /** A reload return is not readiness: the server map must confirm it on a later owned tick. */
+    private final class PendingReplay {
+        private static final int OBSERVATION_LIMIT = 20;
+        private final OwnedDimensionDescriptor descriptor;
+        private final ManagedVerseStateStore.ReadyVerse ready;
+        private final ServerLevel loaded;
+        private int observations;
+
+        private PendingReplay(OwnedDimensionDescriptor descriptor, ManagedVerseStateStore.ReadyVerse ready, ServerLevel loaded) {
+            this.descriptor = descriptor; this.ready = ready; this.loaded = loaded;
+        }
+        private void observe() {
+            if (closed) { fail(); return; }
+            CurrentLevelEvidence current;
+            try { current = levels.current(descriptor); }
+            catch (RuntimeException lookupFailed) { fail(); return; }
+            if (current != null && current.matchesObservable(descriptor) && current.level() == loaded
+                    && current.effectiveSeed() == ready.effectiveSeed()) {
+                try {
+                    supportedProvenance.put(ready.id(), ready);
+                    enrollVerifiedReady(new EnrollmentProvenance(descriptor, loaded, ready.generation(), current.identity()));
+                    effectiveSeeds.put(ready.id(), ready.effectiveSeed());
+                    pendingReplays.remove(ready.id());
+                    return;
+                } catch (ClosedDimensionCopyException | RuntimeException ignored) { /* retain quarantine below */ }
+            }
+            if (++observations >= OBSERVATION_LIMIT) fail();
+        }
+        private void fail() {
+            pendingReplays.remove(ready.id());
+            gate.quarantine(ready.id());
+        }
+    }
     private long createGeneration;
     private long nextCreateGeneration() { return ++createGeneration; }
 
@@ -514,10 +593,29 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         boolean canCreate(ResourceLocation id);
         boolean storageExists(OwnedDimensionDescriptor descriptor);
         ServerLevel create(OwnedDimensionDescriptor descriptor);
+        /** No supplied seed may be admitted unless this exact provider capability is present. */
+        default boolean supportsExplicitSeeds() { return false; }
+        /** Explicit seed bridge is invoked only after {@link #supportsExplicitSeeds()} succeeds. */
+        default ServerLevel create(OwnedDimensionDescriptor descriptor, long requestedSeed) { return null; }
         default boolean hasStoredData(OwnedDimensionDescriptor descriptor) { return false; }
         default ServerLevel reload(OwnedDimensionDescriptor descriptor) { return null; }
+        /** Replays a retained explicit seed through the provider's construction-safe overload. */
+        default ServerLevel reload(OwnedDimensionDescriptor descriptor, long requestedSeed) { return null; }
+        interface ExplicitSeedOperations {
+            ServerLevel create(ResourceLocation id, ChunkGenerator generator, DimensionType type,
+                               DynamicDimensionProperties properties, long seed);
+            ServerLevel reload(ResourceLocation id, ChunkGenerator generator, DimensionType type,
+                               DynamicDimensionProperties properties, long seed);
+        }
+        @FunctionalInterface interface ExplicitSeedBridge {
+            Optional<ExplicitSeedOperations> discover(DynamicDimensionRegistry registry);
+        }
         static CreateGateway minecraft(MinecraftServer server) {
-            DynamicDimensionRegistry registry = DynamicDimensionRegistry.from(server);
+            return minecraft(server, DynamicDimensionRegistry.from(server));
+        }
+        /** Package-visible production factory seam: tests supply a real legacy registry without a fake server. */
+        static CreateGateway minecraft(MinecraftServer server, DynamicDimensionRegistry registry) {
+            Optional<ExplicitSeedOperations> explicit = discoverProductionExplicit(registry);
             return new CreateGateway() {
                 @Override public boolean canCreate(ResourceLocation id) { return registry.canCreateDimension(id) && !registry.anyDimensionExists(id); }
                 @Override public boolean storageExists(OwnedDimensionDescriptor descriptor) {
@@ -527,6 +625,10 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
                 @Override public ServerLevel create(OwnedDimensionDescriptor descriptor) {
                     return registry.createDynamicDimension(descriptor.key().location(), descriptor.generator(), descriptor.type(), descriptor.properties());
                 }
+                @Override public ServerLevel create(OwnedDimensionDescriptor descriptor, long requestedSeed) {
+                    ExplicitSeedOperations operations = explicit.orElseThrow(() -> new UnsupportedOperationException("Explicit seed capability is unavailable"));
+                    return operations.create(descriptor.key().location(), descriptor.generator(), descriptor.type(), descriptor.properties(), requestedSeed);
+                }
                 @Override public boolean hasStoredData(OwnedDimensionDescriptor descriptor) {
                     java.nio.file.Path root = server.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT).toAbsolutePath().normalize();
                     return OwnedCreateStorageConfinement.isExistingConfined(root, descriptor.key());
@@ -534,7 +636,20 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
                 @Override public ServerLevel reload(OwnedDimensionDescriptor descriptor) {
                     return registry.loadDynamicDimension(descriptor.key().location(), descriptor.generator(), descriptor.type(), descriptor.properties());
                 }
+                @Override public ServerLevel reload(OwnedDimensionDescriptor descriptor, long requestedSeed) {
+                    ExplicitSeedOperations operations = explicit.orElseThrow(() -> new UnsupportedOperationException("Explicit seed capability is unavailable"));
+                    return operations.reload(descriptor.key().location(), descriptor.generator(), descriptor.type(), descriptor.properties(), requestedSeed);
+                }
+                @Override public boolean supportsExplicitSeeds() { return explicit.isPresent(); }
             };
+        }
+        static Optional<ExplicitSeedOperations> discoverProductionExplicit(DynamicDimensionRegistry registry) {
+            return discoverExplicit(registry, ExplicitSeedProviderBridge::discover);
+        }
+        /** The sole linkage boundary for an optional provider marker. */
+        static Optional<ExplicitSeedOperations> discoverExplicit(DynamicDimensionRegistry registry, ExplicitSeedBridge bridge) {
+            try { return bridge.discover(registry); }
+            catch (LinkageError unavailable) { return Optional.empty(); }
         }
     }
 }

@@ -16,6 +16,11 @@ final class ManagedVerseRestartReconciler {
                 excludeDestination.accept(intent);
                 after = after.withOperation(intent.interrupted());
             }
+            else if (intent.phase() == ManagedVerseStateStore.OperationPhase.FAILED) {
+                // A later fresh service must retain the conservative exclusion
+                // established by the first restart, rather than forgetting it.
+                excludeDestination.accept(intent);
+            }
         }
         return after;
     }
