@@ -69,6 +69,42 @@ index 68a752c..1938ff0 100644
 +     */
 +    boolean beginQuiesceAndClose(@NotNull ResourceLocation id, @Nullable PlayerRemover remover, @NotNull QuiesceAndCloseCompletion completion);
  }
+diff --git a/common/src/main/java/dev/galacticraft/dynamicdimensions/api/ExplicitSeedDimensionRegistry.java b/common/src/main/java/dev/galacticraft/dynamicdimensions/api/ExplicitSeedDimensionRegistry.java
+new file mode 100644
+index 0000000..273af44
+--- /dev/null
++++ b/common/src/main/java/dev/galacticraft/dynamicdimensions/api/ExplicitSeedDimensionRegistry.java
+@@ -0,0 +1,30 @@
++/*
++ * Copyright (c) 2026 Team Galacticraft
++ */
++package dev.galacticraft.dynamicdimensions.api;
++
++import net.minecraft.resources.ResourceLocation;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.chunk.ChunkGenerator;
++import net.minecraft.world.level.dimension.DimensionType;
++import org.jetbrains.annotations.NotNull;
++import org.jetbrains.annotations.Nullable;
++
++/**
++ * Opt-in capability for registries that install an explicit seed before any
++ * generator or {@link ServerLevel} seed-dependent construction work begins.
++ *
++ * <p>The legacy {@link DynamicDimensionRegistry} overloads intentionally do
++ * not imply this capability: they retain the server save seed. Consumers must
++ * test this marker before calling either operation and must not substitute a
++ * legacy overload when it is absent.</p>
++ */
++public interface ExplicitSeedDimensionRegistry {
++    @Nullable ServerLevel createExplicitSeedDimension(@NotNull ResourceLocation id, @NotNull ChunkGenerator generator,
++                                                      @NotNull DimensionType type, @NotNull DynamicDimensionProperties properties,
++                                                      long seed);
++
++    @Nullable ServerLevel loadExplicitSeedDimension(@NotNull ResourceLocation id, @NotNull ChunkGenerator generator,
++                                                    @NotNull DimensionType type, @NotNull DynamicDimensionProperties properties,
++                                                    long seed);
++}
 diff --git a/common/src/main/java/dev/galacticraft/dynamicdimensions/api/lifecycle/QuiesceAndCloseCompletion.java b/common/src/main/java/dev/galacticraft/dynamicdimensions/api/lifecycle/QuiesceAndCloseCompletion.java
 new file mode 100644
 index 0000000..81face7
@@ -238,8 +274,54 @@ index 0000000..7a56c5a
 +    FAILED_SAVE,
 +    FAILED_CLOSE
 +}
+diff --git a/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/DimensionSeedOwnership.java b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/DimensionSeedOwnership.java
+new file mode 100644
+index 0000000..acf1978
+--- /dev/null
++++ b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/DimensionSeedOwnership.java
+@@ -0,0 +1,40 @@
++package dev.galacticraft.dynamicdimensions.impl;
++
++import java.util.OptionalLong;
++import net.minecraft.resources.ResourceKey;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.Level;
++
++/** Version-pinned adapter around the production identity/generation state machine. */
++public final class DimensionSeedOwnership {
++    private static final SeedOwnershipState<MinecraftServer, ResourceKey<Level>, ServerLevel> STATE = new SeedOwnershipState<>();
++    private DimensionSeedOwnership() { }
++    public static synchronized Lease claim(MinecraftServer server, ResourceKey<Level> key, long seed) {
++        SeedOwnershipTable.Lease<MinecraftServer, ResourceKey<Level>> lease = STATE.claim(server, key, seed);
++        return lease == null ? null : new Lease(lease);
++    }
++    public static Construction enterConstruction(Lease lease) { return new Construction(STATE.enter(lease.delegate)); }
++    /** Pinned post-super ServerLevel.<init> hook binds only the exact receiver for this construction scope. */
++    public static synchronized boolean attachConstructingReceiver(ServerLevel level, MinecraftServer server, ResourceKey<Level> key) {
++        return STATE.attachConstructingReceiver(level, server, key);
++    }
++    public static synchronized OptionalLong seedFor(ServerLevel level) { return STATE.seedFor(level); }
++    /** RegistryImpl's separate biome argument is allowed only before the exact receiver attaches. */
++    public static synchronized OptionalLong seedForConstruction(MinecraftServer server, ResourceKey<Level> key) { return STATE.seedForConstruction(server, key); }
++    public static synchronized boolean retire(ServerLevel level, Lease expected) { return STATE.retire(level, expected.delegate); }
++    /** Exact-lease abort clears any bound receiver for that lease but cannot affect a replacement. */
++    public static synchronized boolean abort(Lease expected) { return STATE.abort(expected.delegate); }
++    public static synchronized void disposeServer(MinecraftServer server) { STATE.dispose(server); }
++    public static final class Construction implements AutoCloseable {
++        private final SeedOwnershipState.Construction<MinecraftServer, ResourceKey<Level>, ServerLevel> token;
++        private Construction(SeedOwnershipState.Construction<MinecraftServer, ResourceKey<Level>, ServerLevel> token) { this.token = token; }
++        @Override public void close() { STATE.close(token); }
++    }
++    public static final class Lease {
++        private final SeedOwnershipTable.Lease<MinecraftServer, ResourceKey<Level>> delegate;
++        private Lease(SeedOwnershipTable.Lease<MinecraftServer, ResourceKey<Level>> delegate) { this.delegate = delegate; }
++        public long seed() { return delegate.seed(); }
++        public long generation() { return delegate.generation(); }
++    }
++}
 diff --git a/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/DynamicDimensionRegistryImpl.java b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/DynamicDimensionRegistryImpl.java
-index 2176aaa..a2b1305 100644
+index 2176aaa..e986f23 100644
 --- a/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/DynamicDimensionRegistryImpl.java
 +++ b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/DynamicDimensionRegistryImpl.java
 @@ -25,7 +25,9 @@ package dev.galacticraft.dynamicdimensions.impl;
@@ -325,7 +407,27 @@ index 2176aaa..a2b1305 100644
      @Override
      public void setDimensionProperties(@NotNull ResourceKey<Level> key, @NotNull DynamicDimensionProperties properties) {
          this.dimensionProperties.put(key, properties);
-@@ -204,7 +250,19 @@ public class DynamicDimensionRegistryImpl implements DynamicDimensionRegistry {
+@@ -184,6 +230,11 @@ public class DynamicDimensionRegistryImpl implements DynamicDimensionRegistry {
+         if (remover == null) remover = PlayerRemover.DEFAULT;
+         ResourceKey<Level> key = ResourceKey.create(Registries.DIMENSION, id);
+         if (!this.canDeleteDimension(key)) return false;
++        // Admission boundary before any mutation: a pending/quarantined
++        // quiesce-and-close must refuse truthfully without touching physics or
++        // property state. dynamicdimensions$removeLevel keeps its own equivalent
++        // guard as defense in depth, not as the only check.
++        if (!((DynamicDimensionProvider) this.server).dynamicdimensions$canRemoveLevel(key)) return false;
+ 
+         DynamicDimensionPhysicsCompat.remove(key);
+         ((DynamicDimensionProvider) this.server).dynamicdimensions$removeLevel(key, remover, true);
+@@ -197,6 +248,7 @@ public class DynamicDimensionRegistryImpl implements DynamicDimensionRegistry {
+         if (remover == null) remover = PlayerRemover.DEFAULT;
+         ResourceKey<Level> key = ResourceKey.create(Registries.DIMENSION, id);
+         if (!this.canDeleteDimension(key)) return false;
++        if (!((DynamicDimensionProvider) this.server).dynamicdimensions$canRemoveLevel(key)) return false;
+ 
+         DynamicDimensionPhysicsCompat.remove(key);
+         ((DynamicDimensionProvider) this.server).dynamicdimensions$removeLevel(key, remover, false);
+@@ -204,7 +256,19 @@ public class DynamicDimensionRegistryImpl implements DynamicDimensionRegistry {
          return true;
      }
  
@@ -345,7 +447,7 @@ index 2176aaa..a2b1305 100644
          ResourceKey<Level> key = ResourceKey.create(Registries.DIMENSION, id);
          if (!this.canCreateDimension(id)) return null;
          Constants.LOGGER.debug("Attempting to create dynamic dimension '{}'", id);
-@@ -213,8 +271,28 @@ public class DynamicDimensionRegistryImpl implements DynamicDimensionRegistry {
+@@ -213,8 +277,28 @@ public class DynamicDimensionRegistryImpl implements DynamicDimensionRegistry {
              return null;
          }
  
@@ -376,7 +478,7 @@ index 2176aaa..a2b1305 100644
      }
  
      private @NotNull ServerLevel createDynamicLevel(@NotNull ResourceLocation id, @NotNull ChunkGenerator generator, @NotNull DimensionType type, ResourceKey<Level> key) {
-@@ -243,7 +321,7 @@ public class DynamicDimensionRegistryImpl implements DynamicDimensionRegistry {
+@@ -243,7 +327,7 @@ public class DynamicDimensionRegistryImpl implements DynamicDimensionRegistry {
                  stem,
                  ((MinecraftServerAccessor) this.server).getProgressListenerFactory().create(10),
                  worldData.isDebugWorld(),
@@ -385,7 +487,7 @@ index 2176aaa..a2b1305 100644
                  ImmutableList.of(),
                  false,
                  null
-@@ -298,6 +376,19 @@ public class DynamicDimensionRegistryImpl implements DynamicDimensionRegistry {
+@@ -298,6 +382,19 @@ public class DynamicDimensionRegistryImpl implements DynamicDimensionRegistry {
          this.dynamicDimensions.remove(key);
      }
  
@@ -405,8 +507,146 @@ index 2176aaa..a2b1305 100644
      public void add(ResourceKey<Level> key) {
          this.dynamicDimensions.add(key);
      }
+diff --git a/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipState.java b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipState.java
+new file mode 100644
+index 0000000..4781e81
+--- /dev/null
++++ b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipState.java
+@@ -0,0 +1,76 @@
++package dev.galacticraft.dynamicdimensions.impl;
++
++import java.util.IdentityHashMap;
++import java.util.Map;
++import java.util.OptionalLong;
++
++/**
++ * Production seed-ownership state machine. Construction uses one explicit
++ * receiver token; all later reads and retirement use only that bound identity.
++ */
++final class SeedOwnershipState<S, K, L> {
++    private final SeedOwnershipTable<S, K> leases = new SeedOwnershipTable<>();
++    private final Map<L, SeedOwnershipTable.Lease<S, K>> bound = new IdentityHashMap<>();
++    private final ThreadLocal<Construction<S, K, L>> constructing = new ThreadLocal<>();
++
++    SeedOwnershipTable.Lease<S, K> claim(S owner, K key, long seed) { return leases.claim(owner, key, seed); }
++    Construction<S, K, L> enter(SeedOwnershipTable.Lease<S, K> lease) {
++        if (constructing.get() != null) throw new IllegalStateException("Nested explicit-seed construction");
++        Construction<S, K, L> token = new Construction<>(lease);
++        constructing.set(token);
++        return token;
++    }
++    boolean attachConstructingReceiver(L receiver, S owner, K key) {
++        Construction<S, K, L> token = constructing.get();
++        if (token == null || token.receiver != null || token.lease.owner() != owner || !token.lease.key().equals(key)
++                || !leases.matches(token.lease)) return false;
++        token.receiver = receiver;
++        bound.put(receiver, token.lease);
++        return true;
++    }
++    OptionalLong seedFor(L receiver) {
++        SeedOwnershipTable.Lease<S, K> lease = bound.get(receiver);
++        if (lease != null) return OptionalLong.of(lease.seed());
++        Construction<S, K, L> token = constructing.get();
++        return token != null && token.active && token.receiver == receiver && leases.matches(token.lease)
++                ? OptionalLong.of(token.lease.seed()) : OptionalLong.empty();
++    }
++    OptionalLong seedForConstruction(S owner, K key) {
++        Construction<S, K, L> token = constructing.get();
++        return token != null && token.active && token.receiver == null && leases.matches(token.lease)
++                && token.lease.owner() == owner && token.lease.key().equals(key)
++                ? OptionalLong.of(token.lease.seed()) : OptionalLong.empty();
++    }
++    boolean retire(L receiver, SeedOwnershipTable.Lease<S, K> expected) {
++        if (bound.get(receiver) != expected) return false;
++        bound.remove(receiver);
++        invalidate(expected);
++        return leases.release(expected);
++    }
++    boolean abort(SeedOwnershipTable.Lease<S, K> expected) {
++        bound.entrySet().removeIf(entry -> entry.getValue() == expected);
++        invalidate(expected);
++        return leases.release(expected);
++    }
++    void dispose(S owner) {
++        bound.entrySet().removeIf(entry -> entry.getValue().owner() == owner);
++        Construction<S, K, L> token = constructing.get();
++        if (token != null && token.lease.owner() == owner) { token.active = false; token.receiver = null; }
++        leases.dispose(owner);
++    }
++    private void invalidate(SeedOwnershipTable.Lease<S, K> lease) {
++        Construction<S, K, L> token = constructing.get();
++        if (token != null && token.lease == lease) { token.active = false; token.receiver = null; }
++    }
++    static final class Construction<S, K, L> implements AutoCloseable {
++        private final SeedOwnershipTable.Lease<S, K> lease;
++        private L receiver;
++        private boolean active = true;
++        private Construction(SeedOwnershipTable.Lease<S, K> lease) { this.lease = lease; }
++        @Override public void close() { }
++    }
++    void close(Construction<S, K, L> token) {
++        if (constructing.get() != token) throw new IllegalStateException("Construction scope changed");
++        constructing.remove();
++    }
++}
+diff --git a/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipTable.java b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipTable.java
+new file mode 100644
+index 0000000..7f06464
+--- /dev/null
++++ b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipTable.java
+@@ -0,0 +1,50 @@
++package dev.galacticraft.dynamicdimensions.impl;
++
++import java.util.HashMap;
++import java.util.IdentityHashMap;
++import java.util.Map;
++import java.util.OptionalLong;
++
++/**
++ * Identity-scoped, generation-checked ownership table used by the explicit
++ * dimension-seed bridge. It intentionally has no Minecraft lifecycle calls so
++ * its replacement and stale-cleanup rules can be verified locally.
++ */
++final class SeedOwnershipTable<S, K> {
++    private final Map<S, Map<K, Entry>> owners = new IdentityHashMap<>();
++    private long nextGeneration;
++
++    Lease<S, K> claim(S owner, K key, long seed) {
++        Map<K, Entry> entries = this.owners.computeIfAbsent(owner, ignored -> new HashMap<>());
++        if (entries.containsKey(key)) return null;
++        Entry entry = new Entry(seed, ++this.nextGeneration);
++        entries.put(key, entry);
++        return new Lease<>(owner, key, entry.seed, entry.generation);
++    }
++
++    OptionalLong seed(S owner, K key) {
++        Map<K, Entry> entries = this.owners.get(owner);
++        Entry entry = entries == null ? null : entries.get(key);
++        return entry == null ? OptionalLong.empty() : OptionalLong.of(entry.seed);
++    }
++
++    boolean release(Lease<S, K> lease) {
++        Map<K, Entry> entries = this.owners.get(lease.owner());
++        Entry current = entries == null ? null : entries.get(lease.key());
++        if (current == null || current.generation != lease.generation()) return false;
++        entries.remove(lease.key());
++        if (entries.isEmpty()) this.owners.remove(lease.owner());
++        return true;
++    }
++
++    boolean matches(Lease<S, K> lease) {
++        Map<K, Entry> entries = this.owners.get(lease.owner());
++        Entry current = entries == null ? null : entries.get(lease.key());
++        return current != null && current.generation == lease.generation();
++    }
++
++    void dispose(S owner) { this.owners.remove(owner); }
++
++    record Lease<S, K>(S owner, K key, long seed, long generation) { }
++    private record Entry(long seed, long generation) { }
++}
 diff --git a/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/accessor/DynamicDimensionProvider.java b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/accessor/DynamicDimensionProvider.java
-index a81983d..2897316 100644
+index a81983d..cf045a6 100644
 --- a/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/accessor/DynamicDimensionProvider.java
 +++ b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/accessor/DynamicDimensionProvider.java
 @@ -24,6 +24,7 @@ package dev.galacticraft.dynamicdimensions.impl.accessor;
@@ -417,10 +657,18 @@ index a81983d..2897316 100644
  import net.minecraft.resources.ResourceKey;
  import net.minecraft.server.level.ServerLevel;
  import net.minecraft.world.level.Level;
-@@ -33,6 +34,12 @@ import org.jetbrains.annotations.Nullable;
+@@ -33,6 +34,20 @@ import org.jetbrains.annotations.Nullable;
  public interface DynamicDimensionProvider {
      void dynamicdimensions$removeLevel(ResourceKey<Level> key, @Nullable PlayerRemover removalMode, boolean removeFiles);
  
++    /**
++     * Side-effect-free admission check for the legacy delete/unload entry points.
++     * Callers must check this before mutating any physics/property state and
++     * refuse truthfully when it returns false; {@link #dynamicdimensions$removeLevel}
++     * keeps its own equivalent guard as defense in depth, not as the sole check.
++     */
++    boolean dynamicdimensions$canRemoveLevel(@NotNull ResourceKey<Level> key);
++
 +    /**
 +     * Admits a non-blocking, tick-queued close operation. The supplied completion
 +     * receives exactly one terminal result for a successful admission.
@@ -431,12 +679,14 @@ index a81983d..2897316 100644
  
      boolean dynamicdimensions$isIdPendingCreation(@NotNull ResourceKey<Level> key);
 diff --git a/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/gametest/DynamicDimensionsGametest.java b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/gametest/DynamicDimensionsGametest.java
-index fa65c70..62f38d2 100644
+index fa65c70..7b8fee5 100644
 --- a/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/gametest/DynamicDimensionsGametest.java
 +++ b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/gametest/DynamicDimensionsGametest.java
-@@ -23,9 +23,12 @@
+@@ -22,10 +22,14 @@
+ 
  package dev.galacticraft.dynamicdimensions.impl.gametest;
  
++import dev.galacticraft.dynamicdimensions.api.DynamicDimensionProperties;
  import dev.galacticraft.dynamicdimensions.api.DynamicDimensionRegistry;
 +import dev.galacticraft.dynamicdimensions.api.lifecycle.QuiesceAndCloseResult;
 +import dev.galacticraft.dynamicdimensions.api.lifecycle.QuiesceAndCloseStatus;
@@ -447,7 +697,7 @@ index fa65c70..62f38d2 100644
  import net.minecraft.core.registries.Registries;
  import net.minecraft.gametest.framework.GameTest;
  import net.minecraft.gametest.framework.GameTestAssertException;
-@@ -42,6 +45,9 @@ import net.minecraft.world.level.block.Blocks;
+@@ -42,9 +46,13 @@ import net.minecraft.world.level.block.Blocks;
  import net.minecraft.world.level.border.WorldBorder;
  import net.minecraft.world.level.dimension.BuiltinDimensionTypes;
  import net.minecraft.world.level.dimension.DimensionType;
@@ -457,7 +707,11 @@ index fa65c70..62f38d2 100644
  import net.minecraft.world.level.portal.DimensionTransition;
  import net.minecraft.world.phys.Vec3;
  import org.apache.commons.io.FileUtils;
-@@ -52,7 +58,13 @@ import org.jetbrains.annotations.NotNull;
++import org.joml.Vector3f;
+ import org.jetbrains.annotations.ApiStatus;
+ import org.jetbrains.annotations.Contract;
+ import org.jetbrains.annotations.NotNull;
+@@ -52,7 +60,13 @@ import org.jetbrains.annotations.NotNull;
  import java.io.File;
  import java.io.IOException;
  import java.nio.file.Path;
@@ -471,10 +725,11 @@ index fa65c70..62f38d2 100644
  
  import static dev.galacticraft.dynamicdimensions.impl.gametest.Assertions.*;
  
-@@ -68,6 +80,12 @@ public class DynamicDimensionsGametest {
+@@ -68,6 +82,13 @@ public class DynamicDimensionsGametest {
      private static final ResourceLocation TEST_LEVEL_3 = ResourceLocation.fromNamespaceAndPath(Constants.MOD_ID, "level_3");
      private static final ResourceLocation TEST_LEVEL_4 = ResourceLocation.fromNamespaceAndPath(Constants.MOD_ID, "level_4");
      private static final ResourceLocation TEST_LEVEL_5 = ResourceLocation.fromNamespaceAndPath(Constants.MOD_ID, "level_5");
++    private static final ResourceLocation TEST_LEVEL_6 = ResourceLocation.fromNamespaceAndPath(Constants.MOD_ID, "level_6");
 +    /** Dedicated to the isolated explicit-seed NORMAL fixture; it deliberately never deletes these paths. */
 +    private static final ResourceLocation TEST_SEED_NORMAL_A = ResourceLocation.fromNamespaceAndPath(Constants.MOD_ID, "seed_normal_a");
 +    private static final ResourceLocation TEST_SEED_NORMAL_B = ResourceLocation.fromNamespaceAndPath(Constants.MOD_ID, "seed_normal_b");
@@ -484,7 +739,67 @@ index fa65c70..62f38d2 100644
  
      /**
       * Checks if dimensions can be created.
-@@ -319,6 +337,144 @@ public class DynamicDimensionsGametest {
+@@ -211,6 +232,59 @@ public class DynamicDimensionsGametest {
+         });
+     }
+ 
++    /**
++     * Reviewed admission-order regression (PR2 review of 08457ba): a pending
++     * quiesce-and-close must refuse the legacy delete/unload entry points
++     * before either mutates physics/property state, and must still deliver
++     * exactly one terminal receipt for the admitted close itself.
++     * @param context GameTest context
++     */
++    @GameTest(template = EMPTY_STRUCTURE, timeoutTicks = 10)
++    public void pendingQuiesceAndCloseRefusesLegacyDeleteAndUnloadBeforeMutation(@NotNull GameTestHelper context) {
++        final MinecraftServer server = context.getLevel().getServer();
++        final ServerLevel overworld = server.overworld();
++        final DynamicDimensionRegistry dynRegistry = DynamicDimensionRegistry.from(server);
++        final ResourceKey<Level> key = ResourceKey.create(Registries.DIMENSION, TEST_LEVEL_6);
++        final DynamicDimensionProperties nonDefault = new DynamicDimensionProperties() {
++            @Override public int priority() { return 7; }
++            @Override public Vector3f baseGravity() { return new Vector3f(1, 2, 3); }
++            @Override public double basePressure() { return 4; }
++            @Override public float universalDrag() { return 5; }
++            @Override public Vector3f magneticNorth() { return new Vector3f(6, 7, 8); }
++        };
++
++        assertNotNull(overworld);
++        assertFalse(dynRegistry.anyDimensionExists(TEST_LEVEL_6));
++        assertNotNull(dynRegistry.createDynamicDimension(TEST_LEVEL_6, overworld.getChunkSource().getGenerator(), createDimensionType(), nonDefault));
++
++        context.runAfterDelay(1, () -> {
++            assertNotNull(server.getLevel(key));
++            assertSame(nonDefault, dynRegistry.getDimensionProperties(key));
++
++            final AtomicReference<QuiesceAndCloseResult> terminal = new AtomicReference<>();
++            final AtomicInteger completions = new AtomicInteger();
++            assertTrue(dynRegistry.beginQuiesceAndClose(TEST_LEVEL_6,
++                    (server1, player) -> player.changeDimension(createTransition(overworld, player)),
++                    result -> { completions.incrementAndGet(); terminal.set(result); }));
++
++            // Before the queue drains: legacy delete/unload must refuse
++            // truthfully and leave physics/property state untouched, not
++            // mutate first and only then discover the conflict.
++            assertFalse(dynRegistry.deleteDynamicDimension(TEST_LEVEL_6, null));
++            assertFalse(dynRegistry.unloadDynamicDimension(TEST_LEVEL_6, null));
++            assertNotNull(server.getLevel(key));
++            assertSame(nonDefault, dynRegistry.getDimensionProperties(key));
++            assertEquals(0, completions.get());
++
++            awaitTerminal(context, terminal, 8, result -> {
++                assertEquals(QuiesceAndCloseStatus.SAVED_AND_CLOSED, result.status());
++                assertEquals(1, completions.get());
++                assertNull(server.getLevel(key));
++                context.succeed();
++            });
++        });
++    }
++
+     /**
+      * Checks that unloaded dimensions are saved and can be reloaded.
+      * @param context GameTest context
+@@ -319,6 +393,144 @@ public class DynamicDimensionsGametest {
          });
      }
  
@@ -629,6 +944,50 @@ index fa65c70..62f38d2 100644
      /**
       * Constructs an arbitrary dimension type for testing.
       * @return a new, unregistered dimension type
+diff --git a/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/gametest/ExplicitSeedNormalGametest.java b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/gametest/ExplicitSeedNormalGametest.java
+new file mode 100644
+index 0000000..200d089
+--- /dev/null
++++ b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/gametest/ExplicitSeedNormalGametest.java
+@@ -0,0 +1,38 @@
++/*
++ * Copyright (c) 2021-2026 Team Galacticraft
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ */
++
++package dev.galacticraft.dynamicdimensions.impl.gametest;
++
++import net.minecraft.gametest.framework.GameTest;
++import net.minecraft.gametest.framework.GameTestHelper;
++import org.jetbrains.annotations.ApiStatus;
++import org.jetbrains.annotations.NotNull;
++
++/**
++ * The isolated independent-seed fixture registration. The existing legacy
++ * DynamicDimensionsGametest class contains delete-oriented tests and is not
++ * registered in this focused provider run.
++ */
++@ApiStatus.Internal
++public final class ExplicitSeedNormalGametest {
++    /**
++     * The provider-owned inert NBT entry is deliberately addressed through the
++     * minecraft namespace because NeoForge's GameTest patch resolves that
++     * namespace for this provider's common-source tests.
++     */
++    @GameTest(template = "dynamicdimensionsgametest.empty", timeoutTicks = 100)
++    public void explicitSeedNormalABAReloadPreservesGeneratedEvidence(@NotNull GameTestHelper context) {
++        DynamicDimensionsGametest.explicitSeedNormalABAReloadPreservesGeneratedEvidence(context);
++    }
++}
 diff --git a/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/internal/QuiesceAndCloseCleanupStep.java b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/internal/QuiesceAndCloseCleanupStep.java
 new file mode 100644
 index 0000000..4f5b22b
@@ -992,7 +1351,7 @@ index 0000000..59bf3ba
 +    }
 +}
 diff --git a/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/mixin/MinecraftServerMixin.java b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/mixin/MinecraftServerMixin.java
-index 7c17c77..da57563 100644
+index 7c17c77..dad988a 100644
 --- a/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/mixin/MinecraftServerMixin.java
 +++ b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/mixin/MinecraftServerMixin.java
 @@ -27,10 +27,23 @@ import dev.galacticraft.dynamicdimensions.api.DynamicDimensionRegistry;
@@ -1048,18 +1407,33 @@ index 7c17c77..da57563 100644
      private DynamicDimensionRegistryImpl dynamicDimensions;
      @Unique
      private boolean tickingLevels = false;
-@@ -109,6 +135,10 @@ public abstract class MinecraftServerMixin implements DynamicDimensionProvider {
+@@ -107,8 +133,25 @@ public abstract class MinecraftServerMixin implements DynamicDimensionProvider {
+         this.dynamicDimensions.loadDynamicDimensions();
+     }
  
++    @Unique
++    private boolean hasConflictingQuiesceAndClose(ResourceKey<Level> key) {
++        return this.pendingQuiesceAndCloses.isLocked(key) || this.quarantinedQuiesceAndCloseKeys.contains(key);
++    }
++
++    @Override
++    public boolean dynamicdimensions$canRemoveLevel(@NotNull ResourceKey<Level> key) {
++        return !this.hasConflictingQuiesceAndClose(key);
++    }
++
      @Override
      public void dynamicdimensions$removeLevel(ResourceKey<Level> key, @Nullable PlayerRemover removalMode, boolean removeFiles) {
-+        if (this.pendingQuiesceAndCloses.isLocked(key) || this.quarantinedQuiesceAndCloseKeys.contains(key)) {
++        if (this.hasConflictingQuiesceAndClose(key)) {
++            // Defense in depth only: truthful callers must check
++            // dynamicdimensions$canRemoveLevel before mutating any state, so a
++            // conflicting call reaching here has already violated that contract.
 +            Constants.LOGGER.warn("Rejected conflicting removal while quiesce-and-close is pending: {}", key);
 +            return;
 +        }
          if (this.tickingLevels) {
              this.pendingDeletions.add(new DimensionRemovalTicket(key, removalMode, removeFiles));
          } else {
-@@ -117,6 +147,14 @@ public abstract class MinecraftServerMixin implements DynamicDimensionProvider {
+@@ -117,6 +160,14 @@ public abstract class MinecraftServerMixin implements DynamicDimensionProvider {
          }
      }
  
@@ -1074,7 +1448,7 @@ index 7c17c77..da57563 100644
      @Override
      public void dynamicdimensions$deleteLevelData(ResourceKey<Level> key) {
          Path dimensionPath = this.storageSource.getDimensionPath(key);
-@@ -169,17 +207,81 @@ public abstract class MinecraftServerMixin implements DynamicDimensionProvider {
+@@ -169,17 +220,81 @@ public abstract class MinecraftServerMixin implements DynamicDimensionProvider {
              }
              this.pendingDeletions.clear();
          }
@@ -1156,7 +1530,7 @@ index 7c17c77..da57563 100644
              DimensionRemovedCallback.invoke(key, level);
  
              List<ServerPlayer> players = new ArrayList<>(level.players()); // prevent co-modification
-@@ -199,12 +301,18 @@ public abstract class MinecraftServerMixin implements DynamicDimensionProvider {
+@@ -199,12 +314,18 @@ public abstract class MinecraftServerMixin implements DynamicDimensionProvider {
          RegistryUtil.unregister(this.registries().compositeAccess().registryOrThrow(Registries.LEVEL_STEM), key.location());
          RegistryUtil.unregister(this.registries().compositeAccess().registryOrThrow(Registries.DIMENSION_TYPE), dimType);
          this.dynamicDimensions.remove(key);
@@ -1175,6 +1549,67 @@ index 7c17c77..da57563 100644
      @Unique
      private void registerLevel(ServerLevel level) {
          DimensionAddedCallback.invoke(level.dimension(), level);
+diff --git a/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/mixin/ServerLevelMixin.java b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/mixin/ServerLevelMixin.java
+new file mode 100644
+index 0000000..d34aa44
+--- /dev/null
++++ b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/mixin/ServerLevelMixin.java
+@@ -0,0 +1,55 @@
++package dev.galacticraft.dynamicdimensions.impl.mixin;
++
++import dev.galacticraft.dynamicdimensions.impl.DimensionSeedOwnership;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.server.level.progress.ChunkProgressListener;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.resources.ResourceKey;
++import net.minecraft.world.RandomSequences;
++import net.minecraft.world.level.CustomSpawner;
++import net.minecraft.world.level.Level;
++import net.minecraft.world.level.dimension.LevelStem;
++import net.minecraft.world.level.storage.LevelStorageSource;
++import net.minecraft.world.level.storage.ServerLevelData;
++import net.minecraft.world.level.levelgen.WorldOptions;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.Redirect;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++import java.util.List;
++import java.util.concurrent.Executor;
++
++/**
++ * Pinned against NeoForge 21.1.148 ServerLevel.<init>: WorldOptions.seed() is
++ * consumed directly by StructureCheck/RandomSequences before normal gameplay
++ * starts. The registry installs DimensionSeedOwnership before `new ServerLevel`.
++ */
++@Mixin(ServerLevel.class)
++abstract class ServerLevelMixin {
++    /**
++     * Exact pinned 1.21.1 constructor descriptor, attached after Level.<init>
++     * and before later seed-dependent ServerLevel work. The scope admits one receiver only.
++     */
++    @Inject(method = "<init>(Lnet/minecraft/server/MinecraftServer;Ljava/util/concurrent/Executor;Lnet/minecraft/world/level/storage/LevelStorageSource$LevelStorageAccess;Lnet/minecraft/world/level/storage/ServerLevelData;Lnet/minecraft/resources/ResourceKey;Lnet/minecraft/world/level/dimension/LevelStem;Lnet/minecraft/server/level/progress/ChunkProgressListener;ZJLjava/util/List;ZLnet/minecraft/world/RandomSequences;)V", at = @At(value = "INVOKE", target = "Lnet/minecraft/world/level/Level;<init>(Lnet/minecraft/world/level/storage/WritableLevelData;Lnet/minecraft/resources/ResourceKey;Lnet/minecraft/core/RegistryAccess;Lnet/minecraft/core/Holder;Ljava/util/function/Supplier;ZZJI)V", shift = At.Shift.AFTER))
++    private void dynamicdimensions$attachConstructingReceiver(MinecraftServer server, Executor executor,
++            LevelStorageSource.LevelStorageAccess storage, ServerLevelData data, ResourceKey<Level> key, LevelStem stem,
++            ChunkProgressListener progress, boolean debug, long biomeSeed, List<CustomSpawner> spawners, boolean tickTime,
++            RandomSequences randomSequences, CallbackInfo callback) {
++        DimensionSeedOwnership.attachConstructingReceiver((ServerLevel) (Object) this, server, key);
++    }
++    @Inject(method = "getSeed()J", at = @At("HEAD"), cancellable = true)
++    private void dynamicdimensions$explicitSeed(CallbackInfoReturnable<Long> callback) {
++        ServerLevel level = (ServerLevel) (Object) this;
++        DimensionSeedOwnership.seedFor(level).ifPresent(callback::setReturnValue);
++    }
++
++    /** Exact 1.21.1 target: Lnet/minecraft/world/level/levelgen/WorldOptions;seed()J in ServerLevel.<init>. */
++    @Redirect(method = "<init>", at = @At(value = "INVOKE", target = "Lnet/minecraft/world/level/levelgen/WorldOptions;seed()J"))
++    private long dynamicdimensions$constructorSeed(WorldOptions options) {
++        ServerLevel level = (ServerLevel) (Object) this;
++        return DimensionSeedOwnership.seedFor(level).orElseGet(options::seed);
++    }
++
++}
 diff --git a/common/src/main/resources/dynamicdimensions.mixins.json b/common/src/main/resources/dynamicdimensions.mixins.json
 index ce2fd0f..04bfdce 100644
 --- a/common/src/main/resources/dynamicdimensions.mixins.json
@@ -1189,6 +1624,124 @@ index ce2fd0f..04bfdce 100644
    ],
    "server": [
    ],
+diff --git a/common/src/test/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipStateTest.java b/common/src/test/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipStateTest.java
+new file mode 100644
+index 0000000..94b11a7
+--- /dev/null
++++ b/common/src/test/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipStateTest.java
+@@ -0,0 +1,64 @@
++package dev.galacticraft.dynamicdimensions.impl;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++import org.junit.jupiter.api.Test;
++
++/** Exercises the exact production ownership helper with ordinary identity tokens. */
++class SeedOwnershipStateTest {
++    @Test void oldReceiverCannotReadReplacementDuringExactConstructionAndStaleRetireCannotClearIt() {
++        SeedOwnershipState<Object, String, Object> state = new SeedOwnershipState<>();
++        Object server = new Object(); Object old = new Object(); Object replacement = new Object();
++        SeedOwnershipTable.Lease<Object, String> first = state.claim(server, "dynamicverse:alpha", 11L);
++        SeedOwnershipState.Construction<Object, String, Object> firstToken = state.enter(first);
++        assertTrue(state.attachConstructingReceiver(old, server, "dynamicverse:alpha")); state.close(firstToken);
++        assertTrue(state.retire(old, first));
++        SeedOwnershipTable.Lease<Object, String> second = state.claim(server, "dynamicverse:alpha", 22L);
++        SeedOwnershipState.Construction<Object, String, Object> secondToken = state.enter(second);
++        assertTrue(state.seedFor(old).isEmpty());
++        assertTrue(state.attachConstructingReceiver(replacement, server, "dynamicverse:alpha"));
++        assertEquals(22L, state.seedFor(replacement).orElseThrow());
++        assertFalse(state.retire(old, first));
++        state.close(secondToken);
++    }
++
++    @Test void unrelatedOrNestedLegacyConstructionCannotReceiveScopedSeedAndAbortRemovesOnlyExactBinding() {
++        SeedOwnershipState<Object, String, Object> state = new SeedOwnershipState<>();
++        Object server = new Object(); Object target = new Object(); Object unrelated = new Object();
++        SeedOwnershipTable.Lease<Object, String> first = state.claim(server, "dynamicverse:alpha", 31L);
++        SeedOwnershipState.Construction<Object, String, Object> token = state.enter(first);
++        assertTrue(state.seedForConstruction(server, "dynamicverse:alpha").isPresent());
++        assertTrue(state.seedForConstruction(server, "dynamicverse:beta").isEmpty());
++        assertFalse(state.attachConstructingReceiver(unrelated, server, "dynamicverse:beta"));
++        assertTrue(state.attachConstructingReceiver(target, server, "dynamicverse:alpha"));
++        assertTrue(state.seedForConstruction(server, "dynamicverse:alpha").isEmpty(), "biome fallback ends after exact receiver attachment");
++        assertTrue(state.abort(first));
++        assertTrue(state.seedFor(target).isEmpty());
++        assertTrue(state.seedForConstruction(server, "dynamicverse:alpha").isEmpty(), "abort invalidates an active construction token");
++        state.close(token);
++        SeedOwnershipTable.Lease<Object, String> replacement = state.claim(server, "dynamicverse:alpha", 32L);
++        assertFalse(state.abort(first), "stale abort cannot erase replacement");
++        state.dispose(server);
++        assertTrue(state.seedFor(target).isEmpty());
++        assertTrue(state.abort(replacement) == false, "server disposal already removed replacement claim");
++    }
++
++    @Test void retireAndDisposalInvalidateActiveTokens() {
++        SeedOwnershipState<Object, String, Object> state = new SeedOwnershipState<>();
++        Object server = new Object(); Object first = new Object(); Object replacement = new Object();
++        SeedOwnershipTable.Lease<Object, String> lease = state.claim(server, "dynamicverse:alpha", 1L);
++        SeedOwnershipState.Construction<Object, String, Object> token = state.enter(lease);
++        assertTrue(state.attachConstructingReceiver(first, server, "dynamicverse:alpha"));
++        assertTrue(state.retire(first, lease));
++        assertTrue(state.seedFor(first).isEmpty());
++        state.close(token);
++        SeedOwnershipTable.Lease<Object, String> newer = state.claim(server, "dynamicverse:alpha", 2L);
++        SeedOwnershipState.Construction<Object, String, Object> newerToken = state.enter(newer);
++        assertTrue(state.attachConstructingReceiver(replacement, server, "dynamicverse:alpha"));
++        state.dispose(server);
++        assertTrue(state.seedFor(replacement).isEmpty());
++        state.close(newerToken);
++    }
++}
+diff --git a/common/src/test/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipTableTest.java b/common/src/test/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipTableTest.java
+new file mode 100644
+index 0000000..0580e5e
+--- /dev/null
++++ b/common/src/test/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipTableTest.java
+@@ -0,0 +1,42 @@
++package dev.galacticraft.dynamicdimensions.impl;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++import org.junit.jupiter.api.Test;
++
++class SeedOwnershipTableTest {
++    @Test
++    void distinctOwnersAndKeysKeepSeedsIndependentAndRepeatable() {
++        SeedOwnershipTable<Object, String> table = new SeedOwnershipTable<>();
++        Object firstServer = new Object();
++        Object secondServer = new Object();
++        SeedOwnershipTable.Lease<Object, String> first = table.claim(firstServer, "dynamicverse:alpha", 17L);
++        SeedOwnershipTable.Lease<Object, String> second = table.claim(firstServer, "dynamicverse:beta", 29L);
++        SeedOwnershipTable.Lease<Object, String> repeat = table.claim(secondServer, "dynamicverse:alpha", 17L);
++
++        assertEquals(17L, table.seed(firstServer, "dynamicverse:alpha").orElseThrow());
++        assertEquals(29L, table.seed(firstServer, "dynamicverse:beta").orElseThrow());
++        assertEquals(17L, table.seed(secondServer, "dynamicverse:alpha").orElseThrow());
++        assertTrue(table.release(first));
++        assertEquals(29L, table.seed(firstServer, "dynamicverse:beta").orElseThrow());
++        assertTrue(table.release(second));
++        assertTrue(table.release(repeat));
++    }
++
++    @Test
++    void conflictIsRefusedAndStaleCleanupCannotEraseReplacementGeneration() {
++        SeedOwnershipTable<Object, String> table = new SeedOwnershipTable<>();
++        Object server = new Object();
++        SeedOwnershipTable.Lease<Object, String> first = table.claim(server, "dynamicverse:alpha", 17L);
++        assertNull(table.claim(server, "dynamicverse:alpha", 29L));
++        assertTrue(table.release(first));
++        SeedOwnershipTable.Lease<Object, String> replacement = table.claim(server, "dynamicverse:alpha", 29L);
++        assertFalse(table.release(first));
++        assertEquals(29L, table.seed(server, "dynamicverse:alpha").orElseThrow());
++        assertTrue(table.release(replacement));
++        assertTrue(table.seed(server, "dynamicverse:alpha").isEmpty());
++    }
++}
 diff --git a/common/src/test/java/dev/galacticraft/dynamicdimensions/impl/internal/QuiesceAndCloseBridgeTest.java b/common/src/test/java/dev/galacticraft/dynamicdimensions/impl/internal/QuiesceAndCloseBridgeTest.java
 new file mode 100644
 index 0000000..00899dd
@@ -1503,493 +2056,6 @@ index b36271d..882de30 100644
 -}
 \ No newline at end of file
 +}
-diff --git a/neoforge/src/main/java/dev/galacticraft/dynamicdimensions/impl/forge/DynamicDimensionsForge.java b/neoforge/src/main/java/dev/galacticraft/dynamicdimensions/impl/forge/DynamicDimensionsForge.java
-index a53e095..e7171fb 100644
---- a/neoforge/src/main/java/dev/galacticraft/dynamicdimensions/impl/forge/DynamicDimensionsForge.java
-+++ b/neoforge/src/main/java/dev/galacticraft/dynamicdimensions/impl/forge/DynamicDimensionsForge.java
-@@ -26,6 +26,7 @@ import dev.galacticraft.dynamicdimensions.impl.Constants;
- import dev.galacticraft.dynamicdimensions.impl.client.network.S2CPacketReceivers;
- import dev.galacticraft.dynamicdimensions.impl.command.DynamicDimensionsCommands;
- import dev.galacticraft.dynamicdimensions.impl.forge.config.DynamicDimensionsConfigImpl;
-+import dev.galacticraft.dynamicdimensions.impl.gametest.ExplicitSeedNormalGametest;
- import dev.galacticraft.dynamicdimensions.impl.gametest.DynamicDimensionsGametest;
- import dev.galacticraft.dynamicdimensions.impl.network.S2CPackets;
- import net.neoforged.api.distmarker.Dist;
-@@ -55,10 +56,14 @@ public final class DynamicDimensionsForge {
-     }
- 
-     public void registerGametests(@NotNull RegisterGameTestsEvent event) {
--        event.register(DynamicDimensionsGametest.class);
-+        if (Boolean.getBoolean("dynamicdimensions.isolatedSeedGameTest")) {
-+            event.register(ExplicitSeedNormalGametest.class);
-+        } else {
-+            event.register(DynamicDimensionsGametest.class);
-+        }
-     }
- 
-     private void registerCommands(@NotNull RegisterCommandsEvent event) {
-         DynamicDimensionsCommands.register(event.getDispatcher(), event.getBuildContext(), event.getCommandSelection());
-     }
--}
-\ No newline at end of file
-+}
-diff --git a/settings.gradle.kts b/settings.gradle.kts
-index 98a5236..8183a5d 100644
---- a/settings.gradle.kts
-+++ b/settings.gradle.kts
-@@ -1,4 +1,9 @@
- pluginManagement {
-+    // Local-only feasibility override for MINECRAFT-470. It is deliberately
-+    // not a publication, cache installation, or substitute for historical
-+    // Mojarn 0.6.1+19 provenance.
-+    includeBuild(providers.gradleProperty("mojarnSource").get())
-+
-     repositories {
-         gradlePluginPortal()
-         mavenCentral()
-diff --git a/common/src/main/java/dev/galacticraft/dynamicdimensions/api/ExplicitSeedDimensionRegistry.java b/common/src/main/java/dev/galacticraft/dynamicdimensions/api/ExplicitSeedDimensionRegistry.java
-new file mode 100644
-index 0000000..273af44
---- /dev/null
-+++ b/common/src/main/java/dev/galacticraft/dynamicdimensions/api/ExplicitSeedDimensionRegistry.java
-@@ -0,0 +1,30 @@
-+/*
-+ * Copyright (c) 2026 Team Galacticraft
-+ */
-+package dev.galacticraft.dynamicdimensions.api;
-+
-+import net.minecraft.resources.ResourceLocation;
-+import net.minecraft.server.level.ServerLevel;
-+import net.minecraft.world.level.chunk.ChunkGenerator;
-+import net.minecraft.world.level.dimension.DimensionType;
-+import org.jetbrains.annotations.NotNull;
-+import org.jetbrains.annotations.Nullable;
-+
-+/**
-+ * Opt-in capability for registries that install an explicit seed before any
-+ * generator or {@link ServerLevel} seed-dependent construction work begins.
-+ *
-+ * <p>The legacy {@link DynamicDimensionRegistry} overloads intentionally do
-+ * not imply this capability: they retain the server save seed. Consumers must
-+ * test this marker before calling either operation and must not substitute a
-+ * legacy overload when it is absent.</p>
-+ */
-+public interface ExplicitSeedDimensionRegistry {
-+    @Nullable ServerLevel createExplicitSeedDimension(@NotNull ResourceLocation id, @NotNull ChunkGenerator generator,
-+                                                      @NotNull DimensionType type, @NotNull DynamicDimensionProperties properties,
-+                                                      long seed);
-+
-+    @Nullable ServerLevel loadExplicitSeedDimension(@NotNull ResourceLocation id, @NotNull ChunkGenerator generator,
-+                                                    @NotNull DimensionType type, @NotNull DynamicDimensionProperties properties,
-+                                                    long seed);
-+}
-diff --git a/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/DimensionSeedOwnership.java b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/DimensionSeedOwnership.java
-new file mode 100644
-index 0000000..acf1978
---- /dev/null
-+++ b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/DimensionSeedOwnership.java
-@@ -0,0 +1,40 @@
-+package dev.galacticraft.dynamicdimensions.impl;
-+
-+import java.util.OptionalLong;
-+import net.minecraft.resources.ResourceKey;
-+import net.minecraft.server.MinecraftServer;
-+import net.minecraft.server.level.ServerLevel;
-+import net.minecraft.world.level.Level;
-+
-+/** Version-pinned adapter around the production identity/generation state machine. */
-+public final class DimensionSeedOwnership {
-+    private static final SeedOwnershipState<MinecraftServer, ResourceKey<Level>, ServerLevel> STATE = new SeedOwnershipState<>();
-+    private DimensionSeedOwnership() { }
-+    public static synchronized Lease claim(MinecraftServer server, ResourceKey<Level> key, long seed) {
-+        SeedOwnershipTable.Lease<MinecraftServer, ResourceKey<Level>> lease = STATE.claim(server, key, seed);
-+        return lease == null ? null : new Lease(lease);
-+    }
-+    public static Construction enterConstruction(Lease lease) { return new Construction(STATE.enter(lease.delegate)); }
-+    /** Pinned post-super ServerLevel.<init> hook binds only the exact receiver for this construction scope. */
-+    public static synchronized boolean attachConstructingReceiver(ServerLevel level, MinecraftServer server, ResourceKey<Level> key) {
-+        return STATE.attachConstructingReceiver(level, server, key);
-+    }
-+    public static synchronized OptionalLong seedFor(ServerLevel level) { return STATE.seedFor(level); }
-+    /** RegistryImpl's separate biome argument is allowed only before the exact receiver attaches. */
-+    public static synchronized OptionalLong seedForConstruction(MinecraftServer server, ResourceKey<Level> key) { return STATE.seedForConstruction(server, key); }
-+    public static synchronized boolean retire(ServerLevel level, Lease expected) { return STATE.retire(level, expected.delegate); }
-+    /** Exact-lease abort clears any bound receiver for that lease but cannot affect a replacement. */
-+    public static synchronized boolean abort(Lease expected) { return STATE.abort(expected.delegate); }
-+    public static synchronized void disposeServer(MinecraftServer server) { STATE.dispose(server); }
-+    public static final class Construction implements AutoCloseable {
-+        private final SeedOwnershipState.Construction<MinecraftServer, ResourceKey<Level>, ServerLevel> token;
-+        private Construction(SeedOwnershipState.Construction<MinecraftServer, ResourceKey<Level>, ServerLevel> token) { this.token = token; }
-+        @Override public void close() { STATE.close(token); }
-+    }
-+    public static final class Lease {
-+        private final SeedOwnershipTable.Lease<MinecraftServer, ResourceKey<Level>> delegate;
-+        private Lease(SeedOwnershipTable.Lease<MinecraftServer, ResourceKey<Level>> delegate) { this.delegate = delegate; }
-+        public long seed() { return delegate.seed(); }
-+        public long generation() { return delegate.generation(); }
-+    }
-+}
-diff --git a/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipState.java b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipState.java
-new file mode 100644
-index 0000000..4781e81
---- /dev/null
-+++ b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipState.java
-@@ -0,0 +1,76 @@
-+package dev.galacticraft.dynamicdimensions.impl;
-+
-+import java.util.IdentityHashMap;
-+import java.util.Map;
-+import java.util.OptionalLong;
-+
-+/**
-+ * Production seed-ownership state machine. Construction uses one explicit
-+ * receiver token; all later reads and retirement use only that bound identity.
-+ */
-+final class SeedOwnershipState<S, K, L> {
-+    private final SeedOwnershipTable<S, K> leases = new SeedOwnershipTable<>();
-+    private final Map<L, SeedOwnershipTable.Lease<S, K>> bound = new IdentityHashMap<>();
-+    private final ThreadLocal<Construction<S, K, L>> constructing = new ThreadLocal<>();
-+
-+    SeedOwnershipTable.Lease<S, K> claim(S owner, K key, long seed) { return leases.claim(owner, key, seed); }
-+    Construction<S, K, L> enter(SeedOwnershipTable.Lease<S, K> lease) {
-+        if (constructing.get() != null) throw new IllegalStateException("Nested explicit-seed construction");
-+        Construction<S, K, L> token = new Construction<>(lease);
-+        constructing.set(token);
-+        return token;
-+    }
-+    boolean attachConstructingReceiver(L receiver, S owner, K key) {
-+        Construction<S, K, L> token = constructing.get();
-+        if (token == null || token.receiver != null || token.lease.owner() != owner || !token.lease.key().equals(key)
-+                || !leases.matches(token.lease)) return false;
-+        token.receiver = receiver;
-+        bound.put(receiver, token.lease);
-+        return true;
-+    }
-+    OptionalLong seedFor(L receiver) {
-+        SeedOwnershipTable.Lease<S, K> lease = bound.get(receiver);
-+        if (lease != null) return OptionalLong.of(lease.seed());
-+        Construction<S, K, L> token = constructing.get();
-+        return token != null && token.active && token.receiver == receiver && leases.matches(token.lease)
-+                ? OptionalLong.of(token.lease.seed()) : OptionalLong.empty();
-+    }
-+    OptionalLong seedForConstruction(S owner, K key) {
-+        Construction<S, K, L> token = constructing.get();
-+        return token != null && token.active && token.receiver == null && leases.matches(token.lease)
-+                && token.lease.owner() == owner && token.lease.key().equals(key)
-+                ? OptionalLong.of(token.lease.seed()) : OptionalLong.empty();
-+    }
-+    boolean retire(L receiver, SeedOwnershipTable.Lease<S, K> expected) {
-+        if (bound.get(receiver) != expected) return false;
-+        bound.remove(receiver);
-+        invalidate(expected);
-+        return leases.release(expected);
-+    }
-+    boolean abort(SeedOwnershipTable.Lease<S, K> expected) {
-+        bound.entrySet().removeIf(entry -> entry.getValue() == expected);
-+        invalidate(expected);
-+        return leases.release(expected);
-+    }
-+    void dispose(S owner) {
-+        bound.entrySet().removeIf(entry -> entry.getValue().owner() == owner);
-+        Construction<S, K, L> token = constructing.get();
-+        if (token != null && token.lease.owner() == owner) { token.active = false; token.receiver = null; }
-+        leases.dispose(owner);
-+    }
-+    private void invalidate(SeedOwnershipTable.Lease<S, K> lease) {
-+        Construction<S, K, L> token = constructing.get();
-+        if (token != null && token.lease == lease) { token.active = false; token.receiver = null; }
-+    }
-+    static final class Construction<S, K, L> implements AutoCloseable {
-+        private final SeedOwnershipTable.Lease<S, K> lease;
-+        private L receiver;
-+        private boolean active = true;
-+        private Construction(SeedOwnershipTable.Lease<S, K> lease) { this.lease = lease; }
-+        @Override public void close() { }
-+    }
-+    void close(Construction<S, K, L> token) {
-+        if (constructing.get() != token) throw new IllegalStateException("Construction scope changed");
-+        constructing.remove();
-+    }
-+}
-diff --git a/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipTable.java b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipTable.java
-new file mode 100644
-index 0000000..7f06464
---- /dev/null
-+++ b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipTable.java
-@@ -0,0 +1,50 @@
-+package dev.galacticraft.dynamicdimensions.impl;
-+
-+import java.util.HashMap;
-+import java.util.IdentityHashMap;
-+import java.util.Map;
-+import java.util.OptionalLong;
-+
-+/**
-+ * Identity-scoped, generation-checked ownership table used by the explicit
-+ * dimension-seed bridge. It intentionally has no Minecraft lifecycle calls so
-+ * its replacement and stale-cleanup rules can be verified locally.
-+ */
-+final class SeedOwnershipTable<S, K> {
-+    private final Map<S, Map<K, Entry>> owners = new IdentityHashMap<>();
-+    private long nextGeneration;
-+
-+    Lease<S, K> claim(S owner, K key, long seed) {
-+        Map<K, Entry> entries = this.owners.computeIfAbsent(owner, ignored -> new HashMap<>());
-+        if (entries.containsKey(key)) return null;
-+        Entry entry = new Entry(seed, ++this.nextGeneration);
-+        entries.put(key, entry);
-+        return new Lease<>(owner, key, entry.seed, entry.generation);
-+    }
-+
-+    OptionalLong seed(S owner, K key) {
-+        Map<K, Entry> entries = this.owners.get(owner);
-+        Entry entry = entries == null ? null : entries.get(key);
-+        return entry == null ? OptionalLong.empty() : OptionalLong.of(entry.seed);
-+    }
-+
-+    boolean release(Lease<S, K> lease) {
-+        Map<K, Entry> entries = this.owners.get(lease.owner());
-+        Entry current = entries == null ? null : entries.get(lease.key());
-+        if (current == null || current.generation != lease.generation()) return false;
-+        entries.remove(lease.key());
-+        if (entries.isEmpty()) this.owners.remove(lease.owner());
-+        return true;
-+    }
-+
-+    boolean matches(Lease<S, K> lease) {
-+        Map<K, Entry> entries = this.owners.get(lease.owner());
-+        Entry current = entries == null ? null : entries.get(lease.key());
-+        return current != null && current.generation == lease.generation();
-+    }
-+
-+    void dispose(S owner) { this.owners.remove(owner); }
-+
-+    record Lease<S, K>(S owner, K key, long seed, long generation) { }
-+    private record Entry(long seed, long generation) { }
-+}
-diff --git a/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/gametest/ExplicitSeedNormalGametest.java b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/gametest/ExplicitSeedNormalGametest.java
-new file mode 100644
-index 0000000..200d089
---- /dev/null
-+++ b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/gametest/ExplicitSeedNormalGametest.java
-@@ -0,0 +1,38 @@
-+/*
-+ * Copyright (c) 2021-2026 Team Galacticraft
-+ *
-+ * Permission is hereby granted, free of charge, to any person obtaining a copy
-+ * of this software and associated documentation files (the "Software"), to deal
-+ * in the Software without restriction, including without limitation the rights
-+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-+ * copies of the Software, and to permit persons to whom the Software is
-+ * furnished to do so, subject to the following conditions:
-+ *
-+ * The above copyright notice and this permission notice shall be included in all
-+ * copies or substantial portions of the Software.
-+ */
-+
-+package dev.galacticraft.dynamicdimensions.impl.gametest;
-+
-+import net.minecraft.gametest.framework.GameTest;
-+import net.minecraft.gametest.framework.GameTestHelper;
-+import org.jetbrains.annotations.ApiStatus;
-+import org.jetbrains.annotations.NotNull;
-+
-+/**
-+ * The isolated independent-seed fixture registration. The existing legacy
-+ * DynamicDimensionsGametest class contains delete-oriented tests and is not
-+ * registered in this focused provider run.
-+ */
-+@ApiStatus.Internal
-+public final class ExplicitSeedNormalGametest {
-+    /**
-+     * The provider-owned inert NBT entry is deliberately addressed through the
-+     * minecraft namespace because NeoForge's GameTest patch resolves that
-+     * namespace for this provider's common-source tests.
-+     */
-+    @GameTest(template = "dynamicdimensionsgametest.empty", timeoutTicks = 100)
-+    public void explicitSeedNormalABAReloadPreservesGeneratedEvidence(@NotNull GameTestHelper context) {
-+        DynamicDimensionsGametest.explicitSeedNormalABAReloadPreservesGeneratedEvidence(context);
-+    }
-+}
-diff --git a/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/mixin/ServerLevelMixin.java b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/mixin/ServerLevelMixin.java
-new file mode 100644
-index 0000000..d34aa44
---- /dev/null
-+++ b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/mixin/ServerLevelMixin.java
-@@ -0,0 +1,55 @@
-+package dev.galacticraft.dynamicdimensions.impl.mixin;
-+
-+import dev.galacticraft.dynamicdimensions.impl.DimensionSeedOwnership;
-+import net.minecraft.server.level.ServerLevel;
-+import net.minecraft.server.level.progress.ChunkProgressListener;
-+import net.minecraft.server.MinecraftServer;
-+import net.minecraft.resources.ResourceKey;
-+import net.minecraft.world.RandomSequences;
-+import net.minecraft.world.level.CustomSpawner;
-+import net.minecraft.world.level.Level;
-+import net.minecraft.world.level.dimension.LevelStem;
-+import net.minecraft.world.level.storage.LevelStorageSource;
-+import net.minecraft.world.level.storage.ServerLevelData;
-+import net.minecraft.world.level.levelgen.WorldOptions;
-+import org.spongepowered.asm.mixin.Mixin;
-+import org.spongepowered.asm.mixin.injection.At;
-+import org.spongepowered.asm.mixin.injection.Inject;
-+import org.spongepowered.asm.mixin.injection.Redirect;
-+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
-+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
-+import java.util.List;
-+import java.util.concurrent.Executor;
-+
-+/**
-+ * Pinned against NeoForge 21.1.148 ServerLevel.<init>: WorldOptions.seed() is
-+ * consumed directly by StructureCheck/RandomSequences before normal gameplay
-+ * starts. The registry installs DimensionSeedOwnership before `new ServerLevel`.
-+ */
-+@Mixin(ServerLevel.class)
-+abstract class ServerLevelMixin {
-+    /**
-+     * Exact pinned 1.21.1 constructor descriptor, attached after Level.<init>
-+     * and before later seed-dependent ServerLevel work. The scope admits one receiver only.
-+     */
-+    @Inject(method = "<init>(Lnet/minecraft/server/MinecraftServer;Ljava/util/concurrent/Executor;Lnet/minecraft/world/level/storage/LevelStorageSource$LevelStorageAccess;Lnet/minecraft/world/level/storage/ServerLevelData;Lnet/minecraft/resources/ResourceKey;Lnet/minecraft/world/level/dimension/LevelStem;Lnet/minecraft/server/level/progress/ChunkProgressListener;ZJLjava/util/List;ZLnet/minecraft/world/RandomSequences;)V", at = @At(value = "INVOKE", target = "Lnet/minecraft/world/level/Level;<init>(Lnet/minecraft/world/level/storage/WritableLevelData;Lnet/minecraft/resources/ResourceKey;Lnet/minecraft/core/RegistryAccess;Lnet/minecraft/core/Holder;Ljava/util/function/Supplier;ZZJI)V", shift = At.Shift.AFTER))
-+    private void dynamicdimensions$attachConstructingReceiver(MinecraftServer server, Executor executor,
-+            LevelStorageSource.LevelStorageAccess storage, ServerLevelData data, ResourceKey<Level> key, LevelStem stem,
-+            ChunkProgressListener progress, boolean debug, long biomeSeed, List<CustomSpawner> spawners, boolean tickTime,
-+            RandomSequences randomSequences, CallbackInfo callback) {
-+        DimensionSeedOwnership.attachConstructingReceiver((ServerLevel) (Object) this, server, key);
-+    }
-+    @Inject(method = "getSeed()J", at = @At("HEAD"), cancellable = true)
-+    private void dynamicdimensions$explicitSeed(CallbackInfoReturnable<Long> callback) {
-+        ServerLevel level = (ServerLevel) (Object) this;
-+        DimensionSeedOwnership.seedFor(level).ifPresent(callback::setReturnValue);
-+    }
-+
-+    /** Exact 1.21.1 target: Lnet/minecraft/world/level/levelgen/WorldOptions;seed()J in ServerLevel.<init>. */
-+    @Redirect(method = "<init>", at = @At(value = "INVOKE", target = "Lnet/minecraft/world/level/levelgen/WorldOptions;seed()J"))
-+    private long dynamicdimensions$constructorSeed(WorldOptions options) {
-+        ServerLevel level = (ServerLevel) (Object) this;
-+        return DimensionSeedOwnership.seedFor(level).orElseGet(options::seed);
-+    }
-+
-+}
-diff --git a/common/src/test/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipStateTest.java b/common/src/test/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipStateTest.java
-new file mode 100644
-index 0000000..94b11a7
---- /dev/null
-+++ b/common/src/test/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipStateTest.java
-@@ -0,0 +1,64 @@
-+package dev.galacticraft.dynamicdimensions.impl;
-+
-+import static org.junit.jupiter.api.Assertions.assertEquals;
-+import static org.junit.jupiter.api.Assertions.assertFalse;
-+import static org.junit.jupiter.api.Assertions.assertTrue;
-+
-+import org.junit.jupiter.api.Test;
-+
-+/** Exercises the exact production ownership helper with ordinary identity tokens. */
-+class SeedOwnershipStateTest {
-+    @Test void oldReceiverCannotReadReplacementDuringExactConstructionAndStaleRetireCannotClearIt() {
-+        SeedOwnershipState<Object, String, Object> state = new SeedOwnershipState<>();
-+        Object server = new Object(); Object old = new Object(); Object replacement = new Object();
-+        SeedOwnershipTable.Lease<Object, String> first = state.claim(server, "dynamicverse:alpha", 11L);
-+        SeedOwnershipState.Construction<Object, String, Object> firstToken = state.enter(first);
-+        assertTrue(state.attachConstructingReceiver(old, server, "dynamicverse:alpha")); state.close(firstToken);
-+        assertTrue(state.retire(old, first));
-+        SeedOwnershipTable.Lease<Object, String> second = state.claim(server, "dynamicverse:alpha", 22L);
-+        SeedOwnershipState.Construction<Object, String, Object> secondToken = state.enter(second);
-+        assertTrue(state.seedFor(old).isEmpty());
-+        assertTrue(state.attachConstructingReceiver(replacement, server, "dynamicverse:alpha"));
-+        assertEquals(22L, state.seedFor(replacement).orElseThrow());
-+        assertFalse(state.retire(old, first));
-+        state.close(secondToken);
-+    }
-+
-+    @Test void unrelatedOrNestedLegacyConstructionCannotReceiveScopedSeedAndAbortRemovesOnlyExactBinding() {
-+        SeedOwnershipState<Object, String, Object> state = new SeedOwnershipState<>();
-+        Object server = new Object(); Object target = new Object(); Object unrelated = new Object();
-+        SeedOwnershipTable.Lease<Object, String> first = state.claim(server, "dynamicverse:alpha", 31L);
-+        SeedOwnershipState.Construction<Object, String, Object> token = state.enter(first);
-+        assertTrue(state.seedForConstruction(server, "dynamicverse:alpha").isPresent());
-+        assertTrue(state.seedForConstruction(server, "dynamicverse:beta").isEmpty());
-+        assertFalse(state.attachConstructingReceiver(unrelated, server, "dynamicverse:beta"));
-+        assertTrue(state.attachConstructingReceiver(target, server, "dynamicverse:alpha"));
-+        assertTrue(state.seedForConstruction(server, "dynamicverse:alpha").isEmpty(), "biome fallback ends after exact receiver attachment");
-+        assertTrue(state.abort(first));
-+        assertTrue(state.seedFor(target).isEmpty());
-+        assertTrue(state.seedForConstruction(server, "dynamicverse:alpha").isEmpty(), "abort invalidates an active construction token");
-+        state.close(token);
-+        SeedOwnershipTable.Lease<Object, String> replacement = state.claim(server, "dynamicverse:alpha", 32L);
-+        assertFalse(state.abort(first), "stale abort cannot erase replacement");
-+        state.dispose(server);
-+        assertTrue(state.seedFor(target).isEmpty());
-+        assertTrue(state.abort(replacement) == false, "server disposal already removed replacement claim");
-+    }
-+
-+    @Test void retireAndDisposalInvalidateActiveTokens() {
-+        SeedOwnershipState<Object, String, Object> state = new SeedOwnershipState<>();
-+        Object server = new Object(); Object first = new Object(); Object replacement = new Object();
-+        SeedOwnershipTable.Lease<Object, String> lease = state.claim(server, "dynamicverse:alpha", 1L);
-+        SeedOwnershipState.Construction<Object, String, Object> token = state.enter(lease);
-+        assertTrue(state.attachConstructingReceiver(first, server, "dynamicverse:alpha"));
-+        assertTrue(state.retire(first, lease));
-+        assertTrue(state.seedFor(first).isEmpty());
-+        state.close(token);
-+        SeedOwnershipTable.Lease<Object, String> newer = state.claim(server, "dynamicverse:alpha", 2L);
-+        SeedOwnershipState.Construction<Object, String, Object> newerToken = state.enter(newer);
-+        assertTrue(state.attachConstructingReceiver(replacement, server, "dynamicverse:alpha"));
-+        state.dispose(server);
-+        assertTrue(state.seedFor(replacement).isEmpty());
-+        state.close(newerToken);
-+    }
-+}
-diff --git a/common/src/test/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipTableTest.java b/common/src/test/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipTableTest.java
-new file mode 100644
-index 0000000..0580e5e
---- /dev/null
-+++ b/common/src/test/java/dev/galacticraft/dynamicdimensions/impl/SeedOwnershipTableTest.java
-@@ -0,0 +1,42 @@
-+package dev.galacticraft.dynamicdimensions.impl;
-+
-+import static org.junit.jupiter.api.Assertions.assertEquals;
-+import static org.junit.jupiter.api.Assertions.assertFalse;
-+import static org.junit.jupiter.api.Assertions.assertNull;
-+import static org.junit.jupiter.api.Assertions.assertTrue;
-+
-+import org.junit.jupiter.api.Test;
-+
-+class SeedOwnershipTableTest {
-+    @Test
-+    void distinctOwnersAndKeysKeepSeedsIndependentAndRepeatable() {
-+        SeedOwnershipTable<Object, String> table = new SeedOwnershipTable<>();
-+        Object firstServer = new Object();
-+        Object secondServer = new Object();
-+        SeedOwnershipTable.Lease<Object, String> first = table.claim(firstServer, "dynamicverse:alpha", 17L);
-+        SeedOwnershipTable.Lease<Object, String> second = table.claim(firstServer, "dynamicverse:beta", 29L);
-+        SeedOwnershipTable.Lease<Object, String> repeat = table.claim(secondServer, "dynamicverse:alpha", 17L);
-+
-+        assertEquals(17L, table.seed(firstServer, "dynamicverse:alpha").orElseThrow());
-+        assertEquals(29L, table.seed(firstServer, "dynamicverse:beta").orElseThrow());
-+        assertEquals(17L, table.seed(secondServer, "dynamicverse:alpha").orElseThrow());
-+        assertTrue(table.release(first));
-+        assertEquals(29L, table.seed(firstServer, "dynamicverse:beta").orElseThrow());
-+        assertTrue(table.release(second));
-+        assertTrue(table.release(repeat));
-+    }
-+
-+    @Test
-+    void conflictIsRefusedAndStaleCleanupCannotEraseReplacementGeneration() {
-+        SeedOwnershipTable<Object, String> table = new SeedOwnershipTable<>();
-+        Object server = new Object();
-+        SeedOwnershipTable.Lease<Object, String> first = table.claim(server, "dynamicverse:alpha", 17L);
-+        assertNull(table.claim(server, "dynamicverse:alpha", 29L));
-+        assertTrue(table.release(first));
-+        SeedOwnershipTable.Lease<Object, String> replacement = table.claim(server, "dynamicverse:alpha", 29L);
-+        assertFalse(table.release(first));
-+        assertEquals(29L, table.seed(server, "dynamicverse:alpha").orElseThrow());
-+        assertTrue(table.release(replacement));
-+        assertTrue(table.seed(server, "dynamicverse:alpha").isEmpty());
-+    }
-+}
 diff --git a/neoforge/scripts/runSeedGameTestWithReceipt.sh b/neoforge/scripts/runSeedGameTestWithReceipt.sh
 new file mode 100644
 index 0000000..6310a6f
@@ -2055,6 +2121,36 @@ index 0000000..6310a6f
 +fi
 +printf '%s\n' "$status" > "$wrapper_exit" || exit 71
 +exit "$status"
+diff --git a/neoforge/src/main/java/dev/galacticraft/dynamicdimensions/impl/forge/DynamicDimensionsForge.java b/neoforge/src/main/java/dev/galacticraft/dynamicdimensions/impl/forge/DynamicDimensionsForge.java
+index a53e095..e7171fb 100644
+--- a/neoforge/src/main/java/dev/galacticraft/dynamicdimensions/impl/forge/DynamicDimensionsForge.java
++++ b/neoforge/src/main/java/dev/galacticraft/dynamicdimensions/impl/forge/DynamicDimensionsForge.java
+@@ -26,6 +26,7 @@ import dev.galacticraft.dynamicdimensions.impl.Constants;
+ import dev.galacticraft.dynamicdimensions.impl.client.network.S2CPacketReceivers;
+ import dev.galacticraft.dynamicdimensions.impl.command.DynamicDimensionsCommands;
+ import dev.galacticraft.dynamicdimensions.impl.forge.config.DynamicDimensionsConfigImpl;
++import dev.galacticraft.dynamicdimensions.impl.gametest.ExplicitSeedNormalGametest;
+ import dev.galacticraft.dynamicdimensions.impl.gametest.DynamicDimensionsGametest;
+ import dev.galacticraft.dynamicdimensions.impl.network.S2CPackets;
+ import net.neoforged.api.distmarker.Dist;
+@@ -55,10 +56,14 @@ public final class DynamicDimensionsForge {
+     }
+ 
+     public void registerGametests(@NotNull RegisterGameTestsEvent event) {
+-        event.register(DynamicDimensionsGametest.class);
++        if (Boolean.getBoolean("dynamicdimensions.isolatedSeedGameTest")) {
++            event.register(ExplicitSeedNormalGametest.class);
++        } else {
++            event.register(DynamicDimensionsGametest.class);
++        }
+     }
+ 
+     private void registerCommands(@NotNull RegisterCommandsEvent event) {
+         DynamicDimensionsCommands.register(event.getDispatcher(), event.getBuildContext(), event.getCommandSelection());
+     }
+-}
+\ No newline at end of file
++}
 diff --git a/neoforge/src/main/resources/data/minecraft/structure/explicitseednormalgametest.dynamicdimensionsgametest.empty.nbt b/neoforge/src/main/resources/data/minecraft/structure/explicitseednormalgametest.dynamicdimensionsgametest.empty.nbt
 new file mode 100644
 index 0000000000000000000000000000000000000000..3a5198731430d96ab6eb2a39ca7d8947de5745dc
@@ -2067,3 +2163,17 @@ dP-OJ8XnB+VA}%);)0}|A2`|#`eVCR2001C|JlOyM
 literal 0
 HcmV?d00001
 
+diff --git a/settings.gradle.kts b/settings.gradle.kts
+index 98a5236..2c7542e 100644
+--- a/settings.gradle.kts
++++ b/settings.gradle.kts
+@@ -1,4 +1,9 @@
+ pluginManagement {
++    // Local-only feasibility override for MINECRAFT-470. It is deliberately
++    // not a publication, cache installation, or substitute for historical
++    // Mojarn 0.6.1+19 provenance.
++    includeBuild(providers.gradleProperty("mojarnSource").get())
++
+     repositories {
+         gradlePluginPortal()
+         mavenCentral()

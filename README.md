@@ -25,17 +25,20 @@ provider profiles need this input; there is no build mode that skips it.
 - **Reproducible alternative (verified, prefer this on a fresh machine):**
   `provider-patches/dynamicdimensions-reviewed-seed-close.patch` applies
   cleanly to the pristine pinned commit above and reproduces that same
-  adaptation from source — same compiled classes, confirmed by diffing a
-  from-patch build against the pinned candidate jar below. See
-  `docs/provider-source-reproducibility.md` for the exact recipe and the
-  verification performed.
+  adaptation from source, with one admission-order defect found and fixed
+  during review (see `docs/provider-source-reproducibility.md`) — so its
+  build is no longer byte-identical to the pinned candidate jar below, only
+  class-by-class equivalent apart from that fix and its own test. See
+  `docs/provider-source-reproducibility.md` for the exact recipe, the fix,
+  and the full class-comparison manifest.
 - Pinned candidate jar checksum (the current default for
-  `acceptedDynamicDimensionsJar`): SHA-256
-  `50b7b75a0751f9774a0586926a9e441512fb62fc815f992052aed9647fc3b30e`.
+  `acceptedDynamicDimensionsJar`, predating the admission-order fix above):
+  SHA-256 `50b7b75a0751f9774a0586926a9e441512fb62fc815f992052aed9647fc3b30e`.
   `reviewedDynamicDimensionsClasses` must point at the compiled-classes output
   of that exact same tree (e.g. `.../build/classes/java/main` from building
-  the jar above, or from the reproducible patch build); do not substitute an
-  arbitrary released provider build.
+  the jar above); do not substitute an arbitrary released provider build. A
+  build from the corrected patch is preferable where available — see the
+  reproducibility doc for its own (different) jar checksum.
 
 Build the fixture with:
 
