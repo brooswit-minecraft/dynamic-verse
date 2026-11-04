@@ -21,16 +21,21 @@ provider profiles need this input; there is no build mode that skips it.
   pin (`docs/local-provider-quiesce-close-adaptation.md`), on branch
   `minecraft-470-local-quiesce-close` of a disposable composite checkout, at
   commit `4b09389`, *plus* further uncommitted explicit-seed changes on top.
-  That tree has no clean, replayable commit today, so it cannot be rebuilt
-  from source alone on another machine; obtain the already-built artifact
-  from the ticket's existing coordinator/holder instead and verify it against
-  the pinned checksum below before use.
+  That tree itself has no clean, replayable commit.
+- **Reproducible alternative (verified, prefer this on a fresh machine):**
+  `provider-patches/dynamicdimensions-reviewed-seed-close.patch` applies
+  cleanly to the pristine pinned commit above and reproduces that same
+  adaptation from source — same compiled classes, confirmed by diffing a
+  from-patch build against the pinned candidate jar below. See
+  `docs/provider-source-reproducibility.md` for the exact recipe and the
+  verification performed.
 - Pinned candidate jar checksum (the current default for
   `acceptedDynamicDimensionsJar`): SHA-256
   `50b7b75a0751f9774a0586926a9e441512fb62fc815f992052aed9647fc3b30e`.
   `reviewedDynamicDimensionsClasses` must point at the compiled-classes output
   of that exact same tree (e.g. `.../build/classes/java/main` from building
-  the jar above); do not substitute an arbitrary released provider build.
+  the jar above, or from the reproducible patch build); do not substitute an
+  arbitrary released provider build.
 
 Build the fixture with:
 
