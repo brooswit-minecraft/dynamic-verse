@@ -16,11 +16,12 @@ corrected defect (below).
    `ecfbdf694d4f4c103404a77858d00c54a91b8020` (the pin already recorded in
    `docs/feasibility-provenance.md`).
 2. Apply `provider-patches/dynamicdimensions-reviewed-seed-close.patch` (SHA-256
-   `3b952a44cbd7ab6ffaaa7a4ca39b9caa6bd6bb4b43bbd00fc18cfb9963109e50`) with `git apply --binary`
+   `5d56c71b69bdd478db633cb5b54049173bccd5e41767016823e3599a19b22bef`) with `git apply --binary`
    from the checkout root. It adds the reviewed `beginQuiesceAndClose` lifecycle API
    (`QuiesceAndClose*` classes, the `MinecraftServerMixin`/`ServerLevelMixin` hooks), the
    explicit-seed API (`ExplicitSeedDimensionRegistry`, `DimensionSeedOwnership`,
-   `SeedOwnershipTable`), their own unit tests, and the admission-order correction below.
+   `SeedOwnershipTable`), their own unit tests, the admission-order correction below, and the
+   test-only save-failure injection hook (also below).
 3. `pluginManagement.includeBuild` in `settings.gradle.kts` resolves `mojarnSource` from a Gradle
    property; point it at a local `TeamGalacticraft/mojarn` checkout (`docs/feasibility-provenance.md`
    records the historical pin `beb2addf7ec99a398b6a243cdcec73f4f33f6b01`) and build offline:
@@ -54,6 +55,23 @@ close still delivers exactly one `SAVED_AND_CLOSED` terminal, and the level is t
 save/close failure to trigger quarantine and was not added here — flagged as not covered, not
 fabricated.)
 
+## Test-only save-failure injection hook (added for PR3's real-provider safe-delete fixture)
+
+Per review of PR3's safe-delete acceptance plan
+(https://github.com/brooswit-minecraft/dynamic-verse/pull/3, technical plan review): native
+acceptance for a failed provider close needs the *real* provider orchestrator to actually produce
+`FAILED_SAVE`, not a fake receipt. Added `dev.galacticraft.dynamicdimensions.impl.internal.TestOnlySaveFailureHook`,
+called from `ServerLevelSaveOperations.save(ServerLevel)` immediately before the real
+`ServerLevel.save(...)` call. It is a complete no-op unless a launch sets the system property
+`dynamicdimensions.testOnlyFailSaveForKey` to the exact dimension location of a disposable test
+target; it fires at most once per JVM (a `consumed` latch) and throws a distinct
+`TestOnlySaveFailureHook.TestOnlySaveFailure` type so a real production save failure is never
+masked as this deliberate one. No other key, and no run that never sets the property, is affected
+by this change. `QuiesceAndCloseOrchestrator.execute` already catches whatever
+`RuntimeException` the save step returns and maps it to `FAILED_SAVE` without calling
+`quarantine()` at that stage — confirmed by reading `QuiesceAndCloseOrchestrator.java` directly —
+so this hook rides the existing, already-reviewed failure path rather than adding a new one.
+
 ## Verification performed this session
 
 - `git apply --check` against a **fresh, otherwise-untouched copy** of the pinned upstream
@@ -70,17 +88,22 @@ fabricated.)
   Server log: "7 tests are now running" → "All 7 required tests passed :)" → normal save/shutdown,
   including the new `level_6` regression above. No lingering process afterward.
 - `:neoforge:build` produced `dynamicdimensions-neoforge-0.10.0+ecfbdf69-dirty.jar`, SHA-256
-  `5c7afbc7061b94ccbe3f3fa903749fc37b597c665de95a28df54f743d93de78f`. Unzipped and diffed class-by-class
-  against the previously pinned candidate (`dynamicdimensions-neoforge-0.10.0+4b09389e-dirty.candidate-51101.jar`,
-  SHA-256 `50b7b75a0751f9774a0586926a9e441512fb62fc815f992052aed9647fc3b30e`, still the default for
+  `4c4d70a90498fded6dcb8488a114597a5ed0052a8c721e888637d3e0bb29f041` (after adding the save-failure
+  hook above; the admission-order-only build was `5c7afbc7061b94ccbe3f3fa903749fc37b597c665de95a28df54f743d93de78f`,
+  still referenced by PR3's already-completed SUPERFLAT native run — that evidence is unaffected by
+  this later addition). Unzipped and diffed class-by-class against the previously pinned candidate
+  (`dynamicdimensions-neoforge-0.10.0+4b09389e-dirty.candidate-51101.jar`, SHA-256
+  `50b7b75a0751f9774a0586926a9e441512fb62fc815f992052aed9647fc3b30e`, still the default for
   `acceptedDynamicDimensionsJar`/`reviewedDynamicDimensionsClasses` in `build.gradle`):
   **the provider changed, so this is no longer byte-identical — that is expected, not a regression
   in the recipe.** Class-comparison manifest:
-  - Changed (the fix + its own test fixture, exactly as expected):
-    `dev/galacticraft/dynamicdimensions/impl/accessor/DynamicDimensionProvider.class`,
+  - Changed (the admission-order fix, the save-failure hook, and their own test fixtures, exactly
+    as expected): `dev/galacticraft/dynamicdimensions/impl/accessor/DynamicDimensionProvider.class`,
     `dev/galacticraft/dynamicdimensions/impl/DynamicDimensionRegistryImpl.class`,
     `dev/galacticraft/dynamicdimensions/impl/mixin/MinecraftServerMixin.class` (+ its `$1` anonymous
-    class), `dev/galacticraft/dynamicdimensions/impl/gametest/DynamicDimensionsGametest.class`
+    class), `dev/galacticraft/dynamicdimensions/impl/internal/ServerLevelSaveOperations.class`,
+    `dev/galacticraft/dynamicdimensions/impl/internal/TestOnlySaveFailureHook.class` (+ its nested
+    `$TestOnlySaveFailure`, new), `dev/galacticraft/dynamicdimensions/impl/gametest/DynamicDimensionsGametest.class`
     (+ its `$1`/`$GenerationEvidence`/`$GenerationGrid` nested classes — constant-pool/inner-class
     numbering shift from the added test, not independent logic changes).
   - Unchanged (byte-identical to the old candidate): every other class, including all

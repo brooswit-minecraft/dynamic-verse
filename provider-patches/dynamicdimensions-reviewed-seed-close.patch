@@ -1325,10 +1325,10 @@ index 0000000..7543a09
 +}
 diff --git a/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/internal/ServerLevelSaveOperations.java b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/internal/ServerLevelSaveOperations.java
 new file mode 100644
-index 0000000..59bf3ba
+index 0000000..c665e9b
 --- /dev/null
 +++ b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/internal/ServerLevelSaveOperations.java
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,22 @@
 +package dev.galacticraft.dynamicdimensions.impl.internal;
 +
 +import net.minecraft.server.level.ServerLevel;
@@ -1347,7 +1347,50 @@ index 0000000..59bf3ba
 +
 +    @Override
 +    public void save(ServerLevel source) {
++        TestOnlySaveFailureHook.maybeThrowBeforeSave(source);
 +        source.save(null, true, false);
++    }
++}
+diff --git a/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/internal/TestOnlySaveFailureHook.java b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/internal/TestOnlySaveFailureHook.java
+new file mode 100644
+index 0000000..6ddcc36
+--- /dev/null
++++ b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/internal/TestOnlySaveFailureHook.java
+@@ -0,0 +1,36 @@
++package dev.galacticraft.dynamicdimensions.impl.internal;
++
++import net.minecraft.server.level.ServerLevel;
++
++/**
++ * Deterministic, single-use fault injection for the forced-save boundary of
++ * {@code beginQuiesceAndClose}. Unarmed (and a complete no-op) unless a test
++ * launch profile sets the {@code dynamicdimensions.testOnlyFailSaveForKey}
++ * system property to the exact dimension location of a disposable test
++ * target; no other key, and no run without that property, is affected. It
++ * fires at most once per JVM, matching the "armed once" requirement of a
++ * single scripted failure scenario. This exists only to let a test harness
++ * observe the real {@code QuiesceAndCloseOrchestrator}/{@code
++ * QuiesceAndCloseSaveStep} produce an authentic {@code FAILED_SAVE} terminal
++ * from the real provider, rather than a fake one; it changes no release
++ * behavior and cannot be armed by anything other than that explicit property.
++ */
++public final class TestOnlySaveFailureHook {
++    private static volatile boolean consumed;
++
++    private TestOnlySaveFailureHook() { }
++
++    /** Called immediately before the real forced {@code ServerLevel.save}. */
++    public static void maybeThrowBeforeSave(ServerLevel level) {
++        String armedKey = System.getProperty("dynamicdimensions.testOnlyFailSaveForKey");
++        if (armedKey == null || armedKey.isBlank() || consumed) return;
++        if (!armedKey.equals(level.dimension().location().toString())) return;
++        consumed = true;
++        throw new TestOnlySaveFailure("dynamicdimensions test-only armed save failure for " + armedKey);
++    }
++
++    /** Distinct type so a real production save failure is never masked as this deliberate one. */
++    public static final class TestOnlySaveFailure extends RuntimeException {
++        TestOnlySaveFailure(String message) { super(message); }
 +    }
 +}
 diff --git a/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/mixin/MinecraftServerMixin.java b/common/src/main/java/dev/galacticraft/dynamicdimensions/impl/mixin/MinecraftServerMixin.java
