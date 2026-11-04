@@ -15,6 +15,18 @@ java {
     }
 }
 
+sourceSets {
+    // This run keeps the provider as an ordinary runtime mod dependency rather
+    // than a legacy-only classpath library; main still owns the fixture classes.
+    providerBridgeGameTest {
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+        // Retain the complete NeoForge/FML launch closure from main while
+        // preserving this source set's provider-only runtime dependencies.
+        runtimeClasspath += sourceSets.main.runtimeClasspath
+    }
+}
+
 neoForge {
     // Pinned to DynamicDimensions' minecraft/1.21 source declaration.
     version = "21.1.148"
@@ -36,23 +48,167 @@ neoForge {
         gameTestServer {
             type = "gameTestServer"
             gameDirectory = project.file("run/gametest")
-            // This test's explicit template namespace is minecraft for the pinned vanilla empty template.
-            // Project source scan finds no other GameTest registration, so this does not broaden this project suite.
+            // The travel fixture uses the pinned vanilla empty template; bridge fixtures register separately.
             systemProperty "neoforge.enabledGameTestNamespaces", "minecraft"
+        }
+    }
+    runs {
+        register("bridgeGameTest") {
+            type = "gameTestServer"
+            // Isolated disposable run state; do not point this at an existing world.
+            gameDirectory = layout.projectDirectory.dir("run/bridgeGameTest-controlled-pending-create-lookup-fixed")
+            // Test output carries the compiled facade cases and its main runtime
+            // dependency; the dynamicverse mod mapping below includes both outputs.
+            sourceSet = sourceSets.test
+            // Explicit template namespaces override @GameTestHolder, so include
+            // both the Dynamic Verse and vanilla-template controlled fixtures.
+            systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse,minecraft"
+        }
+        register("seededBridgeRegressionGameTest") {
+            type = "gameTestServer"
+            gameDirectory = layout.projectDirectory.dir("run/seededBridgeRegression-isolated")
+            sourceSet = sourceSets.test
+            systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
+            systemProperty "dynamicverse.seededBridgeRegression", "true"
+        }
+        // The four selected bridge regressions reference provider API types in
+        // their production bridge signatures.  Use the same reviewed runtime
+        // dependency closure as the accepted provider profiles so those types
+        // are visible to the NeoForge module classloader, not merely javac.
+        register("providerSeededBridgeRegressionGameTest") {
+            type = "gameTestServer"
+            gameDirectory = layout.projectDirectory.dir("run/providerSeededBridgeRegression-isolated")
+            sourceSet = sourceSets.providerBridgeGameTest
+            systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
+            systemProperty "dynamicverse.seededBridgeRegression", "true"
+        }
+        register("providerSeededDuplicateGameTest") {
+            type = "gameTestServer"
+            // A dedicated native root: never reuse controlled, create, or A/B evidence.
+            gameDirectory = layout.projectDirectory.dir("run/providerSeededDuplicate-native-retry")
+            sourceSet = sourceSets.providerBridgeGameTest
+            systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
+            systemProperty "dynamicverse.providerSeededDuplicateIntegration", "true"
+        }
+        register("providerBridgeGameTest") {
+            type = "gameTestServer"
+            // Reserved fresh root for the reviewed top-level-save-adapter candidate; never reuse a prior root.
+            gameDirectory = layout.projectDirectory.dir("run/providerBridgeGameTest-destination-load-integration")
+            sourceSet = sourceSets.providerBridgeGameTest
+            systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
+            systemProperty "dynamicverse.providerBridgeIntegration", "true"
+        }
+        register("providerCreateGameTest") {
+            type = "gameTestServer"
+            // Dedicated, disposable native-create fixture root. Preparation must
+            // create it only when absent and fail if it already exists.
+            gameDirectory = layout.projectDirectory.dir("run/providerCreateGameTest-native-omitted-seed-create")
+            // Reuse the reviewed provider-enabled source set, but select only
+            // the native CreateGateway integration fixture below.
+            sourceSet = sourceSets.providerBridgeGameTest
+            systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
+            systemProperty "dynamicverse.providerCreateIntegration", "true"
+        }
+        // The two processes deliberately share this root.  Phase-A's future
+        // wrapper requires it to be absent/empty; Phase-B's separate wrapper
+        // requires the retained Phase-A manifest and nonempty root.
+        register("providerSeededRestartPhaseAGameTest") {
+            type = "gameTestServer"
+            gameDirectory = layout.projectDirectory.dir("run/providerSeededRestart-native-explicit-seed")
+            sourceSet = sourceSets.providerBridgeGameTest
+            systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
+            systemProperty "dynamicverse.providerSeededRestartPhase", "A"
+        }
+        register("providerSeededRestartPhaseBGameTest") {
+            type = "gameTestServer"
+            gameDirectory = layout.projectDirectory.dir("run/providerSeededRestart-native-explicit-seed")
+            sourceSet = sourceSets.providerBridgeGameTest
+            systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
+            systemProperty "dynamicverse.providerSeededRestartPhase", "B"
+        }
+        // Ordinary server, deliberately not GameTestServer: future O1/O2
+        // validates retained level.dat/primary registry across a new JVM.
+        register("providerOrdinaryRestartO1") {
+            type = "server"
+            // The prior preparation-created empty directory is preserved as
+            // ineligible.  O1 must start from this still-absent root only
+            // after its reviewed wrapper performs the fail-if-exists mkdir.
+            gameDirectory = layout.projectDirectory.dir("run/providerOrdinaryRestart-o1o2-fresh")
+            sourceSet = sourceSets.providerBridgeGameTest
+            systemProperty "dynamicverse.providerOrdinaryRestartPhase", "O1"
+        }
+        register("providerOrdinaryRestartO2") {
+            type = "server"
+            gameDirectory = layout.projectDirectory.dir("run/providerOrdinaryRestart-o1o2-fresh")
+            sourceSet = sourceSets.providerBridgeGameTest
+            systemProperty "dynamicverse.providerOrdinaryRestartPhase", "O2"
+        }
+        // Retry-only ordinary profile.  It intentionally has independent
+        // generated inputs and a new disposable game directory, preserving
+        // the failed ordinary O1 root and every original receipt verbatim.
+        register("providerOrdinaryRestartRetryO1") {
+            type = "server"
+            gameDirectory = layout.projectDirectory.dir("run/providerOrdinaryRestart-o1o2-loopback-retry")
+            sourceSet = sourceSets.providerBridgeGameTest
+            systemProperty "dynamicverse.providerOrdinaryRestartPhase", "O1"
+        }
+        register("providerOrdinaryRestartRetryO2") {
+            type = "server"
+            gameDirectory = layout.projectDirectory.dir("run/providerOrdinaryRestart-o1o2-loopback-retry")
+            sourceSet = sourceSets.providerBridgeGameTest
+            systemProperty "dynamicverse.providerOrdinaryRestartPhase", "O2"
         }
     }
 }
 
 repositories {
     mavenCentral()
+    maven { url = "https://maven.bai.lol" }
 }
 
+def dynamicDimensionsJar = layout.projectDirectory.file("local-artifacts/dynamicdimensions-neoforge.jar")
+// Prepared restart phases select only the separately retained reviewed candidate.
+// The ordinary output and a877c555 baseline remain preserved and unselected.
+def acceptedDynamicDimensionsJar = file(findProperty("acceptedDynamicDimensionsJar") ?: "/tmp/dynamicdimensions-composite/neoforge/build/libs/dynamicdimensions-neoforge-0.10.0+4b09389e-dirty.candidate-51101.jar")
+// 4b09389 classes include the reviewed top-level save adapter; older artifacts intentionally remain untouched.
+def reviewedDynamicDimensionsClasses = file(findProperty("reviewedDynamicDimensionsClasses") ?: "/tmp/dynamicdimensions-composite/neoforge/build/classes/java/main")
+def dynamicDimensionsSha256 = "b25aefb589ae1c8635679373230d536c6c77bd21942f65d0f9765436e5046d79"
+
 dependencies {
+    // Compile against the reviewed, pinned provider API; it is never bundled or published by this fixture.
+    compileOnly files(reviewedDynamicDimensionsClasses)
+    // Controlled facade GameTests construct the production descriptor.
+    testCompileOnly files(reviewedDynamicDimensionsClasses)
+    // Plain JUnit discovery must load that descriptor's API signature. This is
+    // an ordinary test-worker classpath entry, not a NeoForge runtime mod or run source set.
+    testRuntimeOnly files(reviewedDynamicDimensionsClasses)
     // Already pinned by the NeoForge/Minecraft toolchain; needed by the no-server Brigadier JUnit harness.
     testImplementation "com.mojang:brigadier:1.3.10"
     testImplementation platform("org.junit:junit-bom:5.11.4")
     testImplementation "org.junit.jupiter:junit-jupiter"
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+    bridgeGameTestAdditionalRuntimeClasspath files(reviewedDynamicDimensionsClasses)
+    // The selected provider runtime source set exposes these as ordinary run
+    // dependencies so NeoForge discovers their mod metadata and mixins.
+    providerBridgeGameTestRuntimeOnly files(acceptedDynamicDimensionsJar)
+    providerBridgeGameTestRuntimeOnly "lol.bai:badpackets:neo-0.8.2"
+}
+
+tasks.register("verifyLocalDynamicDimensionsArtifact") {
+    group = "verification"
+    description = "Verifies the disposable pinned DynamicDimensions jar used by the feasibility probe."
+    inputs.file(dynamicDimensionsJar)
+    doLast {
+        File artifact = dynamicDimensionsJar.asFile
+        if (!artifact.isFile()) throw new GradleException("Missing local DynamicDimensions artifact: " + artifact)
+        def digest = java.security.MessageDigest.getInstance("SHA-256")
+        artifact.withInputStream { stream ->
+            byte[] buffer = new byte[8192]
+            for (int read; (read = stream.read(buffer)) != -1;) digest.update(buffer, 0, read)
+        }
+        def actual = digest.digest().collect { String.format("%02x", it) }.join()
+        if (actual != dynamicDimensionsSha256) throw new GradleException("Unexpected DynamicDimensions SHA-256: " + actual)
+    }
 }
 
 def dynamicDimensionsJar = layout.projectDirectory.file("local-artifacts/dynamicdimensions-neoforge.jar")

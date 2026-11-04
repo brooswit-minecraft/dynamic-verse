@@ -150,7 +150,13 @@ the provider capability.
 ## Current capability boundary
 
 MINECRAFT-469 v5 remains authoritative: explicit independently seeded creation
-and a verified forced-save-and-close result are unproven. No lifecycle command
-is registered here, and no fail-open fallback is permitted. Future test doubles
-may verify the nonblocking operation/lease state machine, but cannot establish
-the real DynamicDimensions capabilities.
+and a generalized failed-close/recovery protocol are unproven. The accepted
+initially-loaded normal path has verified forced save-and-close followed by
+confined copy, source restoration, and destination load. The server runtime
+starts with an empty, runtime-only managed catalog: it does not adopt existing
+world files or reconstruct READY entries after restart. A future authorized
+ownership producer must supply a verified descriptor and exact live identity
+before a verse becomes READY/travelable. Pending and quarantined entries never
+expose a live identity. Provider linkage failure remains a command-visible
+fail-closed outcome, not a fallback to test-only classes. No fail-open fallback
+is permitted; controlled tests cannot establish real provider capabilities.
