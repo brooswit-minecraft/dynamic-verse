@@ -31,6 +31,7 @@ public final class NeoForgeVerseCommands {
     private static final String DUPLICATE = "duplicate";
     private static final String CREATE = "create";
     private static final String DELETE = "delete";
+    private static final String CONFIRM = "confirm";
     private static final String LIST = "list";
     private static final String SOURCE = "source";
     private static final String NAME = "name";
@@ -155,14 +156,45 @@ public final class NeoForgeVerseCommands {
         else source.sendFailure(Component.literal("create failed: " + outcome));
     }
 
-    /** Admission only: an eligible managed verse still fails closed until safe deletion is proven. */
+    /**
+     * The bare /verse delete <name> is a non-mutating probe only; it never
+     * invokes beginConfirmedDelete and never deletes anything by itself, even
+     * when the verse is otherwise eligible. Only the explicit confirm
+     * subcommand below reaches the mutating path.
+     */
     private static LiteralArgumentBuilder<CommandSourceStack> delete(VerseLifecycleCommandService lifecycle) {
-        return Commands.literal(DELETE).then(Commands.argument(NAME, ResourceLocationArgument.id()).executes(context -> {
-            CommandSourceStack source = context.getSource();
-            VerseLifecycleCommandService.DeleteAdmission result = lifecycle.beginDelete(ownedName(context, NAME));
+        return Commands.literal(DELETE).then(Commands.argument(NAME, ResourceLocationArgument.id())
+                .executes(context -> {
+                    CommandSourceStack source = context.getSource();
+                    VerseLifecycleCommandService.DeleteAdmission result = lifecycle.beginDelete(ownedName(context, NAME));
+                    source.sendFailure(Component.literal("delete failed: " + result));
+                    return 0;
+                })
+                .then(Commands.literal(CONFIRM).executes(context -> confirmedDelete(context, lifecycle))));
+    }
+
+    private static int confirmedDelete(CommandContext<CommandSourceStack> context, VerseLifecycleCommandService lifecycle) throws CommandSyntaxException {
+        CommandSourceStack source = context.getSource();
+        String name = ownedName(context, NAME);
+        boolean[] admitted = {false};
+        java.util.List<VerseLifecycleCommandService.DeleteOutcome> early = new java.util.ArrayList<>();
+        java.util.concurrent.atomic.AtomicBoolean terminalOnce = new java.util.concurrent.atomic.AtomicBoolean();
+        VerseLifecycleCommandService.DeleteAdmission result = lifecycle.beginConfirmedDelete(name, outcome -> {
+            if (!terminalOnce.compareAndSet(false, true)) return;
+            if (admitted[0]) deleteTerminal(source, outcome); else early.add(outcome);
+        });
+        if (result != VerseLifecycleCommandService.DeleteAdmission.ADMITTED) {
             source.sendFailure(Component.literal("delete failed: " + result));
             return 0;
-        }));
+        }
+        admitted[0] = true;
+        source.sendSuccess(() -> Component.literal("delete accepted/pending"), false);
+        early.forEach(outcome -> deleteTerminal(source, outcome));
+        return 1;
+    }
+    private static void deleteTerminal(CommandSourceStack source, VerseLifecycleCommandService.DeleteOutcome outcome) {
+        if (outcome == VerseLifecycleCommandService.DeleteOutcome.DELETED) source.sendSuccess(() -> Component.literal("delete completed"), false);
+        else source.sendFailure(Component.literal("delete failed: " + outcome));
     }
 
     private static LiteralArgumentBuilder<CommandSourceStack> list(VerseLifecycleCommandService lifecycle) {

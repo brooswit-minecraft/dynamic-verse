@@ -114,6 +114,43 @@ public final class NeoForgeVerseCommandsGameTest {
         } catch (CommandSyntaxException expected) {
             helper.assertTrue(lifecycle.deleteAdmissions == 2, "foreign vanilla identifier must not reach delete admission");
         }
+
+        int confirmedBefore = lifecycle.confirmedDeleteAdmissions;
+        feedback.clear(); lifecycle.deleteAdmission = VerseLifecycleCommandService.DeleteAdmission.ERR_CONFIRMATION_REQUIRED;
+        dispatcher.execute("verse delete dynamicverse:alpha", operator);
+        helper.assertTrue(feedback.successes.equals(List.of("delete failed: ERR_CONFIRMATION_REQUIRED"))
+                        && lifecycle.confirmedDeleteAdmissions == confirmedBefore,
+                "a confirmation-required admission must not itself invoke confirmed delete");
+
+        expectRejected(() -> dispatcher.execute("verse delete dynamicverse:alpha confirm", denied),
+                CommandSyntaxException.BUILT_IN_EXCEPTIONS.dispatcherUnknownCommand(), "confirm permission denial");
+        helper.assertTrue(lifecycle.confirmedDeleteAdmissions == confirmedBefore, "permission denial must not admit confirmed delete work");
+
+        feedback.clear(); lifecycle.confirmedDeleteAdmission = VerseLifecycleCommandService.DeleteAdmission.ERR_VERSE_BUSY;
+        dispatcher.execute("verse delete dynamicverse:alpha confirm", operator);
+        helper.assertTrue(lifecycle.confirmedDeleteName.equals("dynamicverse:alpha")
+                        && lifecycle.confirmedDeleteAdmissions == confirmedBefore + 1
+                        && feedback.successes.equals(List.of("delete failed: ERR_VERSE_BUSY")),
+                "a refused confirmed admission must fail closed without a pending claim");
+
+        feedback.clear(); lifecycle.confirmedDeleteAdmission = VerseLifecycleCommandService.DeleteAdmission.ADMITTED;
+        dispatcher.execute("verse delete dynamicverse:alpha confirm", operator);
+        helper.assertTrue(feedback.successes.equals(List.of("delete accepted/pending"))
+                        && lifecycle.confirmedDeleteAdmissions == confirmedBefore + 2,
+                "confirmed admission must not claim terminal success, and confirm reaches the service exactly once per invocation");
+        lifecycle.completeDelete(VerseLifecycleCommandService.DeleteOutcome.DELETED);
+        lifecycle.completeDelete(VerseLifecycleCommandService.DeleteOutcome.QUARANTINED);
+        helper.assertTrue(feedback.successes.equals(List.of("delete accepted/pending", "delete completed")),
+                "delete terminal feedback must be exactly once");
+
+        feedback.clear();
+        dispatcher.execute("verse delete orphan confirm", operator);
+        helper.assertTrue(lifecycle.confirmedDeleteName.equals("orphan")
+                        && feedback.successes.equals(List.of("delete accepted/pending")),
+                "bare owned names must reach the same confirmed-delete service unchanged");
+        lifecycle.completeDelete(VerseLifecycleCommandService.DeleteOutcome.QUARANTINED);
+        helper.assertTrue(feedback.successes.equals(List.of("delete accepted/pending", "delete failed: QUARANTINED")),
+                "a quarantined confirmed terminal reports failure truthfully");
         helper.succeed();
     }
 
@@ -239,6 +276,142 @@ public final class NeoForgeVerseCommandsGameTest {
                 "fail-closed delete admission must leave the READY catalog entry untouched");
         runtime.close();
         helper.succeed();
+    }
+
+    /**
+     * Production-wiring proof requested in review of PR3: not the boolean
+     * fake-journal SafeDeleteOperationTest, but ServerVerseRuntime's actual
+     * delete journal and restart reconciliation, through the real
+     * VerseOperationGate.DeleteReservation and ConfinedDimensionDeleter. A
+     * successful confirmed delete removes only its own READY/intent, leaving
+     * an unrelated owned world untouched; an admitted-but-never-terminated
+     * ("interrupted") delete keeps its durable PENDING intent, so a fresh
+     * runtime recovering the same persisted store quarantines it rather than
+     * ever reloading its stale READY metadata, while the unrelated world
+     * still replays normally.
+     */
+    @GameTest(templateNamespace = "minecraft", template = "bastion/mobs/empty")
+    public static void runtimeConfirmedDeleteRemovesOnlyItsOwnMetadataAndInterruptedDeleteStaysQuarantinedAfterRestart(GameTestHelper helper) throws Exception {
+        net.minecraft.server.level.ServerLevel level = helper.getLevel();
+        java.util.Set<String> createdIds = new java.util.HashSet<>();
+        ServerVerseRuntime.CreateGateway create = new ServerVerseRuntime.CreateGateway() {
+            @Override public boolean canCreate(ResourceLocation id) { return true; }
+            @Override public boolean storageExists(OwnedDimensionDescriptor descriptor) { return false; }
+            @Override public net.minecraft.server.level.ServerLevel create(OwnedDimensionDescriptor descriptor) {
+                createdIds.add(descriptor.id()); return level;
+            }
+            @Override public boolean hasStoredData(OwnedDimensionDescriptor descriptor) { return createdIds.contains(descriptor.id()); }
+            @Override public net.minecraft.server.level.ServerLevel reload(OwnedDimensionDescriptor descriptor) {
+                return createdIds.contains(descriptor.id()) ? level : null;
+            }
+        };
+        ServerVerseRuntime.LevelLookup lookup = descriptor -> createdIds.contains(descriptor.id()) ? evidence(descriptor, helper) : null;
+        InMemoryManagedVerseStateStore state = new InMemoryManagedVerseStateStore();
+        java.nio.file.Path deleteRoot = java.nio.file.Files.createTempDirectory("m470-safe-delete-reconciled-test");
+        try {
+            java.nio.file.Files.createDirectories(deleteRoot.resolve("dimensions/dynamicverse/delete-a"));
+            java.nio.file.Files.createDirectories(deleteRoot.resolve("dimensions/dynamicverse/delete-c"));
+            AtomicReference<String> matchingKey = new AtomicReference<>();
+            AtomicReference<java.util.function.Consumer<io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ClosedDimensionReceipt>> pendingTerminal = new AtomicReference<>();
+            ServerVerseRuntime.DeleteGateway deletes = new ServerVerseRuntime.DeleteGateway() {
+                @Override public java.nio.file.Path root() { return deleteRoot; }
+                @Override public boolean matchesCurrent(io.github.brooswitminecraft.dynamicverse.lifecycle.delete.SafeDeleteOperation.Target target) {
+                    return target.key().equals(matchingKey.get());
+                }
+                @Override public boolean hasPlayers(io.github.brooswitminecraft.dynamicverse.lifecycle.delete.SafeDeleteOperation.Target target) { return false; }
+                @Override public boolean isClosedAndAbsent(io.github.brooswitminecraft.dynamicverse.lifecycle.delete.SafeDeleteOperation.Target target) { return true; }
+                @Override public boolean beginClose(io.github.brooswitminecraft.dynamicverse.lifecycle.delete.SafeDeleteOperation.Target target,
+                        java.util.function.Consumer<io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ClosedDimensionReceipt> terminal) {
+                    pendingTerminal.set(terminal); return true;
+                }
+            };
+            ServerVerseRuntime.BridgeGatewayFactory bridgeFactory = (catalog, gate) -> new ServerVerseRuntime.BridgeGateway() {
+                @Override public void registerReady(String key, String identity, long generation) { gate.publishReady(key, identity, generation); }
+                @Override public ProviderDuplicationBridge.BridgeAdmission beginDuplicate(String s, String d, java.util.function.Consumer<ProviderDuplicationBridge.BridgeOutcome> c) { return ProviderDuplicationBridge.BridgeAdmission.REJECTED_NO_EFFECT; }
+            };
+            ServerVerseRuntime runtime = ServerVerseRuntime.controlled(level.getServer(), lookup, bridgeFactory, create, state, deletes);
+
+            String a = createReadyOwnedId(runtime, createdIds, helper, "delete-a");
+            String b = createReadyOwnedId(runtime, createdIds, helper, "delete-b");
+            String c = createReadyOwnedId(runtime, createdIds, helper, "delete-c");
+
+            // A: a full, successfully-admitted confirmed delete through the real journal/reservation/filesystem removal.
+            matchingKey.set(a);
+            AtomicInteger aCompletions = new AtomicInteger();
+            AtomicReference<VerseLifecycleCommandService.DeleteOutcome> aOutcome = new AtomicReference<>();
+            helper.assertTrue(runtime.beginConfirmedDelete(a, outcome -> { aCompletions.incrementAndGet(); aOutcome.set(outcome); })
+                            == VerseLifecycleCommandService.DeleteAdmission.ADMITTED,
+                    "an eligible owned verse with a delete gateway is admitted for confirmed delete");
+            helper.assertTrue(state.read().operations().values().stream().anyMatch(op -> op.destination().equals(a)),
+                    "the admitted delete persists its own durable intent before any filesystem mutation");
+            pendingTerminal.get().accept(new io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ClosedDimensionReceipt(
+                    a, 0, true, io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ClosedDimensionStatus.SAVED_AND_CLOSED, false));
+            runtime.tick();
+            helper.assertTrue(aCompletions.get() == 1 && aOutcome.get() == VerseLifecycleCommandService.DeleteOutcome.DELETED,
+                    "a verified exact close/absence evidence completes the confirmed delete exactly once");
+            helper.assertTrue(!java.nio.file.Files.exists(deleteRoot.resolve("dimensions/dynamicverse/delete-a")),
+                    "a successful confirmed delete actually removes its own confined storage");
+            helper.assertTrue(runtime.listManaged().stream().noneMatch(item -> item.name().equals(a)),
+                    "a successful confirmed delete removes its own catalog entry");
+            helper.assertTrue(state.read().ready().values().stream().noneMatch(ready -> ready.id().equals(a))
+                            && state.read().operations().values().stream().noneMatch(op -> op.destination().equals(a)),
+                    "a successful confirmed delete removes only its own persisted READY/intent metadata");
+            helper.assertTrue(runtime.listManaged().stream().anyMatch(item -> item.name().equals(b) && item.state() == ManagedVerseListing.State.READY)
+                            && state.read().ready().containsKey(b),
+                    "an unrelated owned world's catalog/persisted metadata is untouched by another world's confirmed delete");
+
+            // C: admitted (durable intent persisted) but never delivered a terminal -- an interrupted delete.
+            matchingKey.set(c);
+            AtomicInteger cCompletions = new AtomicInteger();
+            helper.assertTrue(runtime.beginConfirmedDelete(c, ignored -> cCompletions.incrementAndGet())
+                            == VerseLifecycleCommandService.DeleteAdmission.ADMITTED,
+                    "a second eligible owned verse is independently admitted for confirmed delete");
+            helper.assertTrue(state.read().operations().values().stream().anyMatch(op -> op.destination().equals(c)
+                            && op.phase() == io.github.brooswitminecraft.dynamicverse.lifecycle.ManagedVerseStateStore.OperationPhase.PENDING),
+                    "the interrupted delete's durable intent remains PENDING with no terminal delivered");
+            helper.assertTrue(cCompletions.get() == 0, "no terminal was delivered before the simulated crash");
+            helper.assertTrue(java.nio.file.Files.exists(deleteRoot.resolve("dimensions/dynamicverse/delete-c")),
+                    "an interrupted delete never reaches filesystem removal");
+
+            // Simulate restart: a fresh runtime recovers the same persisted store.
+            ServerVerseRuntime restarted = ServerVerseRuntime.controlled(level.getServer(), lookup, bridgeFactory, create, state, deletes);
+            helper.assertTrue(restarted.listManaged().stream().anyMatch(item -> item.name().equals(c)
+                            && item.state() == ManagedVerseListing.State.QUARANTINED),
+                    "a fresh runtime recovering the same persisted store quarantines the interrupted delete's stale key, never reloading it as READY");
+            VerseReservationSnapshot[] cRead = new VerseReservationSnapshot[1];
+            restarted.beginAcquireReadyRead(c, result -> cRead[0] = result); restarted.tick();
+            helper.assertTrue(cRead[0].lease().isEmpty(), "the quarantined interrupted-delete key is never readable after restart");
+            helper.assertTrue(restarted.listManaged().stream().anyMatch(item -> item.name().equals(b) && item.state() == ManagedVerseListing.State.READY),
+                    "the unrelated owned world still replays normally as READY after restart");
+            VerseReservationSnapshot[] bRead = new VerseReservationSnapshot[1];
+            restarted.beginAcquireReadyRead(b, result -> bRead[0] = result); restarted.tick();
+            helper.assertTrue(bRead[0].lease().isPresent(), "the unrelated owned world remains readable after restart");
+            bRead[0].lease().get().close();
+
+            runtime.close(); restarted.close();
+        } finally {
+            deleteDirectoryRecursively(deleteRoot);
+        }
+        helper.succeed();
+    }
+    private static String createReadyOwnedId(ServerVerseRuntime runtime, java.util.Set<String> createdIds, GameTestHelper helper, String name) {
+        AtomicInteger terminal = new AtomicInteger();
+        helper.assertTrue(runtime.beginCreate(name, VerseLifecycleCommandService.CreateType.NORMAL, java.util.OptionalLong.empty(), outcome -> {
+            helper.assertTrue(outcome == VerseLifecycleCommandService.CreateOutcome.READY, "controlled producer must publish READY");
+            terminal.incrementAndGet();
+        }) == VerseLifecycleCommandService.CreateAdmission.ADMITTED, "controlled producer create admitted for " + name);
+        runtime.tick();
+        String ownedId = "dynamicverse:" + name;
+        helper.assertTrue(createdIds.contains(ownedId) && terminal.get() == 1, "controlled producer exposes the exact created descriptor once for " + name);
+        return ownedId;
+    }
+    private static void deleteDirectoryRecursively(java.nio.file.Path root) throws java.io.IOException {
+        if (!java.nio.file.Files.exists(root)) return;
+        try (var paths = java.nio.file.Files.walk(root)) {
+            paths.sorted(java.util.Comparator.reverseOrder()).forEach(path -> {
+                try { java.nio.file.Files.delete(path); } catch (java.io.IOException ignored) { }
+            });
+        }
     }
 
     /**
@@ -613,6 +786,10 @@ public final class NeoForgeVerseCommandsGameTest {
         private String destination;
         private String deleteName;
         private DeleteAdmission deleteAdmission = DeleteAdmission.ERR_SAFE_DELETE_UNAVAILABLE;
+        private int confirmedDeleteAdmissions;
+        private String confirmedDeleteName;
+        private DeleteAdmission confirmedDeleteAdmission = DeleteAdmission.ADMITTED;
+        private java.util.function.Consumer<DeleteOutcome> deleteCompletion;
         @Override public DuplicateAdmission beginDuplicate(String source, String destination, java.util.function.Consumer<DuplicateOutcome> callback) {
             admissions++; this.source = source; this.destination = destination; completion = callback; return admission;
         }
@@ -623,6 +800,10 @@ public final class NeoForgeVerseCommandsGameTest {
         @Override public DeleteAdmission beginDelete(String name) {
             deleteAdmissions++; deleteName = name; return deleteAdmission;
         }
+        @Override public DeleteAdmission beginConfirmedDelete(String name, java.util.function.Consumer<DeleteOutcome> callback) {
+            confirmedDeleteAdmissions++; confirmedDeleteName = name; deleteCompletion = callback; return confirmedDeleteAdmission;
+        }
+        void completeDelete(DeleteOutcome outcome) { deleteCompletion.accept(outcome); }
         @Override public List<ManagedVerseListing> listManaged() {
             return List.of(new ManagedVerseListing("dynamicverse:alpha", ManagedVerseListing.State.READY, java.util.Optional.of("identity"), java.util.Optional.of(1L)),
                     new ManagedVerseListing("dynamicverse:pending", ManagedVerseListing.State.PENDING, java.util.Optional.empty(), java.util.Optional.empty()));
