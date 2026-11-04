@@ -197,17 +197,22 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
                 if (!closed) admitted.terminal(outcome);
             });
             if (admission == ProviderDuplicationBridge.BridgeAdmission.ADMITTED) return DuplicateAdmission.ADMITTED;
-            admittedCompletions.remove(admitted); persist(state.read().withoutOperation(operationId));
+            admittedCompletions.remove(admitted);
             if (admission == ProviderDuplicationBridge.BridgeAdmission.REJECTED_NO_EFFECT) {
                 // Known to have had no provider-side effect: release the exact
-                // provisional destination reservation so the same name is
-                // immediately reusable once the rejection cause clears.
+                // provisional destination reservation, including its persisted
+                // operation intent, so the same name is immediately reusable
+                // (even across a restart) once the rejection cause clears.
+                persist(state.read().withoutOperation(operationId));
                 supportedProvenance.remove(destination);
                 catalog.unregister(destination);
             }
             // REJECTED_UNCERTAIN leaves the provisional catalog/provenance
-            // reservation in place: an unverified provider invocation must not
-            // be unregistered and silently handed to a new, unrelated world.
+            // reservation, and its persisted operation intent, in place: an
+            // unverified provider invocation must stay durably excluded
+            // (restart recovery reconstructs exclusions from persisted intents)
+            // rather than being unregistered and silently handed to a new,
+            // unrelated world.
             return DuplicateAdmission.ERR_VERSE_BUSY;
         } catch (ClosedDimensionCopyException e) { admittedCompletions.remove(admitted); return DuplicateAdmission.ERR_VERSE_NOT_FOUND; }
     }

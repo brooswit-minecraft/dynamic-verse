@@ -18,6 +18,7 @@ import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ProviderDuplicati
 import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ClosedDimensionCopyException;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.OwnedDimensionDescriptor;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ReadyVerseLeaseFixtures;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.InMemoryManagedVerseStateStore;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.core.registries.Registries;
@@ -244,12 +245,15 @@ public final class NeoForgeVerseCommandsGameTest {
      * Compiled-only proof of the reviewed P2 defect: a duplicate rejection known
      * to have no provider-side effect (e.g. the gate refusing a busy source
      * before the provider is ever invoked) must fully release its provisional
-     * destination reservation, while a rejection reached only after an
-     * uncertain provider invocation must preserve it as quarantine.
+     * destination reservation — including the persisted operation intent, so a
+     * restart does not wrongly exclude it either — while a rejection reached
+     * only after an uncertain provider invocation must preserve it as durable
+     * quarantine that survives a restart over the same persisted store.
      */
     @GameTest(templateNamespace = "minecraft", template = "bastion/mobs/empty")
     public static void runtimeReleasesNoEffectDuplicateReservationButPreservesUncertainQuarantine(GameTestHelper helper) {
         ProducedCreate create = new ProducedCreate(helper);
+        InMemoryManagedVerseStateStore state = new InMemoryManagedVerseStateStore();
         AtomicReference<ProviderDuplicationBridge.BridgeAdmission> nextAdmission =
                 new AtomicReference<>(ProviderDuplicationBridge.BridgeAdmission.REJECTED_NO_EFFECT);
         AtomicInteger bridgeCalls = new AtomicInteger();
@@ -262,21 +266,28 @@ public final class NeoForgeVerseCommandsGameTest {
                         bridgeCalls.incrementAndGet();
                         return nextAdmission.get();
                     }
-                }, create);
+                }, create, state);
         OwnedDimensionDescriptor source = createReady(runtime, create, helper, "busy-retry-source");
 
-        helper.assertTrue(runtime.beginDuplicate(source.id(), "dynamicverse:busy-retry-destination", ignored -> { })
+        helper.assertTrue(runtime.beginDuplicate(source.id(), "dynamicverse:no-effect-destination", ignored -> { })
                         == VerseLifecycleCommandService.DuplicateAdmission.ERR_VERSE_BUSY,
                 "a no-effect rejection is reported as busy");
         int bridgeCallsAfterFirstRejection = bridgeCalls.get();
-        helper.assertTrue(runtime.listManaged().stream().noneMatch(item -> item.name().equals("dynamicverse:busy-retry-destination")),
+        helper.assertTrue(runtime.listManaged().stream().noneMatch(item -> item.name().equals("dynamicverse:no-effect-destination")),
                 "a no-effect rejection releases the provisional destination reservation");
+        helper.assertTrue(state.read().operations().values().stream().noneMatch(op -> op.destination().equals("dynamicverse:no-effect-destination")),
+                "a no-effect rejection also releases the persisted operation intent, not only the in-memory reservation");
 
         nextAdmission.set(ProviderDuplicationBridge.BridgeAdmission.ADMITTED);
-        helper.assertTrue(runtime.beginDuplicate(source.id(), "dynamicverse:busy-retry-destination", ignored -> { })
+        helper.assertTrue(runtime.beginDuplicate(source.id(), "dynamicverse:no-effect-destination", ignored -> { })
                         == VerseLifecycleCommandService.DuplicateAdmission.ADMITTED,
                 "the same destination name is admitted again once the no-effect rejection cause clears");
         helper.assertTrue(bridgeCalls.get() == bridgeCallsAfterFirstRejection + 1, "the retry reaches the bridge exactly once");
+
+        nextAdmission.set(ProviderDuplicationBridge.BridgeAdmission.REJECTED_NO_EFFECT);
+        helper.assertTrue(runtime.beginDuplicate(source.id(), "dynamicverse:no-effect-restart-destination", ignored -> { })
+                        == VerseLifecycleCommandService.DuplicateAdmission.ERR_VERSE_BUSY,
+                "a second, distinct no-effect rejection is also reported as busy");
 
         nextAdmission.set(ProviderDuplicationBridge.BridgeAdmission.REJECTED_UNCERTAIN);
         helper.assertTrue(runtime.beginDuplicate(source.id(), "dynamicverse:uncertain-destination", ignored -> { })
@@ -284,11 +295,21 @@ public final class NeoForgeVerseCommandsGameTest {
                 "an uncertain-provider rejection is also reported as busy");
         helper.assertTrue(runtime.listManaged().stream().anyMatch(item -> item.name().equals("dynamicverse:uncertain-destination")),
                 "an uncertain-provider rejection preserves the provisional destination reservation as quarantine");
+        helper.assertTrue(state.read().operations().values().stream().anyMatch(op -> op.destination().equals("dynamicverse:uncertain-destination")),
+                "an uncertain-provider rejection keeps its persisted operation intent durable, unlike a no-effect rejection");
         nextAdmission.set(ProviderDuplicationBridge.BridgeAdmission.ADMITTED);
         helper.assertTrue(runtime.beginDuplicate(source.id(), "dynamicverse:uncertain-destination", ignored -> { })
                         == VerseLifecycleCommandService.DuplicateAdmission.ERR_VERSE_ALREADY_EXISTS,
-                "a quarantined uncertain destination cannot be silently reused");
+                "a quarantined uncertain destination cannot be silently reused in the same runtime");
         runtime.close();
+
+        ServerVerseRuntime restarted = ServerVerseRuntime.controlled(helper.getLevel().getServer(), descriptor -> null, null, null, state);
+        helper.assertTrue(restarted.listManaged().stream().anyMatch(item -> item.name().equals("dynamicverse:uncertain-destination")
+                        && item.state() == ManagedVerseListing.State.QUARANTINED),
+                "a fresh runtime recovering the same persisted store still excludes the uncertain-provider destination after restart");
+        helper.assertTrue(restarted.listManaged().stream().noneMatch(item -> item.name().equals("dynamicverse:no-effect-restart-destination")),
+                "a fresh runtime recovering the same persisted store never excludes a released no-effect destination");
+        restarted.close();
         helper.succeed();
     }
 
