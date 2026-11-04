@@ -170,7 +170,7 @@ public final class ProviderCreateIntegrationGameTest {
     }
 
     /** Public semantic comparison: FlatLayerInfo has no value equality in the pinned runtime. */
-    private static boolean sameDefaultSuperflat(FlatLevelGeneratorSettings actual, FlatLevelGeneratorSettings expected) {
+    static boolean sameDefaultSuperflat(FlatLevelGeneratorSettings actual, FlatLevelGeneratorSettings expected) {
         if (!actual.getBiome().equals(expected.getBiome()) || !sameLayers(actual.getLayersInfo(), expected.getLayersInfo())) return false;
         if (!holderKeys(actual.structureOverrides()).equals(holderKeys(expected.structureOverrides()))) return false;
         // adjustGenerationSettings exposes the default decoration/lake result without

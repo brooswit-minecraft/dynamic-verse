@@ -21,6 +21,7 @@ import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ProviderDuplicati
 import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.SeededBridgeRegressionGameTest;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ProviderBridgeIntegrationGameTest;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderCreateIntegrationGameTest;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderExplicitSuperflatGameTest;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderSeededDuplicateIntegrationGameTest;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderSeededRestartPhaseAGameTest;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderSeededRestartPhaseBGameTest;
@@ -55,7 +56,7 @@ public final class DynamicVerse {
             case "A" -> ProviderSeededRestartPhaseAGameTest.class;
             case "B" -> ProviderSeededRestartPhaseBGameTest.class;
             default -> selection.providerCreateIntegration
-                    ? ProviderCreateIntegrationGameTest.class
+                    ? (Boolean.getBoolean("dynamicverse.explicitSuperflat") ? ProviderExplicitSuperflatGameTest.class : ProviderCreateIntegrationGameTest.class)
                     : selection.providerSeededDuplicateIntegration
                             ? ProviderSeededDuplicateIntegrationGameTest.class
                     : selection.providerBridgeIntegration
@@ -123,6 +124,9 @@ public final class DynamicVerse {
         }
         @Override public CreateAdmission beginCreate(String name, CreateType type, OptionalLong seed, Consumer<CreateOutcome> completion) {
             return runtime == null ? CreateAdmission.ERR_PROVIDER_UNAVAILABLE : runtime.beginCreate(name, type, seed, completion);
+        }
+        @Override public DeleteAdmission beginConfirmedDelete(String name, java.util.function.Consumer<DeleteOutcome> completion) {
+            return runtime == null ? DeleteAdmission.ERR_VERSE_NOT_MANAGED : runtime.beginConfirmedDelete(name, completion);
         }
         @Override public DeleteAdmission beginDelete(String name) {
             return runtime == null ? DeleteAdmission.ERR_VERSE_NOT_MANAGED : runtime.beginDelete(name);

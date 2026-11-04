@@ -53,6 +53,12 @@ neoForge {
         }
     }
     runs {
+        register("reviewGameTest") {
+            type = "gameTestServer"
+            gameDirectory = layout.projectDirectory.dir("run/m470-review-disposable-20261102")
+            sourceSet = sourceSets.test
+            systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse_review"
+        }
         register("bridgeGameTest") {
             type = "gameTestServer"
             // Isolated disposable run state; do not point this at an existing world.
@@ -97,6 +103,14 @@ neoForge {
             sourceSet = sourceSets.providerBridgeGameTest
             systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
             systemProperty "dynamicverse.providerBridgeIntegration", "true"
+        }
+        register("providerExplicitSuperflatGameTest") {
+            type = "gameTestServer"
+            gameDirectory = layout.projectDirectory.dir("run/m470-explicit-superflat-disposable-corrected-20261102")
+            sourceSet = sourceSets.providerBridgeGameTest
+            systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
+            systemProperty "dynamicverse.providerCreateIntegration", "true"
+            systemProperty "dynamicverse.explicitSuperflat", "true"
         }
         register("providerCreateGameTest") {
             type = "gameTestServer"
@@ -188,6 +202,7 @@ dependencies {
     testImplementation "org.junit.jupiter:junit-jupiter"
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
     bridgeGameTestAdditionalRuntimeClasspath files(reviewedDynamicDimensionsClasses)
+    reviewGameTestAdditionalRuntimeClasspath files(reviewedDynamicDimensionsClasses)
     // The selected provider runtime source set exposes these as ordinary run
     // dependencies so NeoForge discovers their mod metadata and mixins.
     providerBridgeGameTestRuntimeOnly files(acceptedDynamicDimensionsJar)
