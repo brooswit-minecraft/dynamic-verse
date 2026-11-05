@@ -22,6 +22,7 @@ import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.SeededBridgeRegre
 import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ProviderBridgeIntegrationGameTest;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderCreateIntegrationGameTest;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderExplicitSuperflatGameTest;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderSafeDeleteScenariosGameTest;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderSeededDuplicateIntegrationGameTest;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderSeededRestartPhaseAGameTest;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderSeededRestartPhaseBGameTest;
@@ -54,7 +55,9 @@ public final class DynamicVerse {
         FixtureSelection selection = fixtureSelection();
         if (selection.ordinaryPhase != null || selection.safeDeleteCrashPhase != null) return; // ordinary server profiles, never a GameTest selection.
         String restartPhase = selection.seededRestartPhase;
-        event.register(selection.seededBridgeRegression ? SeededBridgeRegressionGameTest.class : switch (restartPhase) {
+        event.register(selection.seededBridgeRegression ? SeededBridgeRegressionGameTest.class
+                : selection.providerSafeDeleteScenarios ? ProviderSafeDeleteScenariosGameTest.class
+                : switch (restartPhase) {
             case "A" -> ProviderSeededRestartPhaseAGameTest.class;
             case "B" -> ProviderSeededRestartPhaseBGameTest.class;
             default -> selection.providerCreateIntegration
@@ -110,18 +113,20 @@ public final class DynamicVerse {
         boolean providerCreate = Boolean.getBoolean("dynamicverse.providerCreateIntegration");
         boolean providerDuplicate = Boolean.getBoolean("dynamicverse.providerSeededDuplicateIntegration");
         boolean providerBridge = Boolean.getBoolean("dynamicverse.providerBridgeIntegration");
+        boolean providerSafeDeleteScenarios = Boolean.getBoolean("dynamicverse.providerSafeDeleteScenarios");
         if (!seededPhase.isEmpty() && !seededPhase.equals("A") && !seededPhase.equals("B")) throw new IllegalStateException("unsupported seeded restart phase");
         if (!ordinaryPhase.isEmpty() && !ordinaryPhase.equals("O1") && !ordinaryPhase.equals("O2")) throw new IllegalStateException("unsupported ordinary restart phase");
         if (!safeDeleteCrashPhase.isEmpty() && !safeDeleteCrashPhase.equals("A") && !safeDeleteCrashPhase.equals("B")) throw new IllegalStateException("unsupported safe-delete crash phase");
         int selected = (seededPhase.isEmpty() ? 0 : 1) + (ordinaryPhase.isEmpty() ? 0 : 1) + (seededBridge ? 1 : 0)
-                + (providerCreate ? 1 : 0) + (providerDuplicate ? 1 : 0) + (providerBridge ? 1 : 0) + (safeDeleteCrashPhase.isEmpty() ? 0 : 1);
+                + (providerCreate ? 1 : 0) + (providerDuplicate ? 1 : 0) + (providerBridge ? 1 : 0) + (safeDeleteCrashPhase.isEmpty() ? 0 : 1)
+                + (providerSafeDeleteScenarios ? 1 : 0);
         if (selected > 1) throw new IllegalStateException("mixed Dynamic Verse fixture selectors are refused");
         return new FixtureSelection(seededPhase, ordinaryPhase.isEmpty() ? null : ordinaryPhase, seededBridge, providerCreate, providerDuplicate, providerBridge,
-                safeDeleteCrashPhase.isEmpty() ? null : safeDeleteCrashPhase);
+                safeDeleteCrashPhase.isEmpty() ? null : safeDeleteCrashPhase, providerSafeDeleteScenarios);
     }
     private record FixtureSelection(String seededRestartPhase, String ordinaryPhase, boolean seededBridgeRegression,
                                     boolean providerCreateIntegration, boolean providerSeededDuplicateIntegration,
-                                    boolean providerBridgeIntegration, String safeDeleteCrashPhase) {
+                                    boolean providerBridgeIntegration, String safeDeleteCrashPhase, boolean providerSafeDeleteScenarios) {
         boolean ownsRuntime() { return seededRestartPhase.equals("A") || seededRestartPhase.equals("B") || providerSeededDuplicateIntegration; }
     }
 

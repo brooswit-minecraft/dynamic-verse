@@ -10,6 +10,112 @@ plan into the actual narrow source/runner it specifies, for review **before
 any native execution**. Nothing in this document, or in the source it
 describes, has been run.
 
+## Round 3, third incremental review (Jira comment 51591): the retained test harness, and the execution-root/preparation-root separation
+
+Confirmed the 51588 fixes against `804d6d3`. Asked for two more concrete
+items, both done here, plus the separately-authorized in-process fixture
+below:
+
+- **The 10-case sourced-wrapper test harness is now committed**, at
+  `scripts/testProviderSafeDeleteCrashWrapperOffline.sh` (it previously
+  only existed as a scratch file, so the 10/10 claim could not be
+  independently inspected or reproduced from the tree). It gained 4 more
+  cases for this round's new `root_is_pristine_or_absent` (below), for 14
+  total. **Run: 14/14 passed.**
+- **The execution-root/preparation-root separation.** Regenerating these
+  launch scripts for review -- ordinary preparation work, done every
+  round -- makes ModDev's own `prepare*Run` task create the configured
+  `gameDirectory` as a side effect; confirmed empirically it creates
+  *exactly* the bare, empty directory and nothing else. Since the wrapper
+  previously hardcoded the SAME path ModDev's run registration names,
+  every round of ordinary script regeneration would have left the
+  wrapper's own "requires an absent root" guard permanently tripped before
+  a real run could ever begin -- and renaming to a different fixed path
+  doesn't help, since ModDev touches whatever path `gameDirectory` names,
+  confirmed by regenerating against a second, differently-named path and
+  observing the same empty directory appear. Fixed two ways together:
+  - `build.gradle`'s `gameDirectory` (and the matching
+    `providerSafeDeleteCrashExpectedGameRoot` system property, kept
+    derived from the exact same value so they can never drift apart) is
+    now overridable via `-PsafeDeleteCrashGameDirectory=<path>`, defaulting
+    to the existing stable preparation path. The wrapper itself now
+    requires `DYNAMICVERSE_SAFE_DELETE_CRASH_EXECUTION_ROOT` to be set
+    explicitly (sourcing for tests is unaffected: the wrapper's own
+    `root` defaults to empty under `set -u`, and only `main()` -- never
+    invoked by sourcing -- requires it non-empty), so a real run is never
+    silently defaulted onto the same path every preparation round uses.
+  - The actual mechanical fix: `root_is_pristine_or_absent` relaxes the
+    absent-root check to also accept a directory that is absent **or**
+    verified to have zero entries -- the exact state ModDev's prepare
+    task leaves and nothing more. A root with any real content (an
+    `eula.txt`, a marker, anything) is still refused exactly as before;
+    nothing is deleted, reused, or weakened. Validated entirely offline
+    (no native run): all four cases -- absent, genuinely empty, real
+    content, symlinked -- behave correctly against synthetic directories,
+    and the two *real* empty directories left over from this review's own
+    script regenerations (the stable default and a differently-named
+    probe) are both now correctly accepted.
+
+## Prepared (not executed): the separate in-process real-provider safe-delete fixture
+
+Authorized for preparation across 51562/51571/51577/51588 and explicitly
+no longer gated on further status exchange (51588: "It need not wait
+behind additional status exchanges"). `ProviderSafeDeleteScenariosGameTest`
+(`src/main/java/.../lifecycle/`, registered the same way
+`ProviderExplicitSuperflatGameTest` already is, via `DynamicVerse`'s
+existing dispatch switch and a new `dynamicverse.providerSafeDeleteScenarios`
+system property/Gradle run `providerSafeDeleteScenariosGameTest`) covers,
+each in its own `@GameTest` method and each calling
+`ServerVerseRuntime.create(server)` for real production wiring -- the
+real `ManagedVerseStateFileStore` and real `DeleteGateway`/provider
+bridge, not the `InMemoryManagedVerseStateStore`/fake gateway the
+existing `NeoForgeVerseCommandsGameTest` confirmed-delete test uses:
+
+- **Success**: a confirmed delete against a real, READY, unobstructed
+  verse completes as `DeleteOutcome.DELETED`.
+- **Occupied-refusal**: a real NeoForge `FakePlayer` (a genuine
+  `ServerPlayer`, not a test double for the delete path) added to the
+  target's own loaded level via `ServerLevel.addNewPlayer` makes
+  `DeleteGateway.minecraft()`'s real `hasPlayers` check true, and
+  `beginConfirmedDelete` is refused `ERR_PLAYERS_PRESENT` -- confirmed by
+  reading `ServerVerseRuntime.beginConfirmedDelete`'s exact source, not
+  assumed.
+- **Busy-refusal**: read `VerseOperationGate`'s actual source directly
+  (not taken on assumption) to find the real, deterministic path to
+  `DeleteAdmission.ERR_VERSE_BUSY`: `beginConfirmedDelete`'s own readiness
+  check (`gate.readiness(key).state() != READY`) is satisfied by an
+  outstanding read lease (readiness ignores the `reads` counter), but
+  `gate.beginDelete(key)` itself refuses whenever `entry.reads != 0` --
+  so an open `beginAcquireReadyRead` lease, never closed, is what actually
+  triggers `ERR_VERSE_BUSY` through the gate's own `IllegalStateException`
+  path. (An earlier draft assumed calling `beginConfirmedDelete` twice on
+  the same key would do this; reading the source directly showed the first
+  call already flips `entry.ready` to `false`, so a second call would
+  instead hit `ERR_VERSE_NOT_READY` -- caught before writing any fixture
+  code, not discovered by running one.)
+- **Exact-target FAILED_SAVE**: arms the real `TestOnlySaveFailureHook`
+  (`dynamicdimensions.testOnlyFailSaveForKey`, matched by the armed
+  dimension's exact `ResourceLocation#toString()`, global single-fire per
+  JVM -- confirmed by reading the hook's actual source in the patch, not
+  assumed) for one target only, after first deleting a separate,
+  never-armed, unrelated verse normally. The armed target's delete is
+  admitted normally (the injected failure fires during the real forced
+  save, not at admission) and surfaces as `DeleteOutcome.QUARANTINED`,
+  with its catalog entry retained as `QUARANTINED` and its on-disk storage
+  directory still present -- never a silently-successful `DELETED`, and
+  the unrelated verse's own successful delete proves the failure is
+  scoped to the exact armed key, not global breakage.
+
+**Verified without executing anything natively:** `compileJava` BUILD
+SUCCESSFUL (the new class and `DynamicVerse`/`build.gradle` wiring
+compile cleanly); `compileTestJava`/`test` unaffected, 91/0/0/0; the new
+Gradle run's launch script was generated (read-only) against the accepted
+hook-bearing provider jar and inspected directly: its own disposable root,
+`-Dneoforge.enabledGameTestNamespaces=dynamicverse`,
+`-Ddynamicverse.providerSafeDeleteScenarios=true`, and the exact expected
+provider jar (`4c4d70a90...`) are all present and correct. No GameTest in
+this class has been run.
+
 ## Round 3, second incremental review (Jira comment 51588): two confirmed runner defects
 
 Reviewed against addea9b. Credited the root-binding/negative test, frozen

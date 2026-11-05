@@ -32,12 +32,21 @@ set -uo pipefail
 workspace=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P) || exit 125
 source "$workspace/scripts/providerOrdinaryRestartReceiptLib.sh" || exit 125
 
-root="$workspace/run/m470-safe-delete-crash-disposable-20261104"
-server_properties="$root/server.properties"
-world_root="$root/world"
-nonce_file="$root/dynamicverse-crash-delete-expected-nonce.txt"
-marker="$root/dynamicverse-crash-delete-phase-a-marker.properties"
-result="$root/dynamicverse-crash-delete-phase-b-result.properties"
+# Deliberately NOT a fixed default: ModDev's own prepare*Run tasks create
+# whatever directory build.gradle's gameDirectory names, as a side effect of
+# simply regenerating these launch scripts for review -- the same ordinary
+# preparation work this entire review has been doing. If this wrapper also
+# defaulted to that same stable path, every routine script regeneration
+# would leave this wrapper's own "requires an absent root" guard permanently
+# tripped before a real run could ever begin. Requiring an explicit,
+# presumably freshly-timestamped override here (matched by regenerating the
+# launch scripts with -PsafeDeleteCrashGameDirectory set to the SAME path --
+# the existing generated-script contract check below already enforces this
+# equality) keeps the stable preparation root and any real execution root
+# from ever being the same path. `:-` (not `:?`) so sourcing this file for
+# testing never fails on an unset variable under `set -u`; main() itself
+# refuses when this is empty.
+root="${DYNAMICVERSE_SAFE_DELETE_CRASH_EXECUTION_ROOT:-}"
 generated_a="$workspace/build/moddev/runProviderSafeDeleteCrashPhaseA.sh"
 generated_b="$workspace/build/moddev/runProviderSafeDeleteCrashPhaseB.sh"
 normal_a="$workspace/build/moddev/providerSafeDeleteCrashPhaseARunClasspath.txt"
@@ -70,6 +79,27 @@ phase_b_timeout_seconds=120
 phase_b_kill_after_seconds=10
 
 refuse() { printf '%s\n' "refused: $*" >&2; exit 125; }
+
+# ModDev's own prepare*Run tasks create exactly the bare, empty gameDirectory
+# as a side effect of nothing more than regenerating these launch scripts --
+# confirmed empirically (find -mindepth 1 on such a directory immediately
+# after regeneration returns nothing). Requiring strict absence would mean
+# the routine preparation this review has been doing on every round -- not
+# a real execution -- permanently trips this guard before a real run could
+# ever begin. This accepts that SPECIFIC, verifiably-content-free state
+# (never anything with actual content: no eula.txt, no marker, nothing) in
+# addition to true absence, without weakening the refusal of a genuinely
+# retained/dirty root one bit -- a root with ANY entry at all is still
+# refused exactly as before.
+root_is_pristine_or_absent() {
+  local path=$1
+  [[ ! -L "$path" ]] || return 1
+  if [[ ! -e "$path" ]]; then return 0; fi
+  [[ -d "$path" ]] || return 1
+  local entry
+  entry=$(find -P "$path" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null) || return 1
+  [[ -z "$entry" ]]
+}
 
 # Linux /proc start-time ticks (stat field 22): stable across a kill -0 poll
 # as long as the kernel has not recycled the PID for a different process.
@@ -246,6 +276,13 @@ read_process_start_instant() {
 }
 
 main() {
+  [[ -n "$root" ]] || refuse "DYNAMICVERSE_SAFE_DELETE_CRASH_EXECUTION_ROOT must be set explicitly to a fresh execution root -- never the stable preparation root ModDev's prepare*Run tasks create as a side effect of regenerating these launch scripts. Regenerate createProviderSafeDeleteCrashPhase{A,B}LaunchScript with -PsafeDeleteCrashGameDirectory set to this SAME path first."
+  server_properties="$root/server.properties"
+  world_root="$root/world"
+  nonce_file="$root/dynamicverse-crash-delete-expected-nonce.txt"
+  marker="$root/dynamicverse-crash-delete-phase-a-marker.properties"
+  result="$root/dynamicverse-crash-delete-phase-b-result.properties"
+
   for tool in sha256sum lsof timeout awk sed grep kill wait mkdir setsid date; do
     command -v "$tool" >/dev/null 2>&1 || refuse "required tool missing before anything is spawned: $tool"
   done
@@ -274,9 +311,9 @@ main() {
   pre_phase_a_manifest=$(capture_manifest A "$generated_a" "$normal_a" "$legacy_a" "$vm_a" "$program_a" "$log4j_a") || refuse "cannot capture the pre-phase-A input manifest"
   require_manifest_schema "pre-phase-A manifest" "$pre_phase_a_manifest"
 
-  [[ ! -e "$root" && ! -L "$root" ]] || refuse "requires an absent non-symlink disposable root -- never reuse a retained profile"
+  root_is_pristine_or_absent "$root" || refuse "requires an absent, non-symlink disposable root OR one that is genuinely empty (only ModDev's own harmless prepare*Run side effect, never anything with real content) -- never reuse a retained/dirty profile"
   [[ ! -e "$receipts" ]] || refuse "requires absent prior receipts"
-  mkdir -- "$root" || refuse "cannot claim fresh disposable root"
+  if [[ ! -e "$root" ]]; then mkdir -- "$root" || refuse "cannot claim fresh disposable root"; fi
   mkdir -- "$receipts" || refuse "cannot claim receipts root"
   printf '%s' "$pre_phase_a_manifest" > "$receipts/pre-phase-a.manifest" || refuse "cannot record the pre-phase-A input manifest"
 
