@@ -3,14 +3,24 @@
 # technical plan review rounds). Orchestrates the two-JVM safe-delete crash
 # fixture: owns and verifies a single expected nonce, enforces the generated
 # launch scripts' root/phase/provider-identity/closure contract (reusing the
-# established providerOrdinaryRestart hash/closure helpers, not merely
-# checking that a script file exists), launches Phase A, waits for its
-# own-PID marker, re-verifies ownership immediately before sending SIGKILL to
-# exactly that PID (never name-based/broad), confirms real exit and a free
-# session.lock (failing closed if lsof is unavailable, not skipping), then
-# launches Phase B under its own timeout and requires both a clean exit and
-# every result-receipt assertion, cross-checked against Phase A's recorded
-# operation identity.
+# established providerOrdinaryRestart hash/closure helpers), rechecks that
+# contract immediately before each launch so a build between phases cannot
+# silently change the evidence, launches Phase A, waits for its own-PID
+# marker, re-verifies both PID and process-start identity immediately before
+# sending SIGKILL to exactly that PID (never name-based/broad), confirms
+# real exit and a free session.lock (failing closed if lsof is unavailable),
+# then launches Phase B under a hard-kill-bounded timeout and requires both
+# a clean exit and every result-receipt assertion, cross-checked against
+# Phase A's recorded operation identity. A forced Phase B exit is always a
+# failure here, never treated as a clean recovery receipt.
+#
+# gameRoot vs worldRoot: `root` below is the --gameDir the JVM is actually
+# launched with (what this wrapper writes eula.txt/server.properties/the
+# nonce/marker/result files under); `world_root` is the Minecraft save
+# directory `root/world` (level-name=world), used only for the session.lock
+# check and as the known parent of dimension storage. The fixture's own
+# ProviderSafeDeleteCrashFixtureRootBindingTest (JUnit, no native launch)
+# exercises the Java-side binding between these two directly.
 set -uo pipefail
 
 workspace=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P) || exit 125
@@ -20,12 +30,14 @@ root="$workspace/run/m470-safe-delete-crash-disposable-20261104"
 server_properties="$root/server.properties"
 world_root="$root/world"
 nonce_file="$root/dynamicverse-crash-delete-expected-nonce.txt"
-marker="$world_root/dynamicverse-crash-delete-phase-a-marker.properties"
-result="$world_root/dynamicverse-crash-delete-phase-b-result.properties"
+marker="$root/dynamicverse-crash-delete-phase-a-marker.properties"
+result="$root/dynamicverse-crash-delete-phase-b-result.properties"
 generated_a="$workspace/build/moddev/runProviderSafeDeleteCrashPhaseA.sh"
 generated_b="$workspace/build/moddev/runProviderSafeDeleteCrashPhaseB.sh"
 normal_a="$workspace/build/moddev/providerSafeDeleteCrashPhaseARunClasspath.txt"
 normal_b="$workspace/build/moddev/providerSafeDeleteCrashPhaseBRunClasspath.txt"
+legacy_a="$workspace/build/moddev/providerSafeDeleteCrashPhaseALegacyClasspath.txt"
+legacy_b="$workspace/build/moddev/providerSafeDeleteCrashPhaseBLegacyClasspath.txt"
 vm_a="$workspace/build/moddev/providerSafeDeleteCrashPhaseARunVmArgs.txt"
 vm_b="$workspace/build/moddev/providerSafeDeleteCrashPhaseBRunVmArgs.txt"
 program_a="$workspace/build/moddev/providerSafeDeleteCrashPhaseARunProgramArgs.txt"
@@ -40,45 +52,90 @@ expected_provider_sha256="4c4d70a90498fded6dcb8488a114597a5ed0052a8c721e888637d3
 marker_timeout_seconds=120
 exit_timeout_seconds=30
 phase_b_timeout_seconds=120
+phase_b_kill_after_seconds=10
 
 refuse() { printf '%s\n' "refused: $*" >&2; exit 125; }
 
+for tool in sha256sum lsof timeout awk sed grep kill wait mkdir; do
+  command -v "$tool" >/dev/null 2>&1 || refuse "required tool missing before anything is spawned: $tool"
+done
+[[ -d /proc ]] || refuse "/proc is required for owned-process start-identity verification on this platform"
+
 phase_a_pid=""
+phase_b_pid=""
 cleanup() {
-  # Any refusal path after spawning Phase A must not leave its blocked JVM
-  # alive. Only ever signals the exact PID this wrapper itself spawned.
+  # Any refusal/interruption path after spawning a phase must not leave its
+  # process alive. Only ever signals the exact PID this wrapper spawned.
   if [[ -n "$phase_a_pid" ]] && kill -0 "$phase_a_pid" 2>/dev/null; then
     kill -9 "$phase_a_pid" 2>/dev/null || true
     wait "$phase_a_pid" 2>/dev/null || true
   fi
+  if [[ -n "$phase_b_pid" ]] && kill -0 "$phase_b_pid" 2>/dev/null; then
+    kill -9 "$phase_b_pid" 2>/dev/null || true
+    wait "$phase_b_pid" 2>/dev/null || true
+  fi
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
+
+# Linux /proc start-time ticks (stat field 22): stable across a kill -0 poll
+# as long as the kernel has not recycled the PID for a different process.
+proc_start_ticks() {
+  local pid=$1
+  awk '{print $22}' "/proc/$pid/stat" 2>/dev/null
+}
 
 crash_require_generated() {
-  local generated=$1 normal=$2 vm=$3 program=$4 log4j=$5 phase=$6
-  [[ -f "$generated" && ! -L "$generated" && -f "$normal" && ! -L "$normal" && -f "$vm" && ! -L "$vm" && -f "$program" && ! -L "$program" && -f "$log4j" && ! -L "$log4j" ]] || return 1
+  local generated=$1 normal=$2 legacy=$3 vm=$4 program=$5 log4j=$6 phase=$7
+  [[ -f "$generated" && ! -L "$generated" && -f "$normal" && ! -L "$normal" && -f "$legacy" && ! -L "$legacy" && -f "$vm" && ! -L "$vm" && -f "$program" && ! -L "$program" && -f "$log4j" && ! -L "$log4j" ]] || return 1
   [[ $(grep -Foc -- "cd '$root'; exec" "$generated") == 1 ]] || return 1
   [[ $(grep -Foc -- "'@$normal'" "$generated") == 1 && $(grep -Foc -- "'@$vm'" "$generated") == 1 && $(grep -Foc -- "'@$program'" "$generated") == 1 ]] || return 1
-  [[ $(grep -Fxc -- "-DlegacyClassPath.file=${vm%RunVmArgs.txt}LegacyClasspath.txt" "$vm") == 1 && $(grep -Fxc -- "-Dlog4j2.configurationFile=$log4j" "$vm") == 1 ]] || return 1
+  [[ $(grep -Fxc -- "-DlegacyClassPath.file=$legacy" "$vm") == 1 && $(grep -Fxc -- "-Dlog4j2.configurationFile=$log4j" "$vm") == 1 ]] || return 1
   [[ $(grep -Fxc -- "-Ddynamicverse.providerSafeDeleteCrashPhase=$phase" "$vm") == 1 && $(grep -Fc -- '-Ddynamicverse.providerSafeDeleteCrashPhase=' "$vm") == 1 ]] || return 1
   [[ $(grep -Fc -- '-Dneoforge.enabledGameTestNamespaces=' "$vm") == 0 ]] || return 1
   [[ $(head -n 1 -- "$normal") == -classpath ]] || return 1
+  # The exact java executable this generated script will exec, bound into
+  # the contract rather than merely assumed.
+  [[ $(grep -Foc -- "exec '/tmp/temurin21/bin/java'" "$generated") == 1 ]] || return 1
 }
 
+# Rechecked immediately before each launch, not only once at the start, so
+# a build run between phases cannot silently change what will actually run.
+verify_input_contract() {
+  crash_require_generated "$generated_a" "$normal_a" "$legacy_a" "$vm_a" "$program_a" "$log4j_a" A || refuse "phase A generated launch contract invalid"
+  crash_require_generated "$generated_b" "$normal_b" "$legacy_b" "$vm_b" "$program_b" "$log4j_b" B || refuse "phase B generated launch contract invalid"
+
+  local provider_a provider_b provider_a_hash provider_b_hash closure_a closure_b legacy_closure_a legacy_closure_b vm_diff
+  provider_a=$(ordinary_provider_input "$normal_a") || refuse "cannot locate exactly one provider jar on phase A's classpath"
+  provider_b=$(ordinary_provider_input "$normal_b") || refuse "cannot locate exactly one provider jar on phase B's classpath"
+  provider_a_hash=$(ordinary_hash "$provider_a") || refuse "cannot hash phase A's selected provider jar"
+  provider_b_hash=$(ordinary_hash "$provider_b") || refuse "cannot hash phase B's selected provider jar"
+  [[ "$provider_a_hash" == "$expected_provider_sha256" ]] || refuse "phase A selected provider jar $provider_a_hash does not match the expected hook-bearing corrected provider $expected_provider_sha256 -- explicitly select -PacceptedDynamicDimensionsJar"
+  [[ "$provider_b_hash" == "$expected_provider_sha256" ]] || refuse "phase B selected provider jar $provider_b_hash does not match the expected hook-bearing corrected provider $expected_provider_sha256"
+
+  closure_a=$(ordinary_closure_hash "$normal_a") || refuse "cannot hash phase A's classpath closure"
+  closure_b=$(ordinary_closure_hash "$normal_b") || refuse "cannot hash phase B's classpath closure"
+  [[ "$closure_a" == "$closure_b" ]] || refuse "phase A and phase B classpath closures differ ($closure_a vs $closure_b)"
+
+  legacy_closure_a=$(ordinary_hash "$legacy_a") || refuse "cannot hash phase A's legacy classpath"
+  legacy_closure_b=$(ordinary_hash "$legacy_b") || refuse "cannot hash phase B's legacy classpath"
+  [[ "$legacy_closure_a" == "$legacy_closure_b" ]] || refuse "phase A and phase B legacy classpaths differ"
+
+  local log4j_hash_a log4j_hash_b
+  log4j_hash_a=$(ordinary_hash "$log4j_a") || refuse "cannot hash phase A's log4j configuration"
+  log4j_hash_b=$(ordinary_hash "$log4j_b") || refuse "cannot hash phase B's log4j configuration"
+  [[ "$log4j_hash_a" == "$log4j_hash_b" ]] || refuse "phase A and phase B log4j configurations differ"
+
+  # The only permitted differences between the two VM-args files are the
+  # phase-property line itself and the two per-phase-named file references
+  # (-Dlog4j2.configurationFile=/-DlegacyClassPath.file=) whose actual
+  # *content* equality is already proven by the hashes just above.
+  vm_diff=$(diff <(grep -vE '^-Ddynamicverse\.providerSafeDeleteCrashPhase=|^-Dlog4j2\.configurationFile=|^-DlegacyClassPath\.file=' "$vm_a") \
+                 <(grep -vE '^-Ddynamicverse\.providerSafeDeleteCrashPhase=|^-Dlog4j2\.configurationFile=|^-DlegacyClassPath\.file=' "$vm_b")) || true
+  [[ -z "$vm_diff" ]] || refuse "phase A and phase B VM args differ beyond the expected phase-only differences: $vm_diff"
+}
+
+verify_input_contract
 [[ -f "$generated_a" && -f "$generated_b" ]] || refuse "generated launch scripts missing -- run both createProviderSafeDeleteCrashPhase*LaunchScript tasks first"
-crash_require_generated "$generated_a" "$normal_a" "$vm_a" "$program_a" "$log4j_a" A || refuse "phase A generated launch contract invalid"
-crash_require_generated "$generated_b" "$normal_b" "$vm_b" "$program_b" "$log4j_b" B || refuse "phase B generated launch contract invalid"
-
-provider_a=$(ordinary_provider_input "$normal_a") || refuse "cannot locate exactly one provider jar on phase A's classpath"
-provider_b=$(ordinary_provider_input "$normal_b") || refuse "cannot locate exactly one provider jar on phase B's classpath"
-provider_a_hash=$(ordinary_hash "$provider_a") || refuse "cannot hash phase A's selected provider jar"
-provider_b_hash=$(ordinary_hash "$provider_b") || refuse "cannot hash phase B's selected provider jar"
-[[ "$provider_a_hash" == "$expected_provider_sha256" ]] || refuse "phase A selected provider jar $provider_a_hash does not match the expected hook-bearing corrected provider $expected_provider_sha256 -- compilation/script generation alone does not prove this; explicitly select -PacceptedDynamicDimensionsJar"
-[[ "$provider_b_hash" == "$expected_provider_sha256" ]] || refuse "phase B selected provider jar $provider_b_hash does not match the expected hook-bearing corrected provider $expected_provider_sha256"
-
-closure_a=$(ordinary_closure_hash "$normal_a") || refuse "cannot hash phase A's classpath closure"
-closure_b=$(ordinary_closure_hash "$normal_b") || refuse "cannot hash phase B's classpath closure"
-[[ "$closure_a" == "$closure_b" ]] || refuse "phase A and phase B classpath closures differ ($closure_a vs $closure_b) -- both phases must run the exact same build/provider inputs"
 
 [[ ! -e "$root" && ! -L "$root" ]] || refuse "requires an absent non-symlink disposable root -- never reuse a retained profile"
 [[ ! -e "$receipts" ]] || refuse "requires absent prior receipts"
@@ -88,8 +145,9 @@ mkdir -- "$receipts" || refuse "cannot claim receipts root"
 printf '%s\n' 'eula=true' > "$root/eula.txt" || refuse "cannot write eula acknowledgement"
 printf '%s\n' 'server-ip=127.0.0.1' 'server-port=0' 'level-name=world' > "$server_properties" || refuse "cannot write loopback server properties"
 
-# This wrapper owns the one expected nonce; neither phase ever generates or
-# writes it. Both phases, and this wrapper, must agree on it exactly.
+# This wrapper owns the one expected nonce, written at the game root (not
+# the world root -- the two must never be conflated). Neither phase ever
+# generates or writes it.
 expected_nonce=$(sha256sum <<<"$RANDOM$RANDOM$$$(date +%s%N)" | awk '{print $1}') || refuse "cannot derive an expected nonce"
 printf '%s' "$expected_nonce" > "$nonce_file" || refuse "cannot write expected-nonce file"
 
@@ -97,28 +155,34 @@ printf '%s' "$expected_nonce" > "$nonce_file" || refuse "cannot write expected-n
 cd -- "$root" || refuse "cannot cd into disposable root"
 /bin/bash -e -- "$generated_a" > "$receipts/phase-a.full.log" 2>&1 &
 phase_a_pid=$!
-echo "spawned phase A as PID $phase_a_pid; waiting up to ${marker_timeout_seconds}s for its marker" >&2
+phase_a_start=$(proc_start_ticks "$phase_a_pid") || true
+[[ -n "$phase_a_start" ]] || refuse "cannot capture phase A's own process start identity immediately after spawn"
+echo "spawned phase A as PID $phase_a_pid (start ticks $phase_a_start); waiting up to ${marker_timeout_seconds}s for its marker" >&2
 
 marker_seen=0
 for ((i = 0; i < marker_timeout_seconds; i++)); do
   if [[ -f "$marker" ]]; then marker_seen=1; break; fi
-  if ! kill -0 "$phase_a_pid" 2>/dev/null; then break; fi
+  if [[ "$(proc_start_ticks "$phase_a_pid")" != "$phase_a_start" ]]; then break; fi
   sleep 1
 done
 (( marker_seen )) || refuse "phase A never published its marker within ${marker_timeout_seconds}s"
 
 reported_pid=$(sed -n 's/^pid=//p' "$marker" | tr -d '\r')
 reported_nonce=$(sed -n 's/^nonce=//p' "$marker" | tr -d '\r')
-reported_root=$(sed -n 's/^root=//p' "$marker" | tr -d '\r')
+reported_game_root=$(sed -n 's/^gameRoot=//p' "$marker" | tr -d '\r')
 [[ "$reported_pid" =~ ^[0-9]+$ ]] || refuse "marker reports no valid PID"
 [[ "$reported_pid" == "$phase_a_pid" ]] || refuse "marker PID $reported_pid does not match the exact JVM this wrapper spawned ($phase_a_pid) -- refusing to kill anything"
 [[ "$reported_nonce" == "$expected_nonce" ]] || refuse "marker nonce does not match this wrapper's own expected nonce"
-[[ "$reported_root" == "$root" ]] || refuse "marker root does not match this wrapper's disposable root"
+[[ "$reported_game_root" == "$root" ]] || refuse "marker gameRoot does not match this wrapper's disposable root"
 [[ "$(sed -n 's/^durablePendingVerified=//p' "$marker" | tr -d '\r')" == "true" ]] || refuse "marker does not confirm the durable PENDING intent was verified before publication"
 
-# Re-verify ownership immediately before every signal, not only once.
-kill -0 "$phase_a_pid" 2>/dev/null || refuse "phase A PID $phase_a_pid is no longer the process this wrapper spawned"
-echo "verified marker PID $reported_pid matches spawned PID $phase_a_pid; sending SIGKILL" >&2
+# Re-verify both PID and process-start identity immediately before every
+# signal, not only once at marker time -- kill -0 alone only proves a PID
+# exists, not that it is still the same process this wrapper spawned.
+current_start=$(proc_start_ticks "$phase_a_pid") || true
+[[ -n "$current_start" ]] || refuse "phase A PID $phase_a_pid is no longer observable -- refusing to signal"
+[[ "$current_start" == "$phase_a_start" ]] || refuse "phase A PID $phase_a_pid's process-start identity changed -- the kernel may have recycled this PID; refusing to signal"
+echo "verified marker PID $reported_pid matches spawned PID $phase_a_pid with unchanged start identity; sending SIGKILL" >&2
 kill -9 "$phase_a_pid" || refuse "cannot signal phase A PID $phase_a_pid"
 
 exited=0
@@ -134,18 +198,22 @@ phase_a_pid=""   # already reaped; cleanup trap must not touch it again
 # failure, only confirmation that it actually terminated.
 printf '%s\n' "$phase_a_exit" > "$receipts/phase-a.forced-kill-exit"
 
-command -v lsof >/dev/null 2>&1 || refuse "lsof is unavailable -- lock-release validation fails closed rather than silently skipping"
 lsof -- "$world_root/session.lock" > "$receipts/phase-a.session-lock-check.log" 2>&1
 [[ ! -s "$receipts/phase-a.session-lock-check.log" ]] || refuse "a process still holds the world session.lock after phase A's forced exit"
 
 ### Phase B: an independent, timeout-bounded launch against the same disposable root.
+verify_input_contract   # rechecked immediately before this launch too.
 set +e
-timeout "${phase_b_timeout_seconds}s" /bin/bash -e -- "$generated_b" > "$receipts/phase-b.full.log" 2>&1
+timeout --kill-after="${phase_b_kill_after_seconds}s" "${phase_b_timeout_seconds}s" /bin/bash -e -- "$generated_b" > "$receipts/phase-b.full.log" 2>&1 &
+phase_b_pid=$!
+wait "$phase_b_pid"
 phase_b_exit=$?
+phase_b_pid=""
 set -e
 printf '%s\n' "$phase_b_exit" > "$receipts/phase-b.exit"
-(( phase_b_exit != 124 )) || refuse "phase B did not exit within ${phase_b_timeout_seconds}s -- timed out, not confirmed clean"
-(( phase_b_exit == 0 )) || refuse "phase B did not exit cleanly (exit $phase_b_exit) -- see $receipts/phase-b.full.log"
+# A forced/timed-out phase B (TERM=124, or the hard KILL fallback, commonly
+# 137) is always a failure here, never a clean recovery receipt.
+(( phase_b_exit == 0 )) || refuse "phase B did not exit cleanly (exit $phase_b_exit, 124=TERM-timeout, 137=hard-kill-fallback) -- see $receipts/phase-b.full.log"
 
 [[ -f "$result" ]] || refuse "phase B produced no result receipt"
 reported_result_nonce=$(sed -n 's/^nonce=//p' "$result" | tr -d '\r')
@@ -159,9 +227,11 @@ reported_result_generation=$(sed -n 's/^targetGeneration=//p' "$result" | tr -d 
 grep -q '^targetQuarantined=true$' "$result" || refuse "phase B result does not confirm the target was quarantined"
 grep -q '^targetRejectionCompleted=true$' "$result" || refuse "phase B result does not confirm an explicit completed rejection with no lease"
 grep -q '^targetNeverReloaded=true$' "$result" || refuse "phase B result does not confirm the target was never reloaded"
+grep -q '^targetOperationInterruptedPostRecovery=true$' "$result" || refuse "phase B result does not confirm the exact operation persisted as the restart-interrupted terminal post-recovery"
 grep -q '^unrelatedLeaseAcquired=true$' "$result" || refuse "phase B result does not confirm the unrelated verse's lease was acquired"
 grep -q '^unrelatedSentinelIntact=true$' "$result" || refuse "phase B result does not confirm the unrelated verse's resolved sentinel"
 grep -q '^targetStorageIntact=true$' "$result" || refuse "phase B result does not confirm the target's on-disk storage survived"
+grep -q '^targetContentIntact=true$' "$result" || refuse "phase B result does not confirm the target's saved region content survived unchanged"
 
 echo "phase A forced-kill exit: $phase_a_exit (expected/recorded separately, not a success signal)" >&2
 echo "phase B clean exit: $phase_b_exit" >&2

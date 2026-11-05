@@ -91,19 +91,19 @@ public final class ProviderSafeDeleteCrashFixture {
 
     /** Must run from ServerStartingEvent before {@link ServerVerseRuntime#create(MinecraftServer)}. */
     public static void validateBeforeRuntime(String phase, MinecraftServer server) {
-        Path root = confinedRoot(server);
-        String expectedNonce = readNonce(root);
+        Path game = gameRoot(server);
+        String expectedNonce = readNonce(game);
         if (phase.equals("A")) {
-            require(!Files.exists(root.resolve(MARKER_FILE), LinkOption.NOFOLLOW_LINKS), "phase A refuses a retained prior marker");
-            require(!Files.exists(root.resolve(RESULT_FILE), LinkOption.NOFOLLOW_LINKS), "phase A refuses a retained prior phase B result");
+            require(!Files.exists(game.resolve(MARKER_FILE), LinkOption.NOFOLLOW_LINKS), "phase A refuses a retained prior marker");
+            require(!Files.exists(game.resolve(RESULT_FILE), LinkOption.NOFOLLOW_LINKS), "phase A refuses a retained prior phase B result");
             return;
         }
-        Path markerPath = root.resolve(MARKER_FILE);
+        Path markerPath = game.resolve(MARKER_FILE);
         require(Files.isRegularFile(markerPath, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(markerPath), "phase B requires phase A's real marker file");
-        require(!Files.exists(root.resolve(RESULT_FILE), LinkOption.NOFOLLOW_LINKS), "phase B refuses a retained prior result");
+        require(!Files.exists(game.resolve(RESULT_FILE), LinkOption.NOFOLLOW_LINKS), "phase B refuses a retained prior result");
         Properties marker = readProperties(markerPath);
         require(expectedNonce.equals(require(marker.getProperty("nonce"), "marker missing nonce")), "marker nonce does not match the wrapper-owned expected nonce");
-        require(root.toString().equals(require(marker.getProperty("root"), "marker missing root")), "marker root does not match this confined root");
+        require(game.toString().equals(require(marker.getProperty("gameRoot"), "marker missing gameRoot")), "marker gameRoot does not match this confined game root");
         String targetKey = require(marker.getProperty("targetKey"), "marker missing targetKey");
         require(TARGET_ID.toString().equals(targetKey), "marker targetKey does not match the expected crash target");
         UUID operationId = UUID.fromString(require(marker.getProperty("operationId"), "marker missing operationId"));
@@ -124,8 +124,9 @@ public final class ProviderSafeDeleteCrashFixture {
     }
 
     private void phaseA(MinecraftServer server, ServerVerseRuntime runtime) {
-        Path root = confinedRoot(server);
-        String expectedNonce = readNonce(root);
+        Path game = gameRoot(server);
+        Path world = worldRoot(server);
+        String expectedNonce = readNonce(game);
 
         require(runtime.beginCreate(TARGET_NAME, VerseLifecycleCommandService.CreateType.NORMAL, java.util.OptionalLong.empty(), ignored -> { })
                         == VerseLifecycleCommandService.CreateAdmission.ADMITTED,
@@ -139,6 +140,10 @@ public final class ProviderSafeDeleteCrashFixture {
 
         writeSentinelAndSave(server, TARGET_KEY, TARGET_SENTINEL, Blocks.REDSTONE_LAMP.defaultBlockState());
         writeSentinelAndSave(server, UNRELATED_KEY, UNRELATED_SENTINEL, Blocks.GLOWSTONE.defaultBlockState());
+        // Meaningful saved-content evidence, hashed now while the target is
+        // still loaded and known-good; Phase B re-hashes the identical raw
+        // file without ever loading/reloading the quarantined target.
+        String targetRegionHash = hashFile(targetRegionFile(world));
 
         require(runtime.beginConfirmedDelete(TARGET_ID.toString(), ignored -> {
                     throw new IllegalStateException("phase A must never observe a delete terminal: the barrier below is supposed to prevent one");
@@ -153,7 +158,7 @@ public final class ProviderSafeDeleteCrashFixture {
                 .findFirst().orElseThrow(() -> new IllegalStateException(
                         "durable PENDING delete intent is not readable from the real state file before any marker is published"));
 
-        writeMarker(root, expectedNonce, intent);
+        writeMarker(game, expectedNonce, intent, targetRegionHash);
 
         // Deterministic barrier, not a sleep-as-proof: admission above only
         // enqueued a QuiesceAndCloseTicket; the real close only drains from
@@ -167,10 +172,12 @@ public final class ProviderSafeDeleteCrashFixture {
     }
 
     private void phaseB(MinecraftServer server, ServerVerseRuntime runtime) {
-        Path root = confinedRoot(server);
-        Properties marker = readProperties(root.resolve(MARKER_FILE));
+        Path game = gameRoot(server);
+        Path world = worldRoot(server);
+        Properties marker = readProperties(game.resolve(MARKER_FILE));
         UUID operationId = UUID.fromString(marker.getProperty("operationId"));
         long targetGeneration = Long.parseLong(marker.getProperty("targetGeneration"));
+        String targetRegionHashBefore = require(marker.getProperty("targetRegionHash"), "marker missing targetRegionHash");
 
         AtomicInteger targetCompletions = new AtomicInteger();
         AtomicReference<VerseReservationSnapshot> targetRead = new AtomicReference<>();
@@ -181,6 +188,15 @@ public final class ProviderSafeDeleteCrashFixture {
         boolean targetRejectionCompleted = targetCompletions.get() == 1 && targetRead.get() != null
                 && targetRead.get().phase() == VerseReservationPhase.FAILED && targetRead.get().lease().isEmpty();
         boolean targetNeverReloaded = server.getLevel(TARGET_KEY) == null;
+
+        // The exact admitted operation must still be present post-recovery,
+        // now transitioned to the restart-interrupted terminal -- not merely
+        // the same id echoed back without checking what happened to it.
+        ManagedVerseStateStore.OperationIntent postRecovery = ManagedVerseStateFileStore.minecraft(server).read().operations().get(operationId);
+        boolean targetOperationInterruptedPostRecovery = postRecovery != null
+                && postRecovery.phase() == ManagedVerseStateStore.OperationPhase.FAILED
+                && "ERR_OPERATION_INTERRUPTED".equals(postRecovery.error())
+                && TARGET_ID.toString().equals(postRecovery.destination());
 
         AtomicReference<VerseReservationSnapshot> unrelatedRead = new AtomicReference<>();
         runtime.beginAcquireReadyRead(UNRELATED_ID.toString(), unrelatedRead::set);
@@ -198,19 +214,48 @@ public final class ProviderSafeDeleteCrashFixture {
             }
         }
 
-        Path targetDir = root.resolve("dimensions").resolve("dynamicverse").resolve(TARGET_NAME);
+        Path targetDir = world.resolve("dimensions").resolve("dynamicverse").resolve(TARGET_NAME);
         boolean targetStorageIntact = Files.isDirectory(targetDir, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(targetDir);
+        // Never loads the quarantined target to inspect it -- only re-hashes
+        // the exact same raw region file Phase A hashed while it was loaded.
+        boolean targetContentIntact = targetStorageIntact
+                && targetRegionHashBefore.equals(hashFile(targetRegionFile(world)));
 
         require(targetQuarantined, "the interrupted delete's target must be quarantined after recovery, never silently dropped from the catalog");
         require(targetRejectionCompleted, "a read acquisition against the quarantined target must actually complete, as an explicit FAILED result with no lease -- not merely never callback");
         require(targetNeverReloaded, "an interrupted delete's target must never be reloaded as a real ServerLevel during recovery");
+        require(targetOperationInterruptedPostRecovery, "the exact admitted operation must persist post-recovery as the restart-interrupted terminal, not merely share an id");
         require(unrelatedLeaseAcquired, "the unrelated verse must still hand out a real lease after recovery");
         require(unrelatedSentinelIntact, "the unrelated verse's resolved current instance must still carry its own sentinel block");
         require(targetStorageIntact, "an interrupted delete must never have removed the target's on-disk storage");
+        require(targetContentIntact, "an interrupted delete must never have altered the target's saved region content");
 
-        writeResult(root, marker.getProperty("nonce"), operationId, targetGeneration,
-                targetQuarantined, targetRejectionCompleted, targetNeverReloaded, unrelatedLeaseAcquired, unrelatedSentinelIntact, targetStorageIntact);
+        writeResult(game, marker.getProperty("nonce"), operationId, targetGeneration, targetContentIntact,
+                targetQuarantined, targetRejectionCompleted, targetNeverReloaded, targetOperationInterruptedPostRecovery,
+                unrelatedLeaseAcquired, unrelatedSentinelIntact, targetStorageIntact);
         server.halt(false);
+    }
+
+    private static Path targetRegionFile(Path world) {
+        // BlockPos(8,80,8) maps to chunk (0,0) -> region (0,0); the same
+        // convention ProviderOrdinaryRestartFixture already relies on.
+        return world.resolve("dimensions").resolve("dynamicverse").resolve(TARGET_NAME).resolve("region").resolve("r.0.0.mca");
+    }
+
+    private static String hashFile(Path file) {
+        require(Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(file), "expected a real region file: " + file);
+        try {
+            java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+            try (var in = Files.newInputStream(file, LinkOption.NOFOLLOW_LINKS)) {
+                byte[] buffer = new byte[8192];
+                for (int read; (read = in.read(buffer)) != -1;) digest.update(buffer, 0, read);
+            }
+            StringBuilder hex = new StringBuilder();
+            for (byte b : digest.digest()) hex.append(String.format("%02x", b));
+            return hex.toString();
+        } catch (IOException | java.security.NoSuchAlgorithmException bad) {
+            throw new IllegalStateException("cannot hash " + file, bad);
+        }
     }
 
     private static void writeSentinelAndSave(MinecraftServer server, ResourceKey<Level> key, BlockPos pos, net.minecraft.world.level.block.state.BlockState state) {
@@ -225,34 +270,38 @@ public final class ProviderSafeDeleteCrashFixture {
         return runtime.listManaged().stream().anyMatch(item -> item.name().equals(id.toString()) && item.state() == ManagedVerseListing.State.READY);
     }
 
-    private void writeMarker(Path root, String expectedNonce, ManagedVerseStateStore.OperationIntent intent) {
+    private void writeMarker(Path game, String expectedNonce, ManagedVerseStateStore.OperationIntent intent, String targetRegionHash) {
         Properties properties = new Properties();
         properties.setProperty("pid", Long.toString(ProcessHandle.current().pid()));
         properties.setProperty("processStartInstant", ProcessHandle.current().info().startInstant()
                 .map(Object::toString).orElse("unknown"));
         properties.setProperty("nonce", expectedNonce);
-        properties.setProperty("root", root.toString());
+        properties.setProperty("gameRoot", game.toString());
         properties.setProperty("operationId", intent.id().toString());
         properties.setProperty("targetKey", intent.destination());
         properties.setProperty("targetGeneration", Long.toString(intent.destinationDescriptor().generation()));
+        properties.setProperty("targetRegionHash", targetRegionHash);
         properties.setProperty("durablePendingVerified", "true");
-        writePropertiesAtomic(root.resolve(MARKER_FILE), properties);
+        writePropertiesAtomic(game.resolve(MARKER_FILE), properties);
     }
 
-    private void writeResult(Path root, String nonce, UUID operationId, long targetGeneration,
+    private void writeResult(Path game, String nonce, UUID operationId, long targetGeneration, boolean targetContentIntact,
                               boolean targetQuarantined, boolean targetRejectionCompleted, boolean targetNeverReloaded,
+                              boolean targetOperationInterruptedPostRecovery,
                               boolean unrelatedLeaseAcquired, boolean unrelatedSentinelIntact, boolean targetStorageIntact) {
         Properties properties = new Properties();
         properties.setProperty("nonce", nonce);
         properties.setProperty("operationId", operationId.toString());
         properties.setProperty("targetGeneration", Long.toString(targetGeneration));
+        properties.setProperty("targetContentIntact", Boolean.toString(targetContentIntact));
         properties.setProperty("targetQuarantined", Boolean.toString(targetQuarantined));
         properties.setProperty("targetRejectionCompleted", Boolean.toString(targetRejectionCompleted));
         properties.setProperty("targetNeverReloaded", Boolean.toString(targetNeverReloaded));
+        properties.setProperty("targetOperationInterruptedPostRecovery", Boolean.toString(targetOperationInterruptedPostRecovery));
         properties.setProperty("unrelatedLeaseAcquired", Boolean.toString(unrelatedLeaseAcquired));
         properties.setProperty("unrelatedSentinelIntact", Boolean.toString(unrelatedSentinelIntact));
         properties.setProperty("targetStorageIntact", Boolean.toString(targetStorageIntact));
-        writePropertiesAtomic(root.resolve(RESULT_FILE), properties);
+        writePropertiesAtomic(game.resolve(RESULT_FILE), properties);
     }
 
     /** CREATE_NEW staging sibling, forced, then one atomic rename -- no reader can ever observe a partial write. */
@@ -291,11 +340,43 @@ public final class ProviderSafeDeleteCrashFixture {
         } catch (IOException bad) { throw new IllegalStateException("cannot read expected nonce", bad); }
     }
 
-    private static Path confinedRoot(MinecraftServer server) {
-        Path root = server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize();
-        require(Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(root), "crash fixture root must be a real directory");
-        require(ROOT_NAME.equals(root.getFileName().toString()), "crash fixture root is not the expected disposable game directory: " + root);
-        return root;
+    /**
+     * {@code LevelResource.ROOT} is the WORLD save directory
+     * ({@code gameDir/<level-name>}), not the game directory the JVM was
+     * launched with (the wrapper's {@code --gameDir}) -- a prior draft of
+     * this fixture conflated the two and would have refused to start. This
+     * derives and verifies the game root from the world root's own
+     * canonical parent via {@link #gameRootFromWorldRoot}, which is
+     * deliberately free of any {@code MinecraftServer} dependency so it is
+     * directly unit-testable.
+     */
+    private static Path worldRoot(MinecraftServer server) {
+        Path world = server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize();
+        gameRootFromWorldRoot(world); // validates the full relationship; result discarded here on purpose.
+        return world;
+    }
+
+    private static Path gameRoot(MinecraftServer server) {
+        return gameRootFromWorldRoot(server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize());
+    }
+
+    /** Package-visible for direct, server-free unit testing of the root-binding contract. */
+    static Path gameRootFromWorldRoot(Path world) {
+        Path normalizedWorld = world.toAbsolutePath().normalize();
+        require(Files.isDirectory(normalizedWorld, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(normalizedWorld),
+                "world root must be a real, non-symlinked directory: " + normalizedWorld);
+        require("world".equals(normalizedWorld.getFileName().toString()),
+                "world root does not have the expected level-name directory name: " + normalizedWorld);
+        Path game = normalizedWorld.getParent();
+        require(game != null, "world root has no parent");
+        require(Files.isDirectory(game, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(game),
+                "game root must be a real, non-symlinked directory: " + game);
+        require(ROOT_NAME.equals(game.getFileName().toString()), "game root is not the expected disposable game directory: " + game);
+        require(normalizedWorld.equals(game.resolve("world")), "world root is not canonically game root's own 'world' child");
+        for (Path ancestor = game; ancestor != null; ancestor = ancestor.getParent()) {
+            require(!Files.isSymbolicLink(ancestor), "a symlinked ancestor is not permitted: " + ancestor);
+        }
+        return game;
     }
 
     private static String require(String value, String message) {

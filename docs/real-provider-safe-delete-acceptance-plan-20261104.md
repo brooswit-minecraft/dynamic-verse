@@ -10,7 +10,43 @@ plan into the actual narrow source/runner it specifies, for review **before
 any native execution**. Nothing in this document, or in the source it
 describes, has been run.
 
-## Round 2 hardening (this update)
+## Round 3 fix (this update): a confirmed, pre-existing defect
+
+Round 2's draft would have refused to even start. `confinedRoot` called
+`server.getWorldPath(LevelResource.ROOT)` -- the WORLD save directory
+(`gameDir/world`, since the wrapper sets `level-name=world`) -- and then
+required *its own basename* to equal the registered *game*-directory name.
+Those are never the same path, so the very first call would have thrown.
+Separately, the wrapper wrote the nonce file at the game root but read/wrote
+the marker and result at the world root, and the marker recorded the world
+root under the key `root` while the wrapper compared it against the game
+root. Found by review, not by running anything.
+
+Fixed by modeling the two roots explicitly and testably:
+
+- `ProviderSafeDeleteCrashFixture.gameRootFromWorldRoot(Path world)` is a
+  new, server-free static method: given the world directory, it requires
+  the world directory to be real/non-symlinked and named exactly `world`,
+  derives the game root as its parent, requires the game root to be real/
+  non-symlinked and named exactly the registered disposable directory, and
+  requires every ancestor of the game root to be non-symlinked. `gameRoot`/
+  `worldRoot` (both taking a `MinecraftServer`) call this.
+- Nonce, marker, and result files all now live at the **game** root
+  exclusively (the wrapper's `eula.txt`/`server.properties` root); dimension
+  storage naturally stays under the **world** root
+  (`world/dimensions/dynamicverse/<name>`). The marker's `root` key was
+  renamed `gameRoot` to make the identity explicit, and `validateBeforeRuntime`/
+  Phase A/Phase B were all updated to use the correct root consistently.
+- `src/test/java/.../lifecycle/ProviderSafeDeleteCrashFixtureRootBindingTest.java`:
+  8 non-native JUnit tests (no `MinecraftServer`, no native launch) against
+  real temp directories -- the intended valid pair, a world directory not
+  named `world`, a game root with the wrong name, a `world` directory that
+  is not the expected game root's own child (same names, wrong relationship),
+  a symlinked world directory, a symlinked game-root ancestor, and a
+  nonexistent retained/foreign path. **Actually run**: `8/8 passed, 0
+  failures, 0 errors.**
+
+## Round 2 hardening
 
 A second technical review of the first draft (97276b8) found the fixture/
 runner "not yet safe or sufficient to run" and named five corrections,
