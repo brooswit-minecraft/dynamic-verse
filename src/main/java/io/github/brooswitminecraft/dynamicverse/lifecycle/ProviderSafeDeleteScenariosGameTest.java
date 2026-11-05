@@ -103,6 +103,7 @@ public final class ProviderSafeDeleteScenariosGameTest {
         ResourceKey<Level> busyKey = ResourceKey.create(Registries.DIMENSION, ResourceLocation.fromNamespaceAndPath("dynamicverse", BUSY_NAME));
         ResourceKey<Level> fsTargetKey = ResourceKey.create(Registries.DIMENSION, ResourceLocation.fromNamespaceAndPath("dynamicverse", FS_TARGET_NAME));
         ResourceLocation fsTargetId = fsTargetKey.location();
+        ResourceKey<Level> fsUnrelatedKey = ResourceKey.create(Registries.DIMENSION, ResourceLocation.fromNamespaceAndPath("dynamicverse", FS_UNRELATED_NAME));
 
         AtomicReference<ReadyVerseLease> openLease = new AtomicReference<>();
         AtomicReference<ServerPlayer> occupant = new AtomicReference<>();
@@ -207,7 +208,7 @@ public final class ProviderSafeDeleteScenariosGameTest {
                                     && item.state() == ManagedVerseListing.State.READY),
                             "a refused-at-admission delete leaves the occupied target's catalog entry untouched and READY");
                     require(occupiedReadyBefore.get().equals(state.read().ready().get(occupiedKeyString)),
-                            "a refused-at-admission delete leaves the occupied target's ENTIRE durable READY record byte-for-byte unchanged, not only its generation");
+                            "a refused-at-admission delete leaves the occupied target's ENTIRE durable READY record semantically unchanged (record equality across every field), not only its generation");
                     require(state.read().operations().values().stream().noneMatch(op -> op.destination().equals(occupiedKeyString)),
                             "a refused-at-admission delete never journals a new durable operation intent for the occupied target");
                     require(level.getBlockState(SENTINEL_POS).equals(Blocks.REDSTONE_LAMP.defaultBlockState()),
@@ -247,7 +248,7 @@ public final class ProviderSafeDeleteScenariosGameTest {
                                     && item.state() == ManagedVerseListing.State.READY),
                             "a busy-refused delete leaves the busy target's catalog entry untouched and READY");
                     require(busyReadyBefore.get().equals(state.read().ready().get(busyKeyString)),
-                            "a busy-refused delete leaves the busy target's ENTIRE durable READY record byte-for-byte unchanged, not only its generation");
+                            "a busy-refused delete leaves the busy target's ENTIRE durable READY record semantically unchanged (record equality across every field), not only its generation");
                     require(state.read().operations().values().stream().noneMatch(op -> op.destination().equals(busyKeyString)),
                             "a busy-refused delete never journals a new durable operation intent for the busy target");
                     require(server.getLevel(busyKey).getBlockState(SENTINEL_POS).equals(Blocks.GLOWSTONE.defaultBlockState()),
@@ -294,11 +295,14 @@ public final class ProviderSafeDeleteScenariosGameTest {
                     Set<Long> newUnrelated = new HashSet<>(afterUnrelated.keySet());
                     newUnrelated.removeAll(fsLedgerBaseline.get().keySet());
                     require(newUnrelated.size() == 1, "exactly one new pinned-provider ledger entry appeared for the unrelated delete");
-                    QuiesceAndCloseResult unrelatedResult = afterUnrelated.get(newUnrelated.iterator().next());
+                    long unrelatedLedgerKey = newUnrelated.iterator().next();
+                    QuiesceAndCloseResult unrelatedResult = afterUnrelated.get(unrelatedLedgerKey);
+                    require(unrelatedResult.key().equals(fsUnrelatedKey) && unrelatedResult.generation() == unrelatedLedgerKey,
+                            "the new ledger entry is bound to the exact unrelated dimension key, and the map's own key equals the result's own generation()");
                     require(unrelatedResult.status() == QuiesceAndCloseStatus.SAVED_AND_CLOSED
                                     && unrelatedResult.failureStage() == null && unrelatedResult.cause() == null,
                             "typed pinned-provider ledger evidence: the unrelated delete's real terminal is a clean SAVED_AND_CLOSED, proving the armed hook never touched it");
-                    fsUnrelatedTerminalGeneration.set(newUnrelated.iterator().next());
+                    fsUnrelatedTerminalGeneration.set(unrelatedLedgerKey);
                     fsLedgerBaseline.set(afterUnrelated);
                     require(runtime.beginConfirmedDelete(FS_TARGET_NAME, fsTargetDelete::set)
                                     == VerseLifecycleCommandService.DeleteAdmission.ADMITTED,
@@ -313,7 +317,10 @@ public final class ProviderSafeDeleteScenariosGameTest {
                     Set<Long> newTarget = new HashSet<>(afterTarget.keySet());
                     newTarget.removeAll(fsLedgerBaseline.get().keySet());
                     require(newTarget.size() == 1, "exactly one new pinned-provider ledger entry appeared for the target delete");
-                    QuiesceAndCloseResult targetResult = afterTarget.get(newTarget.iterator().next());
+                    long targetLedgerKey = newTarget.iterator().next();
+                    QuiesceAndCloseResult targetResult = afterTarget.get(targetLedgerKey);
+                    require(targetResult.key().equals(fsTargetKey) && targetResult.generation() == targetLedgerKey,
+                            "the new ledger entry is bound to the exact target dimension key, and the map's own key equals the result's own generation()");
                     require(targetResult.status() == QuiesceAndCloseStatus.FAILED_SAVE
                                     && targetResult.failureStage() == QuiesceAndCloseFailureStage.SAVE
                                     && targetResult.sourceReadiness() == QuiesceAndCloseSourceReadiness.READY
@@ -380,7 +387,16 @@ public final class ProviderSafeDeleteScenariosGameTest {
      */
     private static Map<Long, QuiesceAndCloseResult> readTerminalLedgerSnapshot(MinecraftServer server) {
         try {
-            Field terminalsField = server.getClass().getDeclaredField("quiesceAndCloseTerminalResults");
+            // getDeclaredField searches only the EXACT class it is called on,
+            // never inherited fields. The provider mixin injects this field
+            // onto MinecraftServer itself (confirmed against the patch); the
+            // concrete runtime server (e.g. GameTestServer under a GameTest)
+            // is a SUBCLASS that does not declare it directly, so
+            // server.getClass() here would throw NoSuchFieldException.
+            // Resolving from the exact known declaring class works for any
+            // concrete subclass, since a declared field's value can be read
+            // from any instance that is-a the declaring class.
+            Field terminalsField = MinecraftServer.class.getDeclaredField("quiesceAndCloseTerminalResults");
             terminalsField.setAccessible(true);
             Object terminals = terminalsField.get(server);
             require(terminals != null, "pinned provider mixin field quiesceAndCloseTerminalResults was null");

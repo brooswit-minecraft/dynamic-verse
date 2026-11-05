@@ -10,6 +10,46 @@ plan into the actual narrow source/runner it specifies, for review **before
 any native execution**. Nothing in this document, or in the source it
 describes, has been run.
 
+## Round 3, sixth incremental review (Jira comment 51607): a real reflection bug in the ledger reader, plus binding/wording corrections
+
+Reviewed against `9be475d`. Confirmed the requested preservation checks
+and root binding are present, and that three independent offline probes
+behave correctly. One concrete blocker remained, closed here:
+
+- **`readTerminalLedgerSnapshot` resolved the field from the wrong
+  class.** `server.getClass().getDeclaredField(...)` searches only the
+  EXACT class it's called on, never inherited fields -- the provider
+  mixin injects `quiesceAndCloseTerminalResults` onto `MinecraftServer`
+  itself, but the concrete runtime server under a GameTest is a subclass
+  that doesn't declare it directly, so the very first snapshot would have
+  thrown `NoSuchFieldException` before either FAILED_SAVE close. Fixed by
+  resolving from `MinecraftServer.class` directly (the exact known
+  declaring class) rather than `server.getClass()` -- a declared field's
+  value can be read from any instance that is-a the declaring class,
+  regardless of its concrete subtype. Verified the underlying Java
+  behavior with a standalone throwaway probe (a parent/child class pair)
+  before trusting either the bug report or the fix: `Child.class
+  .getDeclaredField` on a parent-declared field throws exactly as
+  predicted, and `Parent.class.getDeclaredField(...).get(childInstance)`
+  correctly reads it.
+- **Bound both observed terminal results to their intended identities.**
+  `unrelatedResult.key()`/`targetResult.key()` are now required to equal
+  the exact unrelated/target dimension keys, and each ledger map's own
+  key is required to equal that result's own `generation()` -- on top of
+  (not replacing) the existing unique-new-entry checks, the typed
+  FAILED_SAVE/SAVE/READY/cause checks, and the once-per-JVM hook
+  handling, all unchanged.
+- **Two wording corrections** (flagged as non-blocking): the occupied/busy
+  `ReadyVerse` comparisons are described as record/semantic equality
+  across every field, not "byte-for-byte."
+
+Re-verified without executing anything natively: a standalone Java
+probe confirming the exact `getDeclaredField` inheritance behavior before
+and after the fix; `compileJava`/`compileTestJava`/`test` 93/0/0/0
+(unaffected); the in-process fixture's launch script regenerated and
+inspected. No GameTest in this class has been run; no native run, kill,
+or live-world action has occurred.
+
 ## Round 3, fifth incremental review (Jira comment 51604): typed FAILED_SAVE evidence, stronger preservation proofs, and binding the root claim to its own path
 
 Reviewed against `056c523`. Credited the corrected names, one serialized
