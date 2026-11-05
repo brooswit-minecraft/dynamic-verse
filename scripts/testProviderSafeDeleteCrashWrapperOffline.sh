@@ -208,7 +208,41 @@ mkdir -p "$root_claimed" 2>/dev/null || true
 marker_after=$(cat "$root_claimed/.dynamicverse-safe-delete-crash-execution-root-claim")
 check "a claimed root's marker is unaffected by an idempotent directory-ensure (modeling ModDev's own prepare*Run)" \
   "$([[ "$marker_before" == "$marker_after" ]] && echo 1 || echo 0)"
-rm -rf "$root_probe_base"
+
+### 7. Negative tests requested in Jira comment 51604: a marker's mere
+### presence/shape is not enough -- it must name the EXACT directory it is
+### actually found in, and must not contain duplicate/conflicting fields.
+root_copied="$root_probe_base/copied-foreign-marker"
+mkdir "$root_copied"
+cp "$root_claimed/.dynamicverse-safe-delete-crash-execution-root-claim" "$root_copied/"
+root_is_exclusively_claimed "$root_copied"
+check "root_is_exclusively_claimed REFUSES a marker copied verbatim into a different directory (right shape, wrong location)" "$([[ $? != 0 ]] && echo 1 || echo 0)"
+
+root_wrong_field="$root_probe_base/wrong-canonical-root-field"
+mkdir "$root_wrong_field"
+sed "s#^canonicalRoot=.*#canonicalRoot=$root_probe_base/somewhere-else-entirely#" \
+  "$root_claimed/.dynamicverse-safe-delete-crash-execution-root-claim" > "$root_wrong_field/.dynamicverse-safe-delete-crash-execution-root-claim"
+root_is_exclusively_claimed "$root_wrong_field"
+check "root_is_exclusively_claimed REFUSES a marker whose canonicalRoot field names a different path" "$([[ $? != 0 ]] && echo 1 || echo 0)"
+
+root_dup_nonce="$root_probe_base/duplicate-nonce-field"
+mkdir "$root_dup_nonce"
+own_canonical=$(cd -- "$root_dup_nonce" && pwd -P)
+{
+  sed "s#^canonicalRoot=.*#canonicalRoot=$own_canonical#" "$root_claimed/.dynamicverse-safe-delete-crash-execution-root-claim"
+  echo "nonce=0000000000000000000000000000000000000000000000000000000000000000"
+} > "$root_dup_nonce/.dynamicverse-safe-delete-crash-execution-root-claim"
+root_is_exclusively_claimed "$root_dup_nonce"
+check "root_is_exclusively_claimed REFUSES a marker with a duplicate/conflicting nonce field" "$([[ $? != 0 ]] && echo 1 || echo 0)"
+
+root_malformed_nonce="$root_probe_base/malformed-nonce-field"
+mkdir "$root_malformed_nonce"
+own_canonical2=$(cd -- "$root_malformed_nonce" && pwd -P)
+sed -e "s#^canonicalRoot=.*#canonicalRoot=$own_canonical2#" -e 's/^nonce=.*/nonce=not-a-valid-hex-nonce/' \
+  "$root_claimed/.dynamicverse-safe-delete-crash-execution-root-claim" > "$root_malformed_nonce/.dynamicverse-safe-delete-crash-execution-root-claim"
+root_is_exclusively_claimed "$root_malformed_nonce"
+check "root_is_exclusively_claimed REFUSES a marker with a malformed (non-hex) nonce" "$([[ $? != 0 ]] && echo 1 || echo 0)"
+
 rm -rf "$root_probe_base"
 
 echo "---"

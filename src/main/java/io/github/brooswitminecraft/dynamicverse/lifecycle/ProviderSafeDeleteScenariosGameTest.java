@@ -1,11 +1,21 @@
 package io.github.brooswitminecraft.dynamicverse.lifecycle;
 
+import dev.galacticraft.dynamicdimensions.api.lifecycle.QuiesceAndCloseFailureStage;
+import dev.galacticraft.dynamicdimensions.api.lifecycle.QuiesceAndCloseResult;
+import dev.galacticraft.dynamicdimensions.api.lifecycle.QuiesceAndCloseSourceReadiness;
+import dev.galacticraft.dynamicdimensions.api.lifecycle.QuiesceAndCloseStatus;
+import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
 import java.util.OptionalLong;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.gametest.framework.GameTest;
 import net.minecraft.gametest.framework.GameTestHelper;
@@ -14,9 +24,11 @@ import net.minecraft.gametest.framework.GameTestListener;
 import net.minecraft.gametest.framework.GameTestRunner;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.dimension.DimensionType;
 import net.minecraft.world.level.storage.LevelResource;
 import net.neoforged.neoforge.common.util.FakePlayerFactory;
@@ -26,23 +38,22 @@ import net.neoforged.neoforge.gametest.PrefixGameTestTemplate;
  * In-process (single-JVM) real-provider/real-store acceptance for the four
  * safe-delete scenarios requested separately from the two-JVM crash fixture
  * (MINECRAFT-470 PR3 review, authorized for preparation under 51562/51571/
- * 51577/51588, corrected per 51596): success, occupied-refusal (a real
- * player present in the target), busy-refusal (an outstanding real read
- * lease on the target), and exact-target FAILED_SAVE (via the real
+ * 51577/51588, corrected per 51596 and 51604): success, occupied-refusal (a
+ * real player present in the target), busy-refusal (an outstanding real
+ * read lease on the target), and exact-target FAILED_SAVE (via the real
  * {@code TestOnlySaveFailureHook}).
  *
  * <p>Runs as ONE {@code @GameTest} method against ONE
- * {@link ServerVerseRuntime#create(net.minecraft.server.MinecraftServer)}
- * instance, sequenced phase-by-phase, rather than four independent runtime
- * instances: every runtime constructor replays/reconciles the SAME on-disk
- * durable state file, so four concurrent constructors (plus
- * {@code DynamicVerse}'s own bootstrap instance, suppressed here via
- * {@code FixtureSelection.ownsRuntime()}) could otherwise race against each
- * other's in-flight operations. Real production wiring throughout -- the
- * real {@code ManagedVerseStateFileStore} and real {@code DeleteGateway}/
- * provider bridge -- not the {@code InMemoryManagedVerseStateStore}/fake
- * gateway the existing {@code NeoForgeVerseCommandsGameTest} confirmed-
- * delete test uses.</p>
+ * {@link ServerVerseRuntime#create(MinecraftServer)} instance, sequenced
+ * phase-by-phase, rather than four independent runtime instances: every
+ * runtime constructor replays/reconciles the SAME on-disk durable state
+ * file, so four concurrent constructors (plus {@code DynamicVerse}'s own
+ * bootstrap instance, suppressed here via {@code FixtureSelection.ownsRuntime()})
+ * could otherwise race against each other's in-flight operations. Real
+ * production wiring throughout -- the real {@code ManagedVerseStateFileStore}
+ * and real {@code DeleteGateway}/provider bridge -- not the
+ * {@code InMemoryManagedVerseStateStore}/fake gateway the existing
+ * {@code NeoForgeVerseCommandsGameTest} confirmed-delete test uses.</p>
  *
  * <p>Cleanup (closing the runtime, releasing any open lease, removing the
  * fixture's {@code FakePlayer}, restoring the armed system property) is
@@ -51,6 +62,18 @@ import net.neoforged.neoforge.gametest.PrefixGameTestTemplate;
  * outcome including a genuine framework timeout -- not only the success
  * path a {@code .thenExecute(...)} step at the end of a sequence would
  * reach.</p>
+ *
+ * <p>The FAILED_SAVE scenario's typed evidence comes from
+ * {@link #readTerminalLedgerSnapshot}, a narrowly-scoped, read-only
+ * reflective read of the pinned provider's own
+ * {@code MinecraftServerMixin.quiesceAndCloseTerminalResults} /
+ * {@code QuiesceAndCloseTerminals.results} ledger (no supported accessor
+ * exists; field names/types confirmed directly via {@code javap} against
+ * the real compiled mixin class, not assumed) -- it never executes a
+ * second failure, never resets the hook's once-per-JVM consumption, and
+ * never fabricates a terminal; if the ledger cannot be read, the fixture
+ * fails outright rather than silently falling back to the facade's
+ * generic {@code QUARANTINED} outcome as if it were equivalent proof.</p>
  *
  * <p>No part of this class has been run; see
  * docs/real-provider-safe-delete-acceptance-plan-20261104.md.</p>
@@ -64,6 +87,7 @@ public final class ProviderSafeDeleteScenariosGameTest {
     static final String FS_UNRELATED_NAME = "rp_scenario_fs_unrelated";
     static final String[] ALL_FIXED_NAMES = {SUCCESS_NAME, OCCUPIED_NAME, BUSY_NAME, FS_TARGET_NAME, FS_UNRELATED_NAME};
     private static final String FAILED_SAVE_PROPERTY = "dynamicdimensions.testOnlyFailSaveForKey";
+    private static final BlockPos SENTINEL_POS = new BlockPos(8, 80, 8);
 
     @GameTest(templateNamespace = "dynamicverse", template = "empty", timeoutTicks = 2000)
     @PrefixGameTestTemplate(false)
@@ -74,7 +98,9 @@ public final class ProviderSafeDeleteScenariosGameTest {
         var server = helper.getLevel().getServer();
         var runtime = ServerVerseRuntime.create(server);
         var state = ManagedVerseStateFileStore.minecraft(server);
+        ResourceKey<Level> successKey = ResourceKey.create(Registries.DIMENSION, ResourceLocation.fromNamespaceAndPath("dynamicverse", SUCCESS_NAME));
         ResourceKey<Level> occupiedKey = ResourceKey.create(Registries.DIMENSION, ResourceLocation.fromNamespaceAndPath("dynamicverse", OCCUPIED_NAME));
+        ResourceKey<Level> busyKey = ResourceKey.create(Registries.DIMENSION, ResourceLocation.fromNamespaceAndPath("dynamicverse", BUSY_NAME));
         ResourceKey<Level> fsTargetKey = ResourceKey.create(Registries.DIMENSION, ResourceLocation.fromNamespaceAndPath("dynamicverse", FS_TARGET_NAME));
         ResourceLocation fsTargetId = fsTargetKey.location();
 
@@ -110,11 +136,15 @@ public final class ProviderSafeDeleteScenariosGameTest {
         AtomicReference<VerseLifecycleCommandService.CreateOutcome> fsTargetCreate = new AtomicReference<>();
         AtomicReference<VerseLifecycleCommandService.CreateOutcome> fsUnrelatedCreate = new AtomicReference<>();
         AtomicReference<VerseLifecycleCommandService.DeleteOutcome> successDelete = new AtomicReference<>();
+        AtomicInteger successCompletions = new AtomicInteger();
         AtomicReference<VerseReservationSnapshot> busyAcquired = new AtomicReference<>();
         AtomicReference<VerseLifecycleCommandService.DeleteOutcome> fsUnrelatedDelete = new AtomicReference<>();
         AtomicReference<VerseLifecycleCommandService.DeleteOutcome> fsTargetDelete = new AtomicReference<>();
-        AtomicLong occupiedReadyGeneration = new AtomicLong(-1);
-        AtomicLong busyReadyGeneration = new AtomicLong(-1);
+        AtomicReference<ManagedVerseStateStore.ReadyVerse> occupiedReadyBefore = new AtomicReference<>();
+        AtomicReference<ManagedVerseStateStore.ReadyVerse> busyReadyBefore = new AtomicReference<>();
+        AtomicReference<ServerLevel> fsTargetLevelBeforeFailure = new AtomicReference<>();
+        AtomicReference<Map<Long, QuiesceAndCloseResult>> fsLedgerBaseline = new AtomicReference<>();
+        AtomicReference<Long> fsUnrelatedTerminalGeneration = new AtomicReference<>();
         int[] phase = {0};
 
         require(runtime.beginCreate(SUCCESS_NAME, VerseLifecycleCommandService.CreateType.NORMAL, OptionalLong.empty(), successCreate::set)
@@ -126,24 +156,24 @@ public final class ProviderSafeDeleteScenariosGameTest {
                 case 0 -> {
                     helper.assertTrue(successCreate.get() != null, "waiting for success-scenario create terminal");
                     require(successCreate.get() == VerseLifecycleCommandService.CreateOutcome.READY, "success-scenario create reaches READY");
-                    require(runtime.beginConfirmedDelete(SUCCESS_NAME, successDelete::set)
+                    require(runtime.beginConfirmedDelete(SUCCESS_NAME, outcome -> { successCompletions.incrementAndGet(); successDelete.set(outcome); })
                                     == VerseLifecycleCommandService.DeleteAdmission.ADMITTED,
                             "confirmed delete admitted against a real, READY, unobstructed verse");
                     phase[0] = 1;
                 }
                 case 1 -> {
                     helper.assertTrue(successDelete.get() != null, "waiting for success-scenario delete terminal");
-                    require(successDelete.get() == VerseLifecycleCommandService.DeleteOutcome.DELETED,
-                            "a real, unobstructed confirmed delete completes exactly once as DELETED");
-                    String successKey = ResourceLocation.fromNamespaceAndPath("dynamicverse", SUCCESS_NAME).toString();
-                    require(runtime.listManaged().stream().noneMatch(item -> item.name().equals(successKey)),
+                    require(successCompletions.get() == 1 && successDelete.get() == VerseLifecycleCommandService.DeleteOutcome.DELETED,
+                            "a real, unobstructed confirmed delete completes EXACTLY once (a real counter, not merely a set reference) as DELETED");
+                    String successKeyString = successKey.location().toString();
+                    require(runtime.listManaged().stream().noneMatch(item -> item.name().equals(successKeyString)),
                             "a successful real delete removes its own catalog entry");
-                    require(state.read().ready().values().stream().noneMatch(ready -> ready.id().equals(successKey))
-                                    && state.read().operations().values().stream().noneMatch(op -> op.destination().equals(successKey)),
+                    require(state.read().ready().values().stream().noneMatch(ready -> ready.id().equals(successKeyString))
+                                    && state.read().operations().values().stream().noneMatch(op -> op.destination().equals(successKeyString)),
                             "a successful real delete removes its own durable READY entry and operation intent");
-                    var successStorage = DimensionType.getStorageFolder(
-                            ResourceKey.create(Registries.DIMENSION, ResourceLocation.fromNamespaceAndPath("dynamicverse", SUCCESS_NAME)),
-                            server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize());
+                    require(server.getLevel(successKey) == null,
+                            "a successful real delete leaves the target genuinely unloaded, not merely absent from the catalog");
+                    var successStorage = DimensionType.getStorageFolder(successKey, server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize());
                     require(!Files.exists(successStorage, LinkOption.NOFOLLOW_LINKS),
                             "a successful real delete actually removes its own on-disk storage directory");
                     System.out.println("RP_SCENARIO_SUCCESS_ACCEPTED name=" + SUCCESS_NAME);
@@ -158,7 +188,8 @@ public final class ProviderSafeDeleteScenariosGameTest {
                     ServerLevel level = server.getLevel(occupiedKey);
                     require(level != null, "the occupied target's real ServerLevel is loaded once READY");
                     String occupiedKeyString = occupiedKey.location().toString();
-                    occupiedReadyGeneration.set(state.read().ready().get(occupiedKeyString).generation());
+                    writeSentinelAndSave(level, Blocks.REDSTONE_LAMP.defaultBlockState());
+                    occupiedReadyBefore.set(state.read().ready().get(occupiedKeyString));
                     // A real ServerPlayer (NeoForge's FakePlayer -- a real
                     // ServerPlayer subtype with no network connection, not a test
                     // double for the delete path itself) added to the target's own
@@ -175,8 +206,12 @@ public final class ProviderSafeDeleteScenariosGameTest {
                     require(runtime.listManaged().stream().anyMatch(item -> item.name().equals(occupiedKeyString)
                                     && item.state() == ManagedVerseListing.State.READY),
                             "a refused-at-admission delete leaves the occupied target's catalog entry untouched and READY");
-                    require(state.read().ready().get(occupiedKeyString).generation() == occupiedReadyGeneration.get(),
-                            "a refused-at-admission delete leaves the occupied target's durable READY generation unchanged");
+                    require(occupiedReadyBefore.get().equals(state.read().ready().get(occupiedKeyString)),
+                            "a refused-at-admission delete leaves the occupied target's ENTIRE durable READY record byte-for-byte unchanged, not only its generation");
+                    require(state.read().operations().values().stream().noneMatch(op -> op.destination().equals(occupiedKeyString)),
+                            "a refused-at-admission delete never journals a new durable operation intent for the occupied target");
+                    require(level.getBlockState(SENTINEL_POS).equals(Blocks.REDSTONE_LAMP.defaultBlockState()),
+                            "the occupied target's real saved sentinel content survives the refusal untouched");
                     System.out.println("RP_SCENARIO_OCCUPIED_ACCEPTED name=" + OCCUPIED_NAME);
 
                     require(runtime.beginCreate(BUSY_NAME, VerseLifecycleCommandService.CreateType.NORMAL, OptionalLong.empty(), busyCreate::set)
@@ -186,6 +221,7 @@ public final class ProviderSafeDeleteScenariosGameTest {
                 case 3 -> {
                     helper.assertTrue(busyCreate.get() != null, "waiting for busy-scenario create terminal");
                     require(busyCreate.get() == VerseLifecycleCommandService.CreateOutcome.READY, "busy-scenario create reaches READY");
+                    writeSentinelAndSave(server.getLevel(busyKey), Blocks.GLOWSTONE.defaultBlockState());
                     runtime.beginAcquireReadyRead(BUSY_NAME, busyAcquired::set);
                     phase[0] = 4;
                 }
@@ -193,8 +229,8 @@ public final class ProviderSafeDeleteScenariosGameTest {
                     helper.assertTrue(busyAcquired.get() != null, "waiting for the real read-lease acquisition terminal");
                     require(busyAcquired.get().lease().isPresent(), "a READY busy-scenario verse grants a real read lease");
                     openLease.set(busyAcquired.get().lease().orElseThrow());
-                    String busyKeyString = ResourceLocation.fromNamespaceAndPath("dynamicverse", BUSY_NAME).toString();
-                    busyReadyGeneration.set(state.read().ready().get(busyKeyString).generation());
+                    String busyKeyString = busyKey.location().toString();
+                    busyReadyBefore.set(state.read().ready().get(busyKeyString));
                     // VerseOperationGate.beginDelete's own guard ("entry.reads !=
                     // 0") is keyed on an outstanding READ reservation specifically
                     // -- readiness() itself ignores the reads counter, so an
@@ -210,8 +246,12 @@ public final class ProviderSafeDeleteScenariosGameTest {
                     require(runtime.listManaged().stream().anyMatch(item -> item.name().equals(busyKeyString)
                                     && item.state() == ManagedVerseListing.State.READY),
                             "a busy-refused delete leaves the busy target's catalog entry untouched and READY");
-                    require(state.read().ready().get(busyKeyString).generation() == busyReadyGeneration.get(),
-                            "a busy-refused delete leaves the busy target's durable READY generation unchanged");
+                    require(busyReadyBefore.get().equals(state.read().ready().get(busyKeyString)),
+                            "a busy-refused delete leaves the busy target's ENTIRE durable READY record byte-for-byte unchanged, not only its generation");
+                    require(state.read().operations().values().stream().noneMatch(op -> op.destination().equals(busyKeyString)),
+                            "a busy-refused delete never journals a new durable operation intent for the busy target");
+                    require(server.getLevel(busyKey).getBlockState(SENTINEL_POS).equals(Blocks.GLOWSTONE.defaultBlockState()),
+                            "the busy target's real saved sentinel content survives the refusal untouched");
                     ReadyVerseLease lease = openLease.getAndSet(null);
                     lease.close();
                     System.out.println("RP_SCENARIO_BUSY_ACCEPTED name=" + BUSY_NAME);
@@ -236,6 +276,11 @@ public final class ProviderSafeDeleteScenariosGameTest {
                     require(fsTargetCreate.get() == VerseLifecycleCommandService.CreateOutcome.READY
                                     && fsUnrelatedCreate.get() == VerseLifecycleCommandService.CreateOutcome.READY,
                             "both FAILED_SAVE target and unrelated creates reach READY, with the hook already armed for the target only");
+                    // Captured BEFORE the real forced-save failure so the post-
+                    // failure check can compare the EXACT same object, not merely
+                    // assert some non-null level is present.
+                    fsTargetLevelBeforeFailure.set(server.getLevel(fsTargetKey));
+                    fsLedgerBaseline.set(readTerminalLedgerSnapshot(server));
                     require(runtime.beginConfirmedDelete(FS_UNRELATED_NAME, fsUnrelatedDelete::set)
                                     == VerseLifecycleCommandService.DeleteAdmission.ADMITTED,
                             "unrelated confirmed delete admitted while the hook is armed for a DIFFERENT key");
@@ -245,6 +290,16 @@ public final class ProviderSafeDeleteScenariosGameTest {
                     helper.assertTrue(fsUnrelatedDelete.get() != null, "waiting for the FAILED_SAVE-scenario unrelated delete terminal");
                     require(fsUnrelatedDelete.get() == VerseLifecycleCommandService.DeleteOutcome.DELETED,
                             "a non-matching key's real save is never touched by a hook armed for a different exact key -- the unrelated verse deletes normally");
+                    Map<Long, QuiesceAndCloseResult> afterUnrelated = readTerminalLedgerSnapshot(server);
+                    Set<Long> newUnrelated = new HashSet<>(afterUnrelated.keySet());
+                    newUnrelated.removeAll(fsLedgerBaseline.get().keySet());
+                    require(newUnrelated.size() == 1, "exactly one new pinned-provider ledger entry appeared for the unrelated delete");
+                    QuiesceAndCloseResult unrelatedResult = afterUnrelated.get(newUnrelated.iterator().next());
+                    require(unrelatedResult.status() == QuiesceAndCloseStatus.SAVED_AND_CLOSED
+                                    && unrelatedResult.failureStage() == null && unrelatedResult.cause() == null,
+                            "typed pinned-provider ledger evidence: the unrelated delete's real terminal is a clean SAVED_AND_CLOSED, proving the armed hook never touched it");
+                    fsUnrelatedTerminalGeneration.set(newUnrelated.iterator().next());
+                    fsLedgerBaseline.set(afterUnrelated);
                     require(runtime.beginConfirmedDelete(FS_TARGET_NAME, fsTargetDelete::set)
                                     == VerseLifecycleCommandService.DeleteAdmission.ADMITTED,
                             "target confirmed delete admitted (the armed failure fires during the forced save, not at admission)");
@@ -254,22 +309,39 @@ public final class ProviderSafeDeleteScenariosGameTest {
                     helper.assertTrue(fsTargetDelete.get() != null, "waiting for the FAILED_SAVE-scenario target delete terminal");
                     require(fsTargetDelete.get() == VerseLifecycleCommandService.DeleteOutcome.QUARANTINED,
                             "an exact-target armed FAILED_SAVE surfaces as QUARANTINED, never as a silent DELETED");
+                    Map<Long, QuiesceAndCloseResult> afterTarget = readTerminalLedgerSnapshot(server);
+                    Set<Long> newTarget = new HashSet<>(afterTarget.keySet());
+                    newTarget.removeAll(fsLedgerBaseline.get().keySet());
+                    require(newTarget.size() == 1, "exactly one new pinned-provider ledger entry appeared for the target delete");
+                    QuiesceAndCloseResult targetResult = afterTarget.get(newTarget.iterator().next());
+                    require(targetResult.status() == QuiesceAndCloseStatus.FAILED_SAVE
+                                    && targetResult.failureStage() == QuiesceAndCloseFailureStage.SAVE
+                                    && targetResult.sourceReadiness() == QuiesceAndCloseSourceReadiness.READY
+                                    && targetResult.sourceStillLoaded(),
+                            "typed pinned-provider ledger evidence: FAILED_SAVE/SAVE/READY, matching the provider's own state-machine test expectation for this exact case");
+                    require(targetResult.cause() != null
+                                    && targetResult.cause().getClass().getName().endsWith(".TestOnlySaveFailureHook$TestOnlySaveFailure"),
+                            "typed pinned-provider ledger evidence: the terminal's cause is the exact TestOnlySaveFailureHook.TestOnlySaveFailure, not some other failure that happened to also quarantine");
+
                     String fsTargetKeyString = fsTargetId.toString();
                     require(runtime.listManaged().stream().anyMatch(item -> item.name().equals(fsTargetKeyString)
                                     && item.state() == ManagedVerseListing.State.QUARANTINED),
                             "the quarantined target's catalog entry is retained, not dropped");
                     // The provider's own QuiesceAndCloseOrchestrator returns
                     // FAILED_SAVE/SAVE immediately on a save failure, BEFORE ever
-                    // reaching its close step (confirmed by reading
-                    // QuiesceAndCloseOrchestrator.execute and its own state-machine
-                    // test's "FAILED_SAVE/SAVE/READY" expectation) -- the source
-                    // level is never closed. Runtime-level quarantine revokes gate
-                    // readiness bookkeeping; it does not invent an unload. An
-                    // earlier draft incorrectly asserted the opposite.
-                    require(server.getLevel(fsTargetKey) != null,
-                            "a FAILED_SAVE-quarantined target's real source level remains loaded -- the provider never attempted to close it");
+                    // reaching its close step -- the source level is never closed.
+                    // Runtime-level quarantine revokes gate readiness bookkeeping;
+                    // it does not invent an unload. Compared against the EXACT
+                    // same ServerLevel instance captured before the failure, not
+                    // merely asserting some non-null level is present.
+                    require(server.getLevel(fsTargetKey) == fsTargetLevelBeforeFailure.get(),
+                            "a FAILED_SAVE-quarantined target's real source level is the SAME retained instance, never reloaded or replaced");
                     require(state.read().ready().containsKey(fsTargetKeyString),
                             "a FAILED_SAVE-quarantined target's durable READY metadata is retained, never silently dropped");
+                    require(state.read().operations().values().stream().anyMatch(op -> op.destination().equals(fsTargetKeyString)
+                                    && op.kind() == ManagedVerseStateStore.OperationKind.DELETE
+                                    && op.phase() == ManagedVerseStateStore.OperationPhase.PENDING),
+                            "the quarantined target's durable DELETE operation intent is retained as PENDING -- SafeDeleteOperation's journal has no quarantine-specific update, confirmed by reading it directly, so this is the exact recovery intent a future restart must find");
                     var targetStorage = DimensionType.getStorageFolder(fsTargetKey, server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize());
                     require(Files.isDirectory(targetStorage, LinkOption.NOFOLLOW_LINKS),
                             "an armed FAILED_SAVE must never have removed the target's on-disk storage");
@@ -278,13 +350,56 @@ public final class ProviderSafeDeleteScenariosGameTest {
                     runtime.tick();
                     require(deniedLease.get() != null && deniedLease.get().lease().isEmpty(),
                             "a quarantined target denies any new real read lease");
-                    System.out.println("RP_SCENARIO_FAILED_SAVE_ACCEPTED target=" + FS_TARGET_NAME + " unrelated=" + FS_UNRELATED_NAME);
+                    System.out.println("RP_SCENARIO_FAILED_SAVE_ACCEPTED target=" + FS_TARGET_NAME + " unrelated=" + FS_UNRELATED_NAME
+                            + " unrelatedLedgerGeneration=" + fsUnrelatedTerminalGeneration.get());
                     phase[0] = 8;
                 }
                 default -> { }
             }
             helper.assertTrue(phase[0] >= 8, "waiting for the final phase");
         }).thenSucceed();
+    }
+
+    private static void writeSentinelAndSave(ServerLevel level, net.minecraft.world.level.block.state.BlockState state) {
+        require(level != null, "sentinel write requires the level to actually be loaded");
+        level.setBlock(SENTINEL_POS, state, 0);
+        level.save(null, true, false);
+        require(level.getBlockState(SENTINEL_POS).equals(state), "sentinel write did not take effect");
+    }
+
+    /**
+     * Narrowly-scoped, read-only reflective snapshot of the pinned provider's
+     * own terminal-outcome ledger ({@code MinecraftServerMixin
+     * .quiesceAndCloseTerminalResults}, backed by
+     * {@code QuiesceAndCloseTerminals.results}). No supported accessor
+     * exists; field names/types are pinned to the exact patched provider
+     * this PR already pins everywhere else (confirmed via {@code javap}
+     * against the real compiled mixin class). Fails closed -- never
+     * silently returns an empty/partial snapshot -- if the pinned shape
+     * does not match, exactly as every entry this reads is declared.
+     */
+    private static Map<Long, QuiesceAndCloseResult> readTerminalLedgerSnapshot(MinecraftServer server) {
+        try {
+            Field terminalsField = server.getClass().getDeclaredField("quiesceAndCloseTerminalResults");
+            terminalsField.setAccessible(true);
+            Object terminals = terminalsField.get(server);
+            require(terminals != null, "pinned provider mixin field quiesceAndCloseTerminalResults was null");
+            require("dev.galacticraft.dynamicdimensions.impl.internal.QuiesceAndCloseTerminals".equals(terminals.getClass().getName()),
+                    "pinned provider mixin field quiesceAndCloseTerminalResults is not the exact pinned ledger type: " + terminals.getClass().getName());
+            Field resultsField = terminals.getClass().getDeclaredField("results");
+            resultsField.setAccessible(true);
+            Object resultsObj = resultsField.get(terminals);
+            require(resultsObj instanceof Map, "pinned provider ledger field 'results' is not a Map as declared");
+            Map<Long, QuiesceAndCloseResult> snapshot = new HashMap<>();
+            for (Map.Entry<?, ?> entry : ((Map<?, ?>) resultsObj).entrySet()) {
+                require(entry.getKey() instanceof Long, "pinned provider ledger key is not a Long as declared");
+                require(entry.getValue() instanceof QuiesceAndCloseResult, "pinned provider ledger value is not a QuiesceAndCloseResult as declared");
+                snapshot.put((Long) entry.getKey(), (QuiesceAndCloseResult) entry.getValue());
+            }
+            return snapshot;
+        } catch (ReflectiveOperationException reflective) {
+            throw new IllegalStateException("cannot reflectively read the pinned provider's quiesce-and-close terminal ledger -- the pinned field shape may have changed; refusing to fall back to weaker generic evidence", reflective);
+        }
     }
 
     private static void require(boolean value, String message) { if (!value) throw new IllegalStateException(message); }

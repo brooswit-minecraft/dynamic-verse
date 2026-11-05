@@ -104,16 +104,26 @@ refuse() { printf '%s\n' "refused: $*" >&2; exit 125; }
 # pre-existing marker file byte-for-byte untouched.
 claim_marker_name=.dynamicverse-safe-delete-crash-execution-root-claim
 root_is_exclusively_claimed() {
-  local path=$1 marker entries
+  local path=$1 marker entries canonical_actual
   [[ -d "$path" && ! -L "$path" ]] || return 1
   entries=$(find -P "$path" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null) || return 1
   [[ "$entries" == "$claim_marker_name" ]] || return 1
   marker="$path/$claim_marker_name"
   [[ -f "$marker" && ! -L "$marker" ]] || return 1
+  # Exactly one of each field -- grep -q alone only proves at least one
+  # matching line exists, which a duplicate/conflicting line would still
+  # satisfy; counting first catches that.
+  [[ $(grep -c '^canonicalRoot=' "$marker") == 1 ]] || return 1
+  [[ $(grep -c '^claimedAtUtc=' "$marker") == 1 ]] || return 1
+  [[ $(grep -c '^claimedByHost=' "$marker") == 1 ]] || return 1
+  [[ $(grep -c '^claimedByPid=' "$marker") == 1 ]] || return 1
+  [[ $(grep -c '^nonce=' "$marker") == 1 ]] || return 1
   grep -q '^nonce=[0-9a-f]\{64\}$' "$marker" || return 1
-  grep -q '^claimedAtUtc=' "$marker" || return 1
-  grep -q '^claimedByHost=' "$marker" || return 1
-  grep -q '^claimedByPid=' "$marker"
+  # The marker must name the EXACT directory it is actually found in --
+  # catches a marker copied verbatim into a different directory, which
+  # would otherwise still have the right shape.
+  canonical_actual=$(cd -- "$path" && pwd -P) || return 1
+  [[ "$(sed -n 's/^canonicalRoot=//p' "$marker")" == "$canonical_actual" ]]
 }
 
 # Linux /proc start-time ticks (stat field 22): stable across a kill -0 poll
@@ -336,9 +346,13 @@ main() {
 
   # This wrapper owns the one expected nonce, written at the game root (not
   # the world root -- the two must never be conflated). Neither phase ever
-  # generates or writes it.
+  # generates or writes it. Reuses the SAME nonce claimSafeDeleteCrashExecutionRoot.sh
+  # already recorded in the claim marker, rather than generating a fresh,
+  # unrelated one -- carrying the claim's own identity into execution
+  # instead of having two unrelated nonces in play for the same root.
   local expected_nonce
-  expected_nonce=$(sha256sum <<<"$RANDOM$RANDOM$$$(date +%s%N)" | awk '{print $1}') || refuse "cannot derive an expected nonce"
+  expected_nonce=$(sed -n 's/^nonce=//p' "$root/$claim_marker_name") || refuse "cannot read the claim nonce from the marker"
+  [[ -n "$expected_nonce" ]] || refuse "claim marker reports no nonce"
   printf '%s' "$expected_nonce" > "$nonce_file" || refuse "cannot write expected-nonce file"
 
   ### Phase A: launch, wait for the self-reported marker, verify and kill exactly that PID.

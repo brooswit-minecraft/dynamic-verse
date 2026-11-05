@@ -10,6 +10,78 @@ plan into the actual narrow source/runner it specifies, for review **before
 any native execution**. Nothing in this document, or in the source it
 describes, has been run.
 
+## Round 3, fifth incremental review (Jira comment 51604): typed FAILED_SAVE evidence, stronger preservation proofs, and binding the root claim to its own path
+
+Reviewed against `056c523`. Credited the corrected names, one serialized
+GameTest/runtime, bootstrap suppression, the terminal-cleanup listener,
+armed-before-unrelated ordering, and the truthful loaded-source
+expectation. Three more items, closed here:
+
+- **Strong typed FAILED_SAVE evidence turned out to be available after
+  all.** The pinned provider already retains its own typed
+  `QuiesceAndCloseResult` before invoking any completion callback:
+  `MinecraftServerMixin.quiesceAndCloseTerminalResults`, backed by
+  `QuiesceAndCloseTerminals.results` -- confirmed directly against the
+  patch and, since Mixin merges fields into the target class, against the
+  real compiled mixin class via `javap` (field name and declared type
+  exactly as expected, not assumed). No supported accessor exists, so
+  `readTerminalLedgerSnapshot` is a narrowly-scoped, read-only reflective
+  snapshot of that one field (and the private `results` map inside it),
+  validating every value's exact declared type as it reads it and failing
+  the fixture outright -- never silently falling back to the generic
+  `QUARANTINED` outcome -- if the pinned shape doesn't match. The
+  FAILED_SAVE phase now diffs the ledger's key set immediately before and
+  after each of the unrelated and target deletes (never inspecting a
+  generation number assigned by the provider ahead of time, and never
+  touching the hook a second time or resetting its once-per-JVM
+  consumption): the unrelated delete's new entry must be a clean
+  `SAVED_AND_CLOSED` with no failure, and the target's new entry must be
+  `FAILED_SAVE`/`SAVE`/`READY` with `sourceStillLoaded()` true and a cause
+  whose class name ends in `.TestOnlySaveFailureHook$TestOnlySaveFailure`
+  -- the exact typed signal, not a generic quarantine standing in for it.
+- **Several preservation assertions were still missing, not merely weak.**
+  Added: a real `AtomicInteger` completion counter for the success
+  scenario (a `set`-only reference cannot prove "exactly once"); an
+  exact-instance comparison of the FAILED_SAVE target's `ServerLevel`
+  before and after the failure (`==`, not merely non-null); a check that
+  the target's durable DELETE operation intent is retained as `PENDING`
+  (confirmed by reading `SafeDeleteOperation` directly that nothing ever
+  updates it on a quarantine -- this IS the exact recovery intent a future
+  restart would need to find); full-record (`.equals()`, every field, not
+  only `.generation()`) comparison of the occupied/busy targets' durable
+  `ReadyVerse` before and after their refused attempts; confirmation that
+  neither refusal ever journals a new durable operation intent; a real
+  sentinel block written and saved into each of the occupied/busy targets
+  before the refusal and verified unchanged after; and the success
+  scenario's explicit unloaded-level assertion, retained alongside the
+  disk/catalog removal checks.
+- **The root claim wasn't actually bound to its own path.** The marker had
+  no field naming its own containing directory, so
+  `root_is_exclusively_claimed` only checked shape -- an offline probe
+  confirmed a marker copied verbatim into a different directory was
+  wrongly accepted. `claimSafeDeleteCrashExecutionRoot.sh` now resolves
+  and records a `canonicalRoot=` field, validates every ancestor (not only
+  the immediate parent) is not itself a symlink before claiming, and the
+  check now requires that field to equal the directory's own resolved
+  path, requires exactly one of each field (catching a duplicate or
+  conflicting line a plain `grep -q` would miss), and still requires the
+  nonce's own format. The main wrapper no longer generates an unrelated
+  fresh nonce for execution -- it reads and reuses the SAME nonce the
+  claim recorded, carrying that one identity through claim → generated
+  cwd/`expectedGameRoot` → execution. Added negative tests for a
+  copied/foreign marker, a marker naming the wrong root, and markers with
+  a duplicate or malformed nonce field.
+
+Re-verified without executing anything natively: `compileJava`/
+`compileTestJava`/`test` 93/0/0/0 (unaffected -- only the fixture's
+internals changed, not its scenario count); the in-process fixture's
+launch script regenerated and inspected; the committed offline harness
+extended to 23/23, including a full end-to-end dry run (claim a fresh
+root, confirm `root_is_exclusively_claimed` accepts it and the claim's own
+nonce is readable for execution) against the real wrapper functions, not
+a replica. No GameTest in this class has been run; no native run, kill,
+or live-world action has occurred.
+
 ## Round 3, fourth incremental review (Jira comment 51596): six corrections to the in-process fixture and the root-provenance gap
 
 Reviewed against `0f0d198`. Credited that the fixture and harness are now
