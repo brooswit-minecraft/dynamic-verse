@@ -26,6 +26,7 @@ import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderSeededDuplicat
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderSeededRestartPhaseAGameTest;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderSeededRestartPhaseBGameTest;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderOrdinaryRestartFixture;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderSafeDeleteCrashFixture;
 import java.util.List;
 import java.util.OptionalLong;
 import java.util.function.Consumer;
@@ -37,6 +38,7 @@ public final class DynamicVerse {
     public static final String MOD_ID = "dynamicverse";
     private ServerVerseRuntime runtime;
     private ProviderOrdinaryRestartFixture ordinaryRestart;
+    private ProviderSafeDeleteCrashFixture safeDeleteCrash;
     private final BootstrapFacade facade = new BootstrapFacade();
 
     public DynamicVerse(IEventBus modEventBus) {
@@ -50,7 +52,7 @@ public final class DynamicVerse {
 
     private void registerGameTests(RegisterGameTestsEvent event) {
         FixtureSelection selection = fixtureSelection();
-        if (selection.ordinaryPhase != null) return; // O1/O2 is an ordinary server profile, never a GameTest selection.
+        if (selection.ordinaryPhase != null || selection.safeDeleteCrashPhase != null) return; // ordinary server profiles, never a GameTest selection.
         String restartPhase = selection.seededRestartPhase;
         event.register(selection.seededBridgeRegression ? SeededBridgeRegressionGameTest.class : switch (restartPhase) {
             case "A" -> ProviderSeededRestartPhaseAGameTest.class;
@@ -80,6 +82,13 @@ public final class DynamicVerse {
             ordinaryRestart = new ProviderOrdinaryRestartFixture(selection.ordinaryPhase);
             ordinaryRestart.started(event.getServer(), runtime);
         }
+        // Prepared for review, not yet executed: see
+        // docs/real-provider-safe-delete-acceptance-plan-20261104.md. Phase A
+        // deliberately blocks the server thread here and never returns.
+        if (selection.safeDeleteCrashPhase != null && runtime != null) {
+            safeDeleteCrash = new ProviderSafeDeleteCrashFixture(selection.safeDeleteCrashPhase);
+            safeDeleteCrash.started(event.getServer(), runtime);
+        }
     }
     private void afterServerTick(ServerTickEvent.Post event) {
         if (runtime != null && runtime.owns(event.getServer())) runtime.tick();
@@ -87,6 +96,7 @@ public final class DynamicVerse {
     }
     private void serverStopping(ServerStoppingEvent event) {
         ordinaryRestart = null;
+        safeDeleteCrash = null;
         if (runtime != null && runtime.owns(event.getServer())) { runtime.close(); runtime = null; }
     }
 
@@ -94,20 +104,23 @@ public final class DynamicVerse {
     private static FixtureSelection fixtureSelection() {
         String seededPhase = System.getProperty("dynamicverse.providerSeededRestartPhase", "");
         String ordinaryPhase = System.getProperty("dynamicverse.providerOrdinaryRestartPhase", "");
+        String safeDeleteCrashPhase = System.getProperty("dynamicverse.providerSafeDeleteCrashPhase", "");
         boolean seededBridge = Boolean.getBoolean("dynamicverse.seededBridgeRegression");
         boolean providerCreate = Boolean.getBoolean("dynamicverse.providerCreateIntegration");
         boolean providerDuplicate = Boolean.getBoolean("dynamicverse.providerSeededDuplicateIntegration");
         boolean providerBridge = Boolean.getBoolean("dynamicverse.providerBridgeIntegration");
         if (!seededPhase.isEmpty() && !seededPhase.equals("A") && !seededPhase.equals("B")) throw new IllegalStateException("unsupported seeded restart phase");
         if (!ordinaryPhase.isEmpty() && !ordinaryPhase.equals("O1") && !ordinaryPhase.equals("O2")) throw new IllegalStateException("unsupported ordinary restart phase");
+        if (!safeDeleteCrashPhase.isEmpty() && !safeDeleteCrashPhase.equals("A") && !safeDeleteCrashPhase.equals("B")) throw new IllegalStateException("unsupported safe-delete crash phase");
         int selected = (seededPhase.isEmpty() ? 0 : 1) + (ordinaryPhase.isEmpty() ? 0 : 1) + (seededBridge ? 1 : 0)
-                + (providerCreate ? 1 : 0) + (providerDuplicate ? 1 : 0) + (providerBridge ? 1 : 0);
+                + (providerCreate ? 1 : 0) + (providerDuplicate ? 1 : 0) + (providerBridge ? 1 : 0) + (safeDeleteCrashPhase.isEmpty() ? 0 : 1);
         if (selected > 1) throw new IllegalStateException("mixed Dynamic Verse fixture selectors are refused");
-        return new FixtureSelection(seededPhase, ordinaryPhase.isEmpty() ? null : ordinaryPhase, seededBridge, providerCreate, providerDuplicate, providerBridge);
+        return new FixtureSelection(seededPhase, ordinaryPhase.isEmpty() ? null : ordinaryPhase, seededBridge, providerCreate, providerDuplicate, providerBridge,
+                safeDeleteCrashPhase.isEmpty() ? null : safeDeleteCrashPhase);
     }
     private record FixtureSelection(String seededRestartPhase, String ordinaryPhase, boolean seededBridgeRegression,
                                     boolean providerCreateIntegration, boolean providerSeededDuplicateIntegration,
-                                    boolean providerBridgeIntegration) {
+                                    boolean providerBridgeIntegration, String safeDeleteCrashPhase) {
         boolean ownsRuntime() { return seededRestartPhase.equals("A") || seededRestartPhase.equals("B") || providerSeededDuplicateIntegration; }
     }
 

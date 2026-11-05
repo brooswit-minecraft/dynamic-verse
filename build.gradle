@@ -172,6 +172,23 @@ neoForge {
             sourceSet = sourceSets.providerBridgeGameTest
             systemProperty "dynamicverse.providerOrdinaryRestartPhase", "O2"
         }
+        // Prepared for review, not yet executed: see
+        // docs/real-provider-safe-delete-acceptance-plan-20261104.md. Phase A
+        // deliberately never exits on its own; an external wrapper owns
+        // killing its exact verified PID. Phase B is a second, independent
+        // launch against the same disposable root.
+        register("providerSafeDeleteCrashPhaseA") {
+            type = "server"
+            gameDirectory = layout.projectDirectory.dir("run/m470-safe-delete-crash-disposable-20261104")
+            sourceSet = sourceSets.providerBridgeGameTest
+            systemProperty "dynamicverse.providerSafeDeleteCrashPhase", "A"
+        }
+        register("providerSafeDeleteCrashPhaseB") {
+            type = "server"
+            gameDirectory = layout.projectDirectory.dir("run/m470-safe-delete-crash-disposable-20261104")
+            sourceSet = sourceSets.providerBridgeGameTest
+            systemProperty "dynamicverse.providerSafeDeleteCrashPhase", "B"
+        }
     }
 }
 
