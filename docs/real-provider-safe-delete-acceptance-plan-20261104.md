@@ -10,6 +10,78 @@ plan into the actual narrow source/runner it specifies, for review **before
 any native execution**. Nothing in this document, or in the source it
 describes, has been run.
 
+## Round 3, second incremental review (Jira comment 51588): two confirmed runner defects
+
+Reviewed against addea9b. Credited the root-binding/negative test, frozen
+manifests, shared cleanup identity check, and Phase B process-group
+containment. Found two more defects, each reproduced live with a harmless,
+non-native probe before fixing:
+
+- **Both manifest captures were unchecked command substitutions.**
+  `pre_phase_a_manifest=$(capture_manifest ...)` and the phase-B equivalent
+  had no `|| refuse` guard. `capture_manifest` calls `refuse`/`exit`
+  internally on a helper failure, but that `exit` only terminates the
+  SUBSHELL the command substitution creates; under `set -uo pipefail`
+  without `-e`, the parent script was never told the assignment's command
+  had failed, and continued with whatever partial/empty stdout had been
+  produced. Reproduced with a direct probe: a simulated helper failure
+  inside such a subshell left the parent running with an empty captured
+  variable. Worse, if the same failure hit both phase A's and phase B's
+  capture identically, two empty manifests would compare equal via `diff`.
+  Fixed by adding an explicit `|| refuse` to both call sites, plus a new
+  `require_manifest_schema`, called on both captures, that rejects a
+  missing, partial, or empty manifest by checking each retained field is
+  present and looks like the 64-hex hash it's supposed to be -- defense in
+  depth against a helper that returns 0 but still produces malformed
+  output. `main()` now checks and rejects both before the disposable root
+  is created (pre-phase-A) and before phase B is launched (pre-phase-B).
+- **`Properties.store` escapes `:` in VALUES, not only in keys.** Confirmed
+  empirically: writing `processStartInstant=2026-11-05T01:12:10.123Z` via
+  a real `Properties.store` produces the literal line
+  `processStartInstant=2026-11-05T01\:12\:10.123Z` on disk. The wrapper
+  read this field with the same plain `sed` extraction used for every
+  other (colon-free) marker field, leaving the backslashes in place and
+  breaking `date -u -d ...` parsing -- reproduced directly. Fixed by
+  reusing the existing proper Java-properties reader
+  (`ProviderSeededRestartProperties.java`, already used by the
+  `providerOrdinaryRestart` wrapper for exactly this reason) via a new
+  `read_process_start_instant` helper, rather than hand-rolling Java
+  properties escaping rules in bash.
+
+Also restructured for testability, per the same review's request for "a
+source-level/mock failure-path test that actually exercises the wrapper
+functions, not merely a separately retyped happy-path replica": everything
+previously executed as bare top-level statements is now inside `main()`,
+called only when the file is EXECUTED directly
+(`[[ "${BASH_SOURCE[0]}" == "${0}" ]]`), not when it is sourced -- so a
+test can `source` this exact file to get its real functions with zero
+side effects. A new test sources the real wrapper and: reproduces the
+original unguarded-capture bug and proves the `|| refuse` fix stops it;
+injects a mocked helper failure into `capture_manifest` and confirms it's
+caught; feeds `require_manifest_schema` a partial and an empty manifest
+and confirms both are refused; diffs a real manifest against a
+deliberately drifted copy via `require_manifests_match` and confirms
+refusal, and against itself and confirms acceptance; and writes a real
+`Properties.store`d marker with a colon-bearing `processStartInstant`,
+proving the old `sed` read fails to parse while the new
+`read_process_start_instant` round-trips correctly. Run: 10/10 passed.
+
+Re-verified without executing anything natively: `compileJava`/
+`compileTestJava`/`test` unaffected (91/0/0/0 -- this round touched only
+the wrapper script); `bash -n`; sourcing the restructured wrapper produces
+its real functions with no side effects (confirmed: `main` is a defined
+function, never invoked, and the disposable root is not created); the
+existing read-only contract/manifest preflight re-run against the real
+generated files, unchanged results. Nothing has been executed natively.
+
+Operational note (not a defect, nothing to fix): the disposable game root
+currently exists on disk, empty, as a side effect of Gradle's
+`prepareProviderSafeDeleteCrashPhase*Run` tasks (run while regenerating
+the launch scripts during this review). The wrapper's own
+`[[ ! -e "$root" ]] || refuse ...` check will correctly refuse to proceed
+while it exists -- expected, fail-closed behavior, not something this
+non-native work should remove.
+
 ## Round 3, incremental review (Jira comment 51577): four more closures
 
 Reviewed against b8c706f (the game-root/world-root fix, not yet including
