@@ -112,13 +112,17 @@ neoForge {
             systemProperty "dynamicverse.providerCreateIntegration", "true"
             systemProperty "dynamicverse.explicitSuperflat", "true"
         }
-        // Prepared for review, not yet executed: the in-process (single-JVM,
-        // real provider/store wiring) companion to the two-JVM
-        // providerSafeDeleteCrashPhase{A,B} fixture -- success,
-        // occupied-refusal, busy-refusal, and exact-target FAILED_SAVE.
+        // The in-process (single-JVM, real provider/store wiring) companion
+        // to the two-JVM providerSafeDeleteCrashPhase{A,B} fixture --
+        // success, occupied-refusal, busy-refusal, and exact-target
+        // FAILED_SAVE. gameDirectory is overridable via
+        // -PsafeDeleteScenariosGameDirectory (mirroring
+        // -PsafeDeleteCrashGameDirectory on the crash fixture) so a real
+        // native run is never silently pointed at the stable preparation
+        // root ordinary script regeneration may have already touched.
         register("providerSafeDeleteScenariosGameTest") {
             type = "gameTestServer"
-            gameDirectory = layout.projectDirectory.dir("run/m470-safe-delete-scenarios-disposable-20261105")
+            gameDirectory = layout.projectDirectory.dir(findProperty("safeDeleteScenariosGameDirectory") ?: "run/m470-safe-delete-scenarios-disposable-20261105")
             sourceSet = sourceSets.providerBridgeGameTest
             systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
             systemProperty "dynamicverse.providerSafeDeleteScenarios", "true"

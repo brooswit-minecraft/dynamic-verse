@@ -1,4 +1,4 @@
-# Real-provider safe-delete acceptance: fixture/runner (for review, not yet executed)
+# Real-provider safe-delete acceptance: fixture/runner (two-JVM crash fixture not yet executed; in-process scenarios fixture executed once, see below)
 
 Per MINECRAFT-470 review: `runtimeConfirmedDeleteRemovesOnlyItsOwnMetadataAndInterruptedDeleteStaysQuarantinedAfterRestart`
 is useful production-wiring evidence, but its state store is
@@ -7,8 +7,126 @@ and reconstruction happens in the same process. Per the follow-up technical
 plan review (https://github.com/brooswit-minecraft/dynamic-verse/pull/3,
 "latest technical plan review" comment), this document was updated from a
 plan into the actual narrow source/runner it specifies, for review **before
-any native execution**. Nothing in this document, or in the source it
-describes, has been run.
+any native execution**. The two-JVM crash fixture/runner below (and
+everything under "Round 3" prior to the native run section) still has not
+been executed. Jira comment 51612 explicitly authorized exactly ONE bounded
+native invocation of the separate in-process scenarios fixture
+(`providerSafeDeleteScenariosGameTest`); that one run is documented in the
+section immediately below and has completed. No other native execution --
+including the two-JVM crash fixture, any second invocation, or any
+deliberate crash signal -- has occurred or is authorized.
+
+## Native execution: providerSafeDeleteScenariosGameTest (2026-11-05, head `597b841`)
+
+Authorized by Jira comment 51612 as one fresh, isolated, bounded invocation
+-- not a general go-ahead. Preconditions verified before launch, all
+independently (not relying on `verifyLocalDynamicDimensionsArtifact` or any
+cached/stale claim):
+
+- **Source head**: `597b84180bd32de8f095741fcdfee388452409c5`, clean
+  working tree (`git status --porcelain` empty), exactly the commit the
+  review (51607/51612) was reviewed against.
+- **Compiled classes match source**: fresh `compileJava compileTestJava
+  test` run immediately before launch -- `93/0/0/0` (unaffected; reported
+  separately from this native evidence per the review's instruction, never
+  conflated). The compiled `.class` file's mtime is newer than the source
+  file's. Independently confirmed via `javap -c -p -v` disassembly of the
+  real compiled `ProviderSafeDeleteScenariosGameTest.class` that
+  `readTerminalLedgerSnapshot`'s first bytecode instruction is
+  `ldc #200 // class net/minecraft/server/MinecraftServer` -- i.e. it
+  resolves the field from the class constant directly, not via
+  `aload_0; invokevirtual getClass()` -- confirming the 51607 fix is
+  actually what is compiled into the artifact that ran, not merely present
+  in source.
+- **Provider jar identity**: independently `sha256sum`'d (not trusted from
+  any prior claim) --
+  `4c4d70a90498fded6dcb8488a114597a5ed0052a8c721e888637d3e0bb29f041`,
+  matching the expected hook-bearing corrected provider exactly. Confirmed
+  present on the generated run's classpath via `ordinary_provider_input`.
+- **Generated closure/identity**: `exec '/tmp/temurin21/bin/java'` (the
+  pinned toolchain); `-Dneoforge.enabledGameTestNamespaces=dynamicverse`
+  and `-Ddynamicverse.providerSafeDeleteScenarios=true` both present in the
+  generated VM args; `-Dfml.modFolders=...` naming this workspace's own
+  freshly-compiled `build/classes/java/{main,test}`/`build/resources/{main,test}`.
+- **Execution root, uniquely owned**: the stable preparation root
+  (`run/m470-safe-delete-scenarios-disposable-20261105`, already present
+  and dirtied only by ordinary script-regeneration across this review) was
+  left untouched. A NEW root,
+  `run/m470-safe-delete-scenarios-NATIVE-20261105T0304Z`, was exclusively
+  claimed via the existing, reviewed `claimSafeDeleteCrashExecutionRoot.sh`
+  (reused as-is -- it is fully generic), and the Gradle run's
+  `gameDirectory` was pointed at it via a new minimal override,
+  `-PsafeDeleteScenariosGameDirectory` (added to `build.gradle`, mirroring
+  the existing `-PsafeDeleteCrashGameDirectory` pattern on the crash
+  fixture). Confirmed before launch: the claimed root contained EXACTLY
+  the claim marker (nothing else), the generated script's embedded `cd`
+  target matched that exact claimed root, and the stable preparation root
+  remained empty and unmodified throughout.
+
+**Run command** (via the new `scripts/runProviderSafeDeleteScenariosGameTestWithReceipt.sh`,
+mirroring the existing `runProviderCreateGameTestWithReceipt.sh` pattern --
+requires the generated script, requires the claimed root to contain
+exactly the claim marker and nothing else, requires no pre-existing
+receipts, `cd`s into the claimed root, runs the generated script under
+`tee` so the log is captured even on failure, records the real exit status
+separately from the wrapper's own):
+
+```
+bash scripts/runProviderSafeDeleteScenariosGameTestWithReceipt.sh
+```
+
+**Result**: wrapper exit `0`; underlying generated-script exit (`*.original-exit`) `0`.
+Log (`*.full.log`, 102 lines, SHA-256
+`32a78a83290b0a82f05c247eb5d1c40a88a33abc8e7742f4309cb3d78f9670a3`):
+`All 1 required tests passed :)`. Per-scenario receipt (the fixture's own
+`System.out.println` markers, in order):
+
+```
+RP_SCENARIO_SUCCESS_ACCEPTED name=rp_scenario_success
+RP_SCENARIO_OCCUPIED_ACCEPTED name=rp_scenario_occupied
+RP_SCENARIO_BUSY_ACCEPTED name=rp_scenario_busy
+RP_SCENARIO_FAILED_SAVE_ACCEPTED target=rp_scenario_fs_target unrelated=rp_scenario_fs_unrelated unrelatedLedgerGeneration=2
+```
+
+**Typed FAILED_SAVE identity/cause**: not separately printed to the log,
+but its proof IS the test passing -- `require()` throws immediately and
+fails the GameTest on any mismatch, and the FAILED_SAVE phase's own
+assertions (reflectively read from the pinned provider's real terminal
+ledger, per the 51604/51607 fixes) require, before reaching
+`RP_SCENARIO_FAILED_SAVE_ACCEPTED`: the new ledger entry's `key()` equals
+the exact target dimension key and its map key equals its own
+`generation()`; `status()==FAILED_SAVE`, `failureStage()==SAVE`,
+`sourceReadiness()==READY`, `sourceStillLoaded()==true`; and `cause()`'s
+class name ends in `.TestOnlySaveFailureHook$TestOnlySaveFailure`. The
+unrelated delete's own new entry (map key/generation `2`, confirmed in the
+receipt line above) was separately required to be a clean
+`SAVED_AND_CLOSED` with no failure stage or cause, proving the armed hook
+never touched it.
+
+**Independent filesystem corroboration**, performed after the run against
+the claimed root's own `world/dimensions/dynamicverse/`: `rp_scenario_success`
+and `rp_scenario_fs_unrelated` are both absent (deleted); `rp_scenario_fs_target`
+is present (retained, quarantined, never deleted or closed -- consistent
+with the FAILED_SAVE level remaining loaded, confirmed by the shutdown
+log's own `Saving chunks for level .../dynamicverse:rp_scenario_fs_target`
+line); `rp_scenario_occupied` and `rp_scenario_busy` are both present
+(retained, their deletes having been refused at admission, never
+attempted).
+
+**Cleanup outcome**: the `GameTestListener`-based cleanup (restoring the
+armed system property, closing the runtime, releasing resources) ran as
+part of the normal `testPassed` path; the server's own ordinary shutdown
+log shows a clean, orderly `Stopping server` / `Saving players` /
+`Saving worlds` / per-dimension `All chunks are saved` sequence with no
+forced termination.
+
+Kept separate from this native evidence, per the review's instruction: the
+93 ordinary `test` task and 23 offline-harness results reported in the
+rounds below are unaffected by and distinct from this native run.
+
+This was the ONE native invocation 51612 authorized. No two-JVM crash
+execution, deliberate crash signal, retained-root deletion, merge, or
+deployment has occurred or is requested next.
 
 ## Round 3, sixth incremental review (Jira comment 51607): a real reflection bug in the ledger reader, plus binding/wording corrections
 
