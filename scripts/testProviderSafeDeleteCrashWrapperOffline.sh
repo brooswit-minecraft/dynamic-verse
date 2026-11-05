@@ -4,7 +4,7 @@
 # sourced-wrapper test harness in the tree, not only reported as a result).
 # SOURCES the real wrapper to get its ACTUAL functions (capture_manifest,
 # require_manifest_schema, require_manifests_match, read_process_start_instant,
-# root_is_pristine_or_absent, refuse) -- not a hand-retyped replica -- and
+# root_is_exclusively_claimed, refuse) -- not a hand-retyped replica -- and
 # exercises failure paths with mocked helpers and real serialized input.
 # No process is spawned anywhere in this script; main() is never called
 # (sourcing never invokes it -- see the wrapper's own BASH_SOURCE guard).
@@ -29,7 +29,7 @@ check() {
 source "$wrapper"
 [[ "$(type -t capture_manifest)" == function && "$(type -t require_manifest_schema)" == function \
    && "$(type -t require_manifests_match)" == function && "$(type -t read_process_start_instant)" == function \
-   && "$(type -t root_is_pristine_or_absent)" == function && "$(type -t refuse)" == function ]]
+   && "$(type -t root_is_exclusively_claimed)" == function && "$(type -t refuse)" == function ]]
 check "sourced the real wrapper's actual functions" "$([[ $? == 0 ]] && echo 1 || echo 0)"
 
 normal_a_real="$workspace/build/moddev/providerSafeDeleteCrashPhaseARunClasspath.txt"
@@ -154,29 +154,61 @@ check "fix: read_process_start_instant returns the correctly unescaped value ('$
   "$([[ $fixed_rc == 0 && "$fixed_value" == "2026-11-05T01:12:10.123Z" && -n "$fixed_epoch" ]] && echo 1 || echo 0)"
 rm -rf "$tmp_marker_dir"
 
-### 6. root_is_pristine_or_absent: the execution-root/preparation-root
-### separation contract (Jira comment 51591). Accepts true absence and a
-### genuinely empty directory (ModDev's own prepare*Run side effect);
-### refuses anything with real content and any symlink -- never weakened.
+### 6. root_is_exclusively_claimed + claimSafeDeleteCrashExecutionRoot.sh:
+### the execution-root provenance contract (Jira comment 51596 -- an
+### emptiness check alone cannot prove a directory was freshly claimed by
+### THIS invocation, since ModDev's own prepare*Run side effect leaves an
+### untouched directory looking identically "empty" whether it was just
+### claimed or is some unrelated retained root). Accepts ONLY a root
+### carrying the exact marker the claim script writes; refuses a merely
+### empty directory, real content, and any symlink -- never weakened.
+claim_script="$workspace/scripts/claimSafeDeleteCrashExecutionRoot.sh"
 root_probe_base=$(mktemp -d)
 root_absent="$root_probe_base/absent"
 root_empty="$root_probe_base/empty"; mkdir "$root_empty"
 root_dirty="$root_probe_base/dirty"; mkdir "$root_dirty"; touch "$root_dirty/eula.txt"
 root_linked="$root_probe_base/linked"; root_real_target="$root_probe_base/real-target"; mkdir "$root_real_target"
 ln -s "$root_real_target" "$root_linked" 2>/dev/null || true
+root_claimed="$root_probe_base/claimed"
 
-root_is_pristine_or_absent "$root_absent"
-check "root_is_pristine_or_absent accepts a genuinely absent path" "$([[ $? == 0 ]] && echo 1 || echo 0)"
-root_is_pristine_or_absent "$root_empty"
-check "root_is_pristine_or_absent accepts a genuinely empty directory (the ModDev prepare*Run side effect)" "$([[ $? == 0 ]] && echo 1 || echo 0)"
-root_is_pristine_or_absent "$root_dirty"
-check "root_is_pristine_or_absent REFUSES a directory with real content -- never weakened" "$([[ $? != 0 ]] && echo 1 || echo 0)"
+bash "$claim_script" "$root_claimed" >/dev/null
+check "claim script successfully claims a genuinely absent path" "$([[ $? == 0 ]] && echo 1 || echo 0)"
+if bash "$claim_script" "$root_claimed" >/dev/null 2>"$probe_out"; then
+  check "claim script REFUSES to re-claim an already-claimed path (exclusivity)" 0
+else
+  grep -q 'refused:' "$probe_out"
+  check "claim script REFUSES to re-claim an already-claimed path (exclusivity)" "$([[ $? == 0 ]] && echo 1 || echo 0)"
+fi
+if bash "$claim_script" "$root_empty" >/dev/null 2>"$probe_out"; then
+  check "claim script REFUSES to adopt a pre-existing empty directory -- no silent adoption" 0
+else
+  grep -q 'refused:' "$probe_out"
+  check "claim script REFUSES to adopt a pre-existing empty directory -- no silent adoption" "$([[ $? == 0 ]] && echo 1 || echo 0)"
+fi
+
+root_is_exclusively_claimed "$root_claimed"
+check "root_is_exclusively_claimed accepts a properly-claimed root" "$([[ $? == 0 ]] && echo 1 || echo 0)"
+root_is_exclusively_claimed "$root_absent"
+check "root_is_exclusively_claimed REFUSES a genuinely absent path (claiming, not this check, creates the root)" "$([[ $? != 0 ]] && echo 1 || echo 0)"
+root_is_exclusively_claimed "$root_empty"
+check "root_is_exclusively_claimed REFUSES a merely-empty directory -- the exact gap an emptiness-only check had" "$([[ $? != 0 ]] && echo 1 || echo 0)"
+root_is_exclusively_claimed "$root_dirty"
+check "root_is_exclusively_claimed REFUSES a directory with real (non-marker) content -- never weakened" "$([[ $? != 0 ]] && echo 1 || echo 0)"
 if [[ -L "$root_linked" ]]; then
-  root_is_pristine_or_absent "$root_linked"
-  check "root_is_pristine_or_absent REFUSES a symlinked root -- never weakened" "$([[ $? != 0 ]] && echo 1 || echo 0)"
+  root_is_exclusively_claimed "$root_linked"
+  check "root_is_exclusively_claimed REFUSES a symlinked root -- never weakened" "$([[ $? != 0 ]] && echo 1 || echo 0)"
 else
   echo "SKIP: symlinked-root case (this environment could not create a symlink)"
 fi
+
+# Regenerating the launch scripts against an already-claimed root (ModDev's
+# own prepare*Run side effect) must never disturb the claim marker.
+marker_before=$(cat "$root_claimed/.dynamicverse-safe-delete-crash-execution-root-claim")
+mkdir -p "$root_claimed" 2>/dev/null || true
+marker_after=$(cat "$root_claimed/.dynamicverse-safe-delete-crash-execution-root-claim")
+check "a claimed root's marker is unaffected by an idempotent directory-ensure (modeling ModDev's own prepare*Run)" \
+  "$([[ "$marker_before" == "$marker_after" ]] && echo 1 || echo 0)"
+rm -rf "$root_probe_base"
 rm -rf "$root_probe_base"
 
 echo "---"

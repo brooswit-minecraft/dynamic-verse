@@ -27,6 +27,14 @@
 # sourced -- so a test script can `source` this exact file to get its real
 # functions (not a hand-retyped replica) and exercise failure paths without
 # triggering the real orchestration.
+#
+# Before running this: scripts/claimSafeDeleteCrashExecutionRoot.sh <path>
+# must have exclusively claimed the execution root first (this wrapper
+# never creates it), then the launch scripts must be regenerated with
+# -PsafeDeleteCrashGameDirectory=<same path>, then
+# DYNAMICVERSE_SAFE_DELETE_CRASH_EXECUTION_ROOT=<same path> must be set for
+# this wrapper itself. See root_is_exclusively_claimed below for why an
+# emptiness check alone is not accepted.
 set -uo pipefail
 
 workspace=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P) || exit 125
@@ -80,25 +88,32 @@ phase_b_kill_after_seconds=10
 
 refuse() { printf '%s\n' "refused: $*" >&2; exit 125; }
 
-# ModDev's own prepare*Run tasks create exactly the bare, empty gameDirectory
-# as a side effect of nothing more than regenerating these launch scripts --
-# confirmed empirically (find -mindepth 1 on such a directory immediately
-# after regeneration returns nothing). Requiring strict absence would mean
-# the routine preparation this review has been doing on every round -- not
-# a real execution -- permanently trips this guard before a real run could
-# ever begin. This accepts that SPECIFIC, verifiably-content-free state
-# (never anything with actual content: no eula.txt, no marker, nothing) in
-# addition to true absence, without weakening the refusal of a genuinely
-# retained/dirty root one bit -- a root with ANY entry at all is still
-# refused exactly as before.
-root_is_pristine_or_absent() {
-  local path=$1
-  [[ ! -L "$path" ]] || return 1
-  if [[ ! -e "$path" ]]; then return 0; fi
-  [[ -d "$path" ]] || return 1
-  local entry
-  entry=$(find -P "$path" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null) || return 1
-  [[ -z "$entry" ]]
+# An emptiness check alone cannot prove a directory was freshly claimed by
+# THIS invocation rather than being some other retained root that happens
+# to be empty for an unrelated reason -- ModDev's own prepare*Run task
+# leaves an untouched directory looking identically "empty" either way
+# (confirmed empirically). Provenance instead comes from
+# claimSafeDeleteCrashExecutionRoot.sh, the ONLY place that ever creates
+# this root: it refuses anything but true absence, uses mkdir's own
+# atomicity for the actual exclusive claim (no separate check-then-create
+# race window), and immediately writes one marker file recording that
+# claim. This wrapper never calls mkdir on the root at all -- it only
+# verifies that exact marker is still present and well-formed. Confirmed
+# empirically that regenerating the launch scripts against an
+# already-claimed root (ModDev's own prepare*Run side effect) leaves a
+# pre-existing marker file byte-for-byte untouched.
+claim_marker_name=.dynamicverse-safe-delete-crash-execution-root-claim
+root_is_exclusively_claimed() {
+  local path=$1 marker entries
+  [[ -d "$path" && ! -L "$path" ]] || return 1
+  entries=$(find -P "$path" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null) || return 1
+  [[ "$entries" == "$claim_marker_name" ]] || return 1
+  marker="$path/$claim_marker_name"
+  [[ -f "$marker" && ! -L "$marker" ]] || return 1
+  grep -q '^nonce=[0-9a-f]\{64\}$' "$marker" || return 1
+  grep -q '^claimedAtUtc=' "$marker" || return 1
+  grep -q '^claimedByHost=' "$marker" || return 1
+  grep -q '^claimedByPid=' "$marker"
 }
 
 # Linux /proc start-time ticks (stat field 22): stable across a kill -0 poll
@@ -276,7 +291,7 @@ read_process_start_instant() {
 }
 
 main() {
-  [[ -n "$root" ]] || refuse "DYNAMICVERSE_SAFE_DELETE_CRASH_EXECUTION_ROOT must be set explicitly to a fresh execution root -- never the stable preparation root ModDev's prepare*Run tasks create as a side effect of regenerating these launch scripts. Regenerate createProviderSafeDeleteCrashPhase{A,B}LaunchScript with -PsafeDeleteCrashGameDirectory set to this SAME path first."
+  [[ -n "$root" ]] || refuse "DYNAMICVERSE_SAFE_DELETE_CRASH_EXECUTION_ROOT must be set explicitly to a root already exclusively claimed via scripts/claimSafeDeleteCrashExecutionRoot.sh -- never the stable preparation root ModDev's prepare*Run tasks create as a side effect of regenerating these launch scripts. Claim a fresh root, regenerate createProviderSafeDeleteCrashPhase{A,B}LaunchScript with -PsafeDeleteCrashGameDirectory set to that SAME path, then set this variable to it."
   server_properties="$root/server.properties"
   world_root="$root/world"
   nonce_file="$root/dynamicverse-crash-delete-expected-nonce.txt"
@@ -311,9 +326,8 @@ main() {
   pre_phase_a_manifest=$(capture_manifest A "$generated_a" "$normal_a" "$legacy_a" "$vm_a" "$program_a" "$log4j_a") || refuse "cannot capture the pre-phase-A input manifest"
   require_manifest_schema "pre-phase-A manifest" "$pre_phase_a_manifest"
 
-  root_is_pristine_or_absent "$root" || refuse "requires an absent, non-symlink disposable root OR one that is genuinely empty (only ModDev's own harmless prepare*Run side effect, never anything with real content) -- never reuse a retained/dirty profile"
+  root_is_exclusively_claimed "$root" || refuse "requires a root already exclusively claimed via scripts/claimSafeDeleteCrashExecutionRoot.sh $root -- an emptiness check alone cannot prove provenance; never reuse a retained/foreign/merely-empty root"
   [[ ! -e "$receipts" ]] || refuse "requires absent prior receipts"
-  if [[ ! -e "$root" ]]; then mkdir -- "$root" || refuse "cannot claim fresh disposable root"; fi
   mkdir -- "$receipts" || refuse "cannot claim receipts root"
   printf '%s' "$pre_phase_a_manifest" > "$receipts/pre-phase-a.manifest" || refuse "cannot record the pre-phase-A input manifest"
 

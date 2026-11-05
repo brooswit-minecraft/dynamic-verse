@@ -127,7 +127,13 @@ public final class DynamicVerse {
     private record FixtureSelection(String seededRestartPhase, String ordinaryPhase, boolean seededBridgeRegression,
                                     boolean providerCreateIntegration, boolean providerSeededDuplicateIntegration,
                                     boolean providerBridgeIntegration, String safeDeleteCrashPhase, boolean providerSafeDeleteScenarios) {
-        boolean ownsRuntime() { return seededRestartPhase.equals("A") || seededRestartPhase.equals("B") || providerSeededDuplicateIntegration; }
+        // providerSafeDeleteScenarios is included here (mirroring
+        // providerSeededDuplicateIntegration) so DynamicVerse's own bootstrap
+        // never constructs a SECOND ServerVerseRuntime alongside the one the
+        // fixture's own @GameTest method constructs and owns -- both would
+        // otherwise independently reconcile the same on-disk durable state
+        // file at startup and tick in parallel.
+        boolean ownsRuntime() { return seededRestartPhase.equals("A") || seededRestartPhase.equals("B") || providerSeededDuplicateIntegration || providerSafeDeleteScenarios; }
     }
 
     /** Stateless delegation prevents command-event ordering from fabricating a runtime/catalog. */

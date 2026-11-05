@@ -10,6 +10,108 @@ plan into the actual narrow source/runner it specifies, for review **before
 any native execution**. Nothing in this document, or in the source it
 describes, has been run.
 
+## Round 3, fourth incremental review (Jira comment 51596): six corrections to the in-process fixture and the root-provenance gap
+
+Reviewed against `0f0d198`. Credited that the fixture and harness are now
+accessible, the busy case uses a real lease, and the occupied case reaches
+the production player-list check. Found six more issues, each verified
+against the actual source before fixing (not assumed):
+
+- **A fixed scenario name was too long.** `rp_scenario_failed_save_unrelated`
+  is 33 characters; `ServerVerseRuntime.ownedCreateId` permits at most 32
+  (`name.matches("[a-z0-9_-]{1,32}")`, confirmed by reading it directly) --
+  its own create would have been rejected before any native run. Renamed to
+  `rp_scenario_fs_unrelated`/`rp_scenario_fs_target` (24/21 chars), and added
+  `ProviderSafeDeleteScenariosNamingTest` (non-native JUnit) asserting every
+  fixed name against the exact contract regex, run as part of the ordinary
+  `test` task.
+- **The FAILED_SAVE assertion was backwards.** Read
+  `QuiesceAndCloseOrchestrator.execute` directly: on a save failure it
+  returns `terminal(FAILED_SAVE, SAVE, saveFailure)` immediately, **before**
+  ever reaching the close step -- the source level is never closed. Its own
+  state-machine test (`QuiesceAndCloseBridgeTest`) literally expects
+  `"FAILED_SAVE/SAVE/READY"` (status/failureStage/sourceReadiness) for this
+  exact case. `ServerVerseRuntime`'s own quarantine is bookkeeping only (it
+  revokes gate readiness) and does not invent an unload. The fixture
+  previously asserted `server.getLevel(fsTargetKey) == null`; fixed to
+  assert the target's real level remains loaded.
+- **Four independent runtime instances, plus `DynamicVerse`'s own bootstrap
+  fifth, all reconciling the same durable file.** Each of the four
+  `@GameTest` methods constructed its own `ServerVerseRuntime.create`, and
+  `providerSafeDeleteScenarios` was not yet in `ownsRuntime()`, so
+  `DynamicVerse.serverStarting` also built its own. Consolidated into ONE
+  `@GameTest` method sharing ONE runtime, scenarios run strictly
+  sequentially; added `providerSafeDeleteScenarios` to `ownsRuntime()` so
+  the bootstrap instance is suppressed (mirroring the existing
+  `providerSeededDuplicateIntegration` precedent) -- fixture-local, not a
+  new production framework.
+- **The FAILED_SAVE proof was too weak.** Deleting the unrelated verse
+  *before* arming the hook only proves ordinary success, not that a
+  non-matching armed key leaves the hook unconsumed. The hook is now armed
+  *before* either FAILED_SAVE-scenario verse is even created; the unrelated
+  (non-matching) verse is deleted *while already armed* for the target's
+  different key, then the target is deleted. The armed system property is
+  now restored to its original value in the same unified cleanup every
+  outcome runs through (below) -- it was previously never restored.
+  Strengthening the evidence beyond the facade's generic `QUARANTINED`
+  further hit a real constraint: the hook fires at most once per JVM, so a
+  throwaway low-level probe to inspect the typed cause would consume the
+  one real attempt the production-facade assertion needs, and the
+  orchestrator's typed cause is never surfaced through
+  `ServerVerseRuntime`/`SafeDeleteOperation` to begin with (confirmed by
+  reading `SafeDeleteOperation.finish()`/`quarantine()` directly -- no
+  stage-specific error is persisted anywhere observable). Getting a typed
+  signal would need either consuming the hook twice (impossible) or
+  extending production mapping code (explicitly out of scope); the
+  evidence this fixture retains is deliberately bounded to what the real,
+  single armed attempt actually proves through the production facade:
+  `QUARANTINED` outcome, catalog state, retained durable/disk data, and the
+  unrelated verse's normal success under the same armed property.
+- **Cleanup only ran on the success path.** `.thenExecute(runtime::close)`
+  is never reached if a step fails or the test times out. Replaced with a
+  `GameTestListener` registered once via `helper.testInfo.addListener(...)`
+  (a real, public extension point -- confirmed via `javap` against the
+  actual compiled class, not assumed): its `testPassed`/`testFailed`
+  callbacks fire for every terminal outcome, including a genuine framework
+  timeout, and release the open lease, remove the fixture's `FakePlayer`,
+  restore the armed property, and close the runtime exactly once
+  (`compareAndSet`-guarded). Added the stronger durable/disk assertions
+  requested: success now also verifies the target's on-disk storage is
+  actually removed and its durable READY/operation entries are gone (not
+  just catalog/unloaded state); occupied/busy refusals now verify the
+  durable READY generation is byte-identical before and after the refused
+  attempt; FAILED_SAVE now also verifies the durable READY entry is
+  retained and that a fresh `beginAcquireReadyRead` against the quarantined
+  target is denied.
+- **The execution-root check accepted any empty directory, not specifically
+  one this invocation owned.** An emptiness check cannot prove provenance:
+  ModDev's own `prepare*Run` task leaves an untouched directory looking
+  identically empty whether it was just claimed or is an unrelated retained
+  root. Replaced with an explicit claim stage,
+  `scripts/claimSafeDeleteCrashExecutionRoot.sh <path>`: it is the ONLY
+  place that ever creates the root, refuses anything but true absence, and
+  relies on `mkdir`'s own atomicity for the actual exclusive claim (no
+  separate check-then-create race window) before writing one marker file
+  recording the claim (host, pid, UTC timestamp, a nonce). The main wrapper
+  no longer calls `mkdir` on the root at all; `root_is_exclusively_claimed`
+  verifies that exact marker is present and well-formed, refusing a merely
+  empty directory, real content, or a symlink exactly as before. Confirmed
+  empirically (not assumed) that regenerating the launch scripts against an
+  already-claimed root leaves a pre-existing file byte-for-byte untouched,
+  so claiming first and regenerating second is safe.
+
+Re-verified without executing anything natively: `compileJava`/
+`compileTestJava`/`test` 93/0/0/0 (2 new naming-contract tests; everything
+else unaffected); both launch scripts (`providerSafeDeleteScenariosGameTest`,
+and the two-JVM crash fixture's, re-regenerated after an earlier probe had
+pointed them at a scratch path) regenerated against the accepted provider
+jar and inspected -- correct `cd` target, namespace/property, and provider
+hash all present; the committed offline harness extended to 19/19,
+including the claim script's own exclusivity (refuses to re-claim, refuses
+to adopt a pre-existing empty directory) and the marker's survival through
+a modeled `prepare*Run` side effect. No native run, kill, or live-world
+action has occurred.
+
 ## Round 3, third incremental review (Jira comment 51591): the retained test harness, and the execution-root/preparation-root separation
 
 Confirmed the 51588 fixes against `804d6d3`. Asked for two more concrete
