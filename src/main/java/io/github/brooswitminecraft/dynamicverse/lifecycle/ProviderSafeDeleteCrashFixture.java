@@ -67,7 +67,8 @@ import net.minecraft.world.level.storage.LevelResource;
  * -- Phase B is the recovery check, not another crash.</p>
  */
 public final class ProviderSafeDeleteCrashFixture {
-    private static final String ROOT_NAME = "m470-safe-delete-crash-disposable-20261104";
+    /** Supplied by the launch contract itself (build.gradle's run registration), not re-derived. */
+    private static final String EXPECTED_GAME_ROOT_PROPERTY = "dynamicverse.providerSafeDeleteCrashExpectedGameRoot";
     public static final String TARGET_NAME = "crash_delete_target";
     public static final ResourceLocation TARGET_ID = ResourceLocation.fromNamespaceAndPath("dynamicverse", TARGET_NAME);
     public static final ResourceKey<Level> TARGET_KEY = ResourceKey.create(Registries.DIMENSION, TARGET_ID);
@@ -348,21 +349,32 @@ public final class ProviderSafeDeleteCrashFixture {
      * derives and verifies the game root from the world root's own
      * canonical parent via {@link #gameRootFromWorldRoot}, which is
      * deliberately free of any {@code MinecraftServer} dependency so it is
-     * directly unit-testable.
+     * directly unit-testable. A basename/shape match alone is not
+     * confinement: a same-named, same-shaped pair retained or copied
+     * somewhere else on disk must still be refused, so the resolved game
+     * root is additionally required to equal the exact absolute path the
+     * launch contract itself supplied via {@link #EXPECTED_GAME_ROOT_PROPERTY}.
      */
     private static Path worldRoot(MinecraftServer server) {
         Path world = server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize();
-        gameRootFromWorldRoot(world); // validates the full relationship; result discarded here on purpose.
+        gameRootFromWorldRoot(world, expectedGameRoot()); // validates the full relationship; result discarded here on purpose.
         return world;
     }
 
     private static Path gameRoot(MinecraftServer server) {
-        return gameRootFromWorldRoot(server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize());
+        return gameRootFromWorldRoot(server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize(), expectedGameRoot());
+    }
+
+    private static Path expectedGameRoot() {
+        String raw = System.getProperty(EXPECTED_GAME_ROOT_PROPERTY);
+        require(raw != null && !raw.isBlank(), "launch contract did not supply " + EXPECTED_GAME_ROOT_PROPERTY);
+        return Path.of(raw).toAbsolutePath().normalize();
     }
 
     /** Package-visible for direct, server-free unit testing of the root-binding contract. */
-    static Path gameRootFromWorldRoot(Path world) {
+    static Path gameRootFromWorldRoot(Path world, Path expectedGameRoot) {
         Path normalizedWorld = world.toAbsolutePath().normalize();
+        Path normalizedExpected = expectedGameRoot.toAbsolutePath().normalize();
         require(Files.isDirectory(normalizedWorld, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(normalizedWorld),
                 "world root must be a real, non-symlinked directory: " + normalizedWorld);
         require("world".equals(normalizedWorld.getFileName().toString()),
@@ -371,7 +383,10 @@ public final class ProviderSafeDeleteCrashFixture {
         require(game != null, "world root has no parent");
         require(Files.isDirectory(game, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(game),
                 "game root must be a real, non-symlinked directory: " + game);
-        require(ROOT_NAME.equals(game.getFileName().toString()), "game root is not the expected disposable game directory: " + game);
+        // The decisive confinement check: not merely a plausible name/shape,
+        // but the exact root the launch contract itself registered.
+        require(game.equals(normalizedExpected),
+                "game root " + game + " does not match the exact root supplied by the launch contract: " + normalizedExpected);
         require(normalizedWorld.equals(game.resolve("world")), "world root is not canonically game root's own 'world' child");
         for (Path ancestor = game; ancestor != null; ancestor = ancestor.getParent()) {
             require(!Files.isSymbolicLink(ancestor), "a symlinked ancestor is not permitted: " + ancestor);

@@ -71,26 +71,9 @@ done
 [[ -d /proc ]] || refuse "/proc is required for owned-process start-identity verification on this platform"
 
 phase_a_pid=""
+phase_a_start=""
 phase_b_pid=""
-cleanup() {
-  # Any refusal/interruption path after spawning a phase must not leave its
-  # process alive. Phase A execs java directly over its own spawned PID, so
-  # signaling that PID is sufficient. Phase B is spawned under `timeout`
-  # (itself under `setsid`, as its own process-group leader): SIGKILL
-  # cannot be forwarded by any process, so killing only the `timeout` PID
-  # would silently orphan the actual java process underneath it. Signaling
-  # the negative PID (the process GROUP setsid created) reaches both.
-  if [[ -n "$phase_a_pid" ]] && kill -0 "$phase_a_pid" 2>/dev/null; then
-    kill -9 "$phase_a_pid" 2>/dev/null || true
-    wait "$phase_a_pid" 2>/dev/null || true
-  fi
-  if [[ -n "$phase_b_pid" ]] && kill -0 "$phase_b_pid" 2>/dev/null; then
-    kill -9 -- "-$phase_b_pid" 2>/dev/null || true
-    kill -9 "$phase_b_pid" 2>/dev/null || true
-    wait "$phase_b_pid" 2>/dev/null || true
-  fi
-}
-trap cleanup EXIT INT TERM
+phase_b_start=""
 
 # Linux /proc start-time ticks (stat field 22): stable across a kill -0 poll
 # as long as the kernel has not recycled the PID for a different process.
@@ -98,6 +81,52 @@ proc_start_ticks() {
   local pid=$1
   awk '{print $22}' "/proc/$pid/stat" 2>/dev/null
 }
+
+# A PID existing (kill -0) is not proof it is still the process this wrapper
+# spawned -- the kernel can recycle a PID for something unrelated. Every
+# signal, INCLUDING this cleanup/interruption path (not only the primary
+# verified-kill path later in the script), must re-check the recorded
+# process-start identity before signaling. Without this, a refusal issued
+# because identity verification failed would still be defeated by the EXIT
+# trap blindly killing whatever now holds that PID.
+kill_if_still_owned() {
+  local pid=$1 start=$2 as_group=$3 current
+  [[ -n "$pid" ]] || return 0
+  current=$(proc_start_ticks "$pid") || true
+  if [[ -n "$current" && -n "$start" && "$current" == "$start" ]]; then
+    if [[ "$as_group" == group ]]; then
+      # Phase B is spawned under `timeout` (itself under `setsid`, as its
+      # own process-group leader): SIGKILL cannot be forwarded by any
+      # process, so killing only the `timeout` PID would silently orphan
+      # the actual java process underneath it. Signaling the negative PID
+      # (the process GROUP setsid created) reaches both.
+      kill -9 -- "-$pid" 2>/dev/null || true
+    fi
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+
+cleanup() {
+  kill_if_still_owned "$phase_a_pid" "$phase_a_start" direct
+  kill_if_still_owned "$phase_b_pid" "$phase_b_start" group
+}
+trap cleanup EXIT
+
+# A trapped INT/TERM handler that returns without exiting lets bash resume
+# script execution at the NEXT statement after the interrupted one -- an
+# interruption during phase A's wait loop could otherwise fall through into
+# launching phase B. Clean up, restore default disposition, then re-deliver
+# the signal to ourselves so the process actually terminates (and EXIT's
+# own `cleanup` is not invoked a second time).
+on_terminating_signal() {
+  local sig=$1
+  cleanup
+  trap - EXIT INT TERM
+  kill "-$sig" "$$"
+}
+trap 'on_terminating_signal INT' INT
+trap 'on_terminating_signal TERM' TERM
 
 crash_require_generated() {
   local generated=$1 normal=$2 legacy=$3 vm=$4 program=$5 log4j=$6 phase=$7
@@ -116,71 +145,88 @@ crash_require_generated() {
   [[ $(grep -Foc -- "'-Dfml.modFolders=dynamicverse%%$mod_main_classes:dynamicverse%%$mod_main_resources:dynamicverse%%$mod_test_classes:dynamicverse%%$mod_test_resources'" "$generated") == 1 ]] || return 1
 }
 
-# Rechecked immediately before each launch, not only once at the start, so
-# a build run between phases cannot silently change what will actually run.
-verify_input_contract() {
-  crash_require_generated "$generated_a" "$normal_a" "$legacy_a" "$vm_a" "$program_a" "$log4j_a" A || refuse "phase A generated launch contract invalid"
-  crash_require_generated "$generated_b" "$normal_b" "$legacy_b" "$vm_b" "$program_b" "$log4j_b" B || refuse "phase B generated launch contract invalid"
+# Per-phase structural/identity sanity, re-run every time a manifest is
+# captured for that phase: the generated script matches the expected
+# contract, and its selected provider jar is the one expected hook-bearing
+# corrected artifact (not merely equal to the OTHER phase's, which alone
+# would accept two phases sharing the same wrong provider).
+verify_phase_sanity() {
+  local phase=$1 generated=$2 normal=$3 legacy=$4 vm=$5 program=$6 log4j=$7
+  crash_require_generated "$generated" "$normal" "$legacy" "$vm" "$program" "$log4j" "$phase" || refuse "phase $phase generated launch contract invalid"
+  local provider provider_hash
+  provider=$(ordinary_provider_input "$normal") || refuse "cannot locate exactly one provider jar on phase $phase's classpath"
+  provider_hash=$(ordinary_hash "$provider") || refuse "cannot hash phase $phase's selected provider jar"
+  [[ "$provider_hash" == "$expected_provider_sha256" ]] || refuse "phase $phase selected provider jar $provider_hash does not match the expected hook-bearing corrected provider $expected_provider_sha256 -- explicitly select -PacceptedDynamicDimensionsJar"
+}
 
-  local provider_a provider_b provider_a_hash provider_b_hash closure_a closure_b legacy_closure_a legacy_closure_b vm_diff
-  provider_a=$(ordinary_provider_input "$normal_a") || refuse "cannot locate exactly one provider jar on phase A's classpath"
-  provider_b=$(ordinary_provider_input "$normal_b") || refuse "cannot locate exactly one provider jar on phase B's classpath"
-  provider_a_hash=$(ordinary_hash "$provider_a") || refuse "cannot hash phase A's selected provider jar"
-  provider_b_hash=$(ordinary_hash "$provider_b") || refuse "cannot hash phase B's selected provider jar"
-  [[ "$provider_a_hash" == "$expected_provider_sha256" ]] || refuse "phase A selected provider jar $provider_a_hash does not match the expected hook-bearing corrected provider $expected_provider_sha256 -- explicitly select -PacceptedDynamicDimensionsJar"
-  [[ "$provider_b_hash" == "$expected_provider_sha256" ]] || refuse "phase B selected provider jar $provider_b_hash does not match the expected hook-bearing corrected provider $expected_provider_sha256"
-
-  closure_a=$(ordinary_closure_hash "$normal_a") || refuse "cannot hash phase A's classpath closure"
-  closure_b=$(ordinary_closure_hash "$normal_b") || refuse "cannot hash phase B's classpath closure"
-  [[ "$closure_a" == "$closure_b" ]] || refuse "phase A and phase B classpath closures differ ($closure_a vs $closure_b)"
-
+# The complete set of retained, content-bound inputs for one phase: the
+# provider jar, the full normal AND legacy classpath closures (every entry
+# content-hashed, not merely the listing file), all four mod-folder
+# directories NeoForge actually loads from, the log4j configuration, the
+# program arguments, the exact java executable's own binary, and the VM
+# args with only the known phase-specific lines normalized away. Printed
+# as one deterministic block so two captures can be compared with a plain
+# diff.
+capture_manifest() {
+  local phase=$1 generated=$2 normal=$3 legacy=$4 vm=$5 program=$6 log4j=$7
+  local provider provider_hash normal_hash legacy_hash log4j_hash java_hash program_hash
+  local main_classes_hash main_resources_hash test_classes_hash test_resources_hash vm_normalized
+  provider=$(ordinary_provider_input "$normal") || refuse "cannot locate exactly one provider jar on phase $phase's classpath"
+  provider_hash=$(ordinary_hash "$provider") || refuse "cannot hash phase $phase's selected provider jar"
+  normal_hash=$(ordinary_closure_hash "$normal") || refuse "cannot hash phase $phase's classpath closure"
   # A hash of the listing file alone only proves the two listings name the
-  # same paths, not that the jars at those paths have the same bytes.
-  # ordinary_closure_hash resolves and content-hashes every entry the
-  # listing names (recursively, for directory entries).
-  legacy_closure_a=$(ordinary_closure_hash "$legacy_a") || refuse "cannot hash phase A's legacy classpath contents"
-  legacy_closure_b=$(ordinary_closure_hash "$legacy_b") || refuse "cannot hash phase B's legacy classpath contents"
-  [[ "$legacy_closure_a" == "$legacy_closure_b" ]] || refuse "phase A and phase B legacy classpath contents differ"
-
-  local mod_main_classes_hash_a mod_main_resources_hash_a mod_test_classes_hash_a mod_test_resources_hash_a
-  local mod_main_classes_hash_b mod_main_resources_hash_b mod_test_classes_hash_b mod_test_resources_hash_b
-  mod_main_classes_hash_a=$(ordinary_typed_entry_hash "$mod_main_classes") || refuse "cannot hash main classes directory before phase A"
-  mod_main_resources_hash_a=$(ordinary_typed_entry_hash "$mod_main_resources") || refuse "cannot hash main resources directory before phase A"
-  mod_test_classes_hash_a=$(ordinary_typed_entry_hash "$mod_test_classes") || refuse "cannot hash test classes directory before phase A"
-  mod_test_resources_hash_a=$(ordinary_typed_entry_hash "$mod_test_resources") || refuse "cannot hash test resources directory before phase A"
-  mod_main_classes_hash_b=$(ordinary_typed_entry_hash "$mod_main_classes") || refuse "cannot hash main classes directory before phase B"
-  mod_main_resources_hash_b=$(ordinary_typed_entry_hash "$mod_main_resources") || refuse "cannot hash main resources directory before phase B"
-  mod_test_classes_hash_b=$(ordinary_typed_entry_hash "$mod_test_classes") || refuse "cannot hash test classes directory before phase B"
-  mod_test_resources_hash_b=$(ordinary_typed_entry_hash "$mod_test_resources") || refuse "cannot hash test resources directory before phase B"
-  [[ "$mod_main_classes_hash_a" == "$mod_main_classes_hash_b" ]] || refuse "main classes directory content changed between phase A and phase B verification"
-  [[ "$mod_main_resources_hash_a" == "$mod_main_resources_hash_b" ]] || refuse "main resources directory content changed between phase A and phase B verification"
-  [[ "$mod_test_classes_hash_a" == "$mod_test_classes_hash_b" ]] || refuse "test classes directory content changed between phase A and phase B verification"
-  [[ "$mod_test_resources_hash_a" == "$mod_test_resources_hash_b" ]] || refuse "test resources directory content changed between phase A and phase B verification"
-  printf 'mainClasses=%s\nmainResources=%s\ntestClasses=%s\ntestResources=%s\n' \
-    "$mod_main_classes_hash_a" "$mod_main_resources_hash_a" "$mod_test_classes_hash_a" "$mod_test_resources_hash_a" \
-    > "$receipts/mod-folder-hashes.txt" 2>/dev/null || true
-
-  local log4j_hash_a log4j_hash_b
-  log4j_hash_a=$(ordinary_hash "$log4j_a") || refuse "cannot hash phase A's log4j configuration"
-  log4j_hash_b=$(ordinary_hash "$log4j_b") || refuse "cannot hash phase B's log4j configuration"
-  [[ "$log4j_hash_a" == "$log4j_hash_b" ]] || refuse "phase A and phase B log4j configurations differ"
-
+  # same paths, not that the jars at those paths have the same bytes;
+  # ordinary_closure_hash resolves and content-hashes every entry named.
+  legacy_hash=$(ordinary_closure_hash "$legacy") || refuse "cannot hash phase $phase's legacy classpath contents"
+  log4j_hash=$(ordinary_hash "$log4j") || refuse "cannot hash phase $phase's log4j configuration"
+  main_classes_hash=$(ordinary_typed_entry_hash "$mod_main_classes") || refuse "cannot hash main classes directory for phase $phase"
+  main_resources_hash=$(ordinary_typed_entry_hash "$mod_main_resources") || refuse "cannot hash main resources directory for phase $phase"
+  test_classes_hash=$(ordinary_typed_entry_hash "$mod_test_classes") || refuse "cannot hash test classes directory for phase $phase"
+  test_resources_hash=$(ordinary_typed_entry_hash "$mod_test_resources") || refuse "cannot hash test resources directory for phase $phase"
+  java_hash=$(ordinary_hash /tmp/temurin21/bin/java) || refuse "cannot hash the java executable for phase $phase"
+  program_hash=$(ordinary_hash "$program") || refuse "cannot hash phase $phase's program arguments"
   # The only permitted differences between the two VM-args files are the
   # phase-property line itself and the two per-phase-named file references
   # (-Dlog4j2.configurationFile=/-DlegacyClassPath.file=) whose actual
-  # *content* equality is already proven by the hashes just above.
-  vm_diff=$(diff <(grep -vE '^-Ddynamicverse\.providerSafeDeleteCrashPhase=|^-Dlog4j2\.configurationFile=|^-DlegacyClassPath\.file=' "$vm_a") \
-                 <(grep -vE '^-Ddynamicverse\.providerSafeDeleteCrashPhase=|^-Dlog4j2\.configurationFile=|^-DlegacyClassPath\.file=' "$vm_b")) || true
-  [[ -z "$vm_diff" ]] || refuse "phase A and phase B VM args differ beyond the expected phase-only differences: $vm_diff"
+  # *content* equality is already proven by the hashes above.
+  vm_normalized=$(grep -vE '^-Ddynamicverse\.providerSafeDeleteCrashPhase=|^-Dlog4j2\.configurationFile=|^-DlegacyClassPath\.file=' "$vm") || refuse "cannot read phase $phase's normalized VM args"
+  printf 'provider=%s\nnormalClosure=%s\nlegacyClosure=%s\nlog4j=%s\nmainClasses=%s\nmainResources=%s\ntestClasses=%s\ntestResources=%s\njavaBinary=%s\nprogramArgs=%s\nvmArgsNormalized<<<\n%s\n>>>\n' \
+    "$provider_hash" "$normal_hash" "$legacy_hash" "$log4j_hash" "$main_classes_hash" "$main_resources_hash" "$test_classes_hash" "$test_resources_hash" "$java_hash" "$program_hash" "$vm_normalized"
 }
 
-verify_input_contract
+# diff's exit status distinguishes "identical" (0) from "differences found"
+# (1) from "diff itself failed" (2+, e.g. an unreadable file) -- collapsing
+# all non-"found a difference" outcomes into a swallowed `|| true` would
+# treat a diff ERROR (empty stdout) as an empty-output success. Fail closed
+# on both.
+require_manifests_match() {
+  local label=$1 before=$2 after=$3 output status
+  output=$(diff <(printf '%s' "$before") <(printf '%s' "$after") 2>&1)
+  status=$?
+  case "$status" in
+    0) ;;
+    1) refuse "$label: inputs changed ($output)" ;;
+    *) refuse "$label: cannot compare manifests (diff exit $status): $output" ;;
+  esac
+}
+
+verify_phase_sanity A "$generated_a" "$normal_a" "$legacy_a" "$vm_a" "$program_a" "$log4j_a"
+verify_phase_sanity B "$generated_b" "$normal_b" "$legacy_b" "$vm_b" "$program_b" "$log4j_b"
 [[ -f "$generated_a" && -f "$generated_b" ]] || refuse "generated launch scripts missing -- run both createProviderSafeDeleteCrashPhase*LaunchScript tasks first"
+
+# Captured ONCE, before phase A ever launches, and never recomputed: phase
+# B's manifest is compared against this frozen snapshot rather than against
+# a freshly-recomputed phase A manifest, so a build that changes shared
+# inputs between the two launches cannot have both sides silently agree on
+# the new state while actually running something different from what phase
+# A's marker/receipt will claim.
+pre_phase_a_manifest=$(capture_manifest A "$generated_a" "$normal_a" "$legacy_a" "$vm_a" "$program_a" "$log4j_a")
 
 [[ ! -e "$root" && ! -L "$root" ]] || refuse "requires an absent non-symlink disposable root -- never reuse a retained profile"
 [[ ! -e "$receipts" ]] || refuse "requires absent prior receipts"
 mkdir -- "$root" || refuse "cannot claim fresh disposable root"
 mkdir -- "$receipts" || refuse "cannot claim receipts root"
+printf '%s' "$pre_phase_a_manifest" > "$receipts/pre-phase-a.manifest" || refuse "cannot record the pre-phase-A input manifest"
 
 printf '%s\n' 'eula=true' > "$root/eula.txt" || refuse "cannot write eula acknowledgement"
 printf '%s\n' 'server-ip=127.0.0.1' 'server-port=0' 'level-name=world' > "$server_properties" || refuse "cannot write loopback server properties"
@@ -257,7 +303,17 @@ lsof -- "$world_root/session.lock" > "$receipts/phase-a.session-lock-check.log" 
 [[ ! -s "$receipts/phase-a.session-lock-check.log" ]] || refuse "a process still holds the world session.lock after phase A's forced exit"
 
 ### Phase B: an independent, timeout-bounded launch against the same disposable root.
-verify_input_contract   # rechecked immediately before this launch too.
+# Rechecked immediately before this launch, not only once at the start, so
+# a build run between phases cannot silently change what will actually
+# run -- and compared against the manifest FROZEN before phase A launched,
+# not a freshly-recomputed one, so drift affecting both sides identically
+# still cannot slip through.
+verify_phase_sanity A "$generated_a" "$normal_a" "$legacy_a" "$vm_a" "$program_a" "$log4j_a"
+verify_phase_sanity B "$generated_b" "$normal_b" "$legacy_b" "$vm_b" "$program_b" "$log4j_b"
+pre_phase_b_manifest=$(capture_manifest B "$generated_b" "$normal_b" "$legacy_b" "$vm_b" "$program_b" "$log4j_b")
+printf '%s' "$pre_phase_b_manifest" > "$receipts/pre-phase-b.manifest" || refuse "cannot record the pre-phase-B input manifest"
+require_manifests_match "phase A/B input manifest" "$pre_phase_a_manifest" "$pre_phase_b_manifest"
+
 set +e
 # setsid (without -f, so it execs in place rather than forking away) makes
 # this `timeout` invocation its own session/process-group leader, so the
@@ -266,9 +322,12 @@ set +e
 # even though SIGKILL to `timeout` alone can never be forwarded to its child.
 setsid timeout --kill-after="${phase_b_kill_after_seconds}s" "${phase_b_timeout_seconds}s" /bin/bash -e -- "$generated_b" > "$receipts/phase-b.full.log" 2>&1 &
 phase_b_pid=$!
+phase_b_start=$(proc_start_ticks "$phase_b_pid") || true
+[[ -n "$phase_b_start" ]] || refuse "cannot capture phase B's own process start identity immediately after spawn"
 wait "$phase_b_pid"
 phase_b_exit=$?
 phase_b_pid=""
+phase_b_start=""
 set -e
 printf '%s\n' "$phase_b_exit" > "$receipts/phase-b.exit"
 # A forced/timed-out phase B (TERM=124, or the hard KILL fallback, commonly

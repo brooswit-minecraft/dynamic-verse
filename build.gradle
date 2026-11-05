@@ -182,12 +182,18 @@ neoForge {
             gameDirectory = layout.projectDirectory.dir("run/m470-safe-delete-crash-disposable-20261104")
             sourceSet = sourceSets.providerBridgeGameTest
             systemProperty "dynamicverse.providerSafeDeleteCrashPhase", "A"
+            // Supplied by the launch contract itself (not re-derived from cwd
+            // or inferred from a basename pattern) so the fixture can bind to
+            // the exact registered root rather than accepting any directory
+            // that merely happens to share its name and parent/child shape.
+            systemProperty "dynamicverse.providerSafeDeleteCrashExpectedGameRoot", layout.projectDirectory.dir("run/m470-safe-delete-crash-disposable-20261104").asFile.absolutePath
         }
         register("providerSafeDeleteCrashPhaseB") {
             type = "server"
             gameDirectory = layout.projectDirectory.dir("run/m470-safe-delete-crash-disposable-20261104")
             sourceSet = sourceSets.providerBridgeGameTest
             systemProperty "dynamicverse.providerSafeDeleteCrashPhase", "B"
+            systemProperty "dynamicverse.providerSafeDeleteCrashExpectedGameRoot", layout.projectDirectory.dir("run/m470-safe-delete-crash-disposable-20261104").asFile.absolutePath
         }
     }
 }

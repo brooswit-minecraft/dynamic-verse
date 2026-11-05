@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -17,6 +18,12 @@ import org.junit.jupiter.api.Test;
  * first native run. These exercise {@code gameRootFromWorldRoot} directly
  * against real temp directories, with no MinecraftServer and no native
  * launch at all.
+ *
+ * <p>{@code gameRootFromWorldRoot} takes the expected game root as an
+ * explicit parameter (mirroring the launch contract supplying it via a
+ * system property), and requires an EXACT match rather than merely a
+ * plausible basename/shape -- a same-named, same-shaped pair located
+ * somewhere else on disk must still be refused.</p>
  */
 class ProviderSafeDeleteCrashFixtureRootBindingTest {
     private static final String EXPECTED_GAME_NAME = "m470-safe-delete-crash-disposable-20261104";
@@ -26,7 +33,7 @@ class ProviderSafeDeleteCrashFixtureRootBindingTest {
         Path world = game.resolve("world");
         Files.createDirectories(world);
 
-        Path resolved = ProviderSafeDeleteCrashFixture.gameRootFromWorldRoot(world);
+        Path resolved = ProviderSafeDeleteCrashFixture.gameRootFromWorldRoot(world, game);
 
         assertEquals(game.toAbsolutePath().normalize(), resolved);
     }
@@ -36,28 +43,31 @@ class ProviderSafeDeleteCrashFixtureRootBindingTest {
         Path notWorld = game.resolve("not-world");
         Files.createDirectories(notWorld);
 
-        assertThrows(IllegalStateException.class, () -> ProviderSafeDeleteCrashFixture.gameRootFromWorldRoot(notWorld));
+        assertThrows(IllegalStateException.class, () -> ProviderSafeDeleteCrashFixture.gameRootFromWorldRoot(notWorld, game));
     }
 
     @Test void aGameRootWithTheWrongNameIsRefused() throws IOException {
-        Path game = Files.createTempDirectory("crash-root-test-").resolve("some-other-directory-name");
-        Path world = game.resolve("world");
+        Path expected = Files.createTempDirectory("crash-root-test-").resolve(EXPECTED_GAME_NAME);
+        Path actualGame = expected.getParent().resolve("some-other-directory-name");
+        Path world = actualGame.resolve("world");
         Files.createDirectories(world);
 
-        assertThrows(IllegalStateException.class, () -> ProviderSafeDeleteCrashFixture.gameRootFromWorldRoot(world));
+        assertThrows(IllegalStateException.class, () -> ProviderSafeDeleteCrashFixture.gameRootFromWorldRoot(world, expected));
     }
 
-    @Test void aForeignWorldDirectoryElsewhereWithTheRightNamesIsStillAcceptedOnlyIfCanonicallyRelated() throws IOException {
-        // A "world" directory that happens to sit under a directory that
-        // happens to be named correctly, but is not actually that exact
-        // canonical pair (e.g. retained from an unrelated prior run copied
-        // alongside), must still resolve correctly as long as it really is
-        // the direct parent/child pair -- this is the ordinary accepted case,
-        // included to make the boundary with the next (rejected) case clear.
-        Path game = Files.createTempDirectory("crash-root-test-").resolve(EXPECTED_GAME_NAME);
-        Path world = game.resolve("world");
-        Files.createDirectories(world);
-        assertEquals(game.toAbsolutePath().normalize(), ProviderSafeDeleteCrashFixture.gameRootFromWorldRoot(world));
+    @Test void aForeignPairElsewhereWithTheRightNamesAndShapeIsStillRefusedUnlessItIsTheExactExpectedRoot() throws IOException {
+        // A same-named, same-shaped "world" under a correctly-named parent
+        // -- but retained/copied somewhere other than the one true,
+        // launch-contract-registered root -- must be refused. Confinement
+        // means the exact root, not any directory that merely looks right.
+        Path base = Files.createTempDirectory("crash-root-test-");
+        Path foreignGame = base.resolve("foreign").resolve(EXPECTED_GAME_NAME);
+        Path foreignWorld = foreignGame.resolve("world");
+        Files.createDirectories(foreignWorld);
+        Path trueExpectedGame = base.resolve("true").resolve(EXPECTED_GAME_NAME);
+
+        assertThrows(IllegalStateException.class,
+                () -> ProviderSafeDeleteCrashFixture.gameRootFromWorldRoot(foreignWorld, trueExpectedGame));
     }
 
     @Test void aWorldDirectoryThatIsNotTheGameRootsOwnChildIsRefused() throws IOException {
@@ -70,7 +80,7 @@ class ProviderSafeDeleteCrashFixtureRootBindingTest {
         Path foreignWorld = base.resolve("world");
         Files.createDirectories(foreignWorld);
 
-        assertThrows(IllegalStateException.class, () -> ProviderSafeDeleteCrashFixture.gameRootFromWorldRoot(foreignWorld));
+        assertThrows(IllegalStateException.class, () -> ProviderSafeDeleteCrashFixture.gameRootFromWorldRoot(foreignWorld, game));
     }
 
     @Test void aSymlinkedWorldDirectoryIsRefused() throws IOException {
@@ -83,10 +93,11 @@ class ProviderSafeDeleteCrashFixtureRootBindingTest {
         try {
             Files.createSymbolicLink(linkedWorld, realWorld);
         } catch (UnsupportedOperationException | IOException noSymlinkSupport) {
-            return; // environment cannot create symlinks; nothing to assert here.
+            Assumptions.abort("this environment cannot create symlinks; skipping rather than silently passing");
+            return;
         }
 
-        assertThrows(IllegalStateException.class, () -> ProviderSafeDeleteCrashFixture.gameRootFromWorldRoot(linkedWorld));
+        assertThrows(IllegalStateException.class, () -> ProviderSafeDeleteCrashFixture.gameRootFromWorldRoot(linkedWorld, game));
     }
 
     @Test void aSymlinkedGameRootAncestorIsRefused() throws IOException {
@@ -97,16 +108,18 @@ class ProviderSafeDeleteCrashFixtureRootBindingTest {
         try {
             Files.createSymbolicLink(linkedGame, realGame);
         } catch (UnsupportedOperationException | IOException noSymlinkSupport) {
+            Assumptions.abort("this environment cannot create symlinks; skipping rather than silently passing");
             return;
         }
         Path world = linkedGame.resolve("world");
 
-        assertThrows(IllegalStateException.class, () -> ProviderSafeDeleteCrashFixture.gameRootFromWorldRoot(world));
+        assertThrows(IllegalStateException.class, () -> ProviderSafeDeleteCrashFixture.gameRootFromWorldRoot(world, linkedGame));
     }
 
     @Test void aRetainedForeignWorldMissingEntirelyIsRefused() {
         Path neverCreated = Path.of(System.getProperty("java.io.tmpdir"), "crash-root-test-never-created-" + System.nanoTime(), EXPECTED_GAME_NAME, "world");
+        Path expected = neverCreated.getParent();
 
-        assertThrows(IllegalStateException.class, () -> ProviderSafeDeleteCrashFixture.gameRootFromWorldRoot(neverCreated));
+        assertThrows(IllegalStateException.class, () -> ProviderSafeDeleteCrashFixture.gameRootFromWorldRoot(neverCreated, expected));
     }
 }

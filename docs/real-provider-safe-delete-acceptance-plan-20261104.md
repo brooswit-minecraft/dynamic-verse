@@ -10,7 +10,82 @@ plan into the actual narrow source/runner it specifies, for review **before
 any native execution**. Nothing in this document, or in the source it
 describes, has been run.
 
-## Round 3 fix (this update): a confirmed, pre-existing defect
+## Round 3, incremental review (Jira comment 51577): four more closures
+
+Reviewed against b8c706f (the game-root/world-root fix, not yet including
+the input-receipt/process-ownership closures above). Confirmed useful but
+found four more source-backed gaps; closed here (`build.gradle`, the
+wrapper script, the Java fixture, and its tests -- no native execution):
+
+- **`cleanup()` didn't check process-start identity, only `kill -0`.** A
+  refusal issued because the primary path's identity check failed would
+  still run the EXIT trap, which -- checking only that the PID exists --
+  could kill whatever unrelated process the kernel had since reused that
+  PID for, defeating the refusal it was supposed to honor. Introduced
+  `kill_if_still_owned`, which re-checks `/proc` start ticks before
+  signaling, and routed BOTH the primary kill path and `cleanup()` through
+  it; `phase_b_start` is now captured and checked the same way phase A's
+  already was.
+- **A trapped INT/TERM handler that returns lets the script fall through
+  into the next statement**, rather than actually stopping -- an
+  interruption during phase A's wait loop could otherwise continue on into
+  launching phase B. Split the EXIT trap (`cleanup`) from a new
+  `on_terminating_signal`, which cleans up, clears all traps, and
+  re-delivers the same signal to the wrapper's own PID so it actually
+  terminates.
+- **No immutable pre-phase-A manifest.** `verify_input_contract` recomputed
+  both phases' hashes at each call and compared them to each other; if a
+  build changed shared inputs between calls, both recomputations could
+  still agree while silently differing from what phase A actually ran.
+  Replaced with `capture_manifest`, called once before phase A ever
+  launches and stored (`pre_phase_a_manifest`); phase B's freshly captured
+  manifest is compared against that frozen snapshot via
+  `require_manifests_match`, not against a re-derived phase A snapshot.
+  The retained manifest also newly binds the legacy classpath by content
+  (not just the listing file), all four `-Dfml.modFolders=` directories
+  (now also bound into the generated-script contract check itself), the
+  exact java executable's own binary, and the program arguments -- not
+  only the normal classpath and VM args as before.
+- **`diff ... || true` could treat a diff ERROR as an empty-output
+  success.** `require_manifests_match` now captures diff's exit status
+  explicitly and fails closed on anything other than 0 (identical),
+  distinguishing "differences found" (1, refused with the diff shown) from
+  "diff itself could not run" (2+, also refused). Verified with a
+  deliberately corrupted manifest that the check actually refuses rather
+  than silently passing.
+- **`gameRootFromWorldRoot` accepted any correctly-named/shaped pair, not
+  only the one true root.** The round-3 test
+  `aForeignWorldDirectoryElsewhereWithTheRightNamesIsStillAcceptedOnlyIfCanonicallyRelated`
+  explicitly asserted this as acceptable, contradicting the confinement
+  requirement. `build.gradle` now supplies the exact registered absolute
+  game-root path via a new system property
+  (`dynamicverse.providerSafeDeleteCrashExpectedGameRoot`) on both run
+  configs; `gameRootFromWorldRoot` takes it as an explicit parameter and
+  requires an exact match, not merely a basename/shape match. The
+  contradicting test was replaced with
+  `aForeignPairElsewhereWithTheRightNamesAndShapeIsStillRefusedUnlessItIsTheExactExpectedRoot`,
+  which asserts the opposite (refusal) for the same kind of foreign pair.
+  The two symlink-dependent tests that silently returned (counting as a
+  pass) when this environment cannot create symlinks now call
+  `Assumptions.abort(...)` instead, so that environment limitation shows
+  up as a reported skip, never a silent pass.
+
+Re-verified without executing anything natively: `compileJava`/
+`compileTestJava`/`test` 91/0/0/0 (one test renamed, net count unchanged);
+`bash -n` on the wrapper; both launch scripts regenerated against the
+corrected `build.gradle` (confirmed the new system property reaches the
+generated VM args, identically for A and B); a read-only replica of
+`crash_require_generated`/`verify_phase_sanity`/`capture_manifest`/
+`require_manifests_match` run against those real regenerated files --
+phase A and B sanity both OK, a 29-line manifest captured for each, the
+two manifests match, and a deliberately corrupted copy is correctly
+refused as "inputs changed" rather than silently accepted. The
+`setsid`+group-kill mechanism from the prior closure was also re-verified
+empirically (a throwaway `setsid timeout ... sleep` tree, confirming the
+forced-kill path kills both members, not only `timeout`). Nothing has been
+executed natively.
+
+## Round 3 fix: a confirmed, pre-existing defect
 
 Round 2's draft would have refused to even start. `confinedRoot` called
 `server.getWorldPath(LevelResource.ROOT)` -- the WORLD save directory
