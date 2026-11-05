@@ -70,6 +70,7 @@ public final class DynamicVerse {
     private void serverStarting(ServerStartingEvent event) {
         FixtureSelection selection = fixtureSelection();
         if (selection.ordinaryPhase != null) ProviderOrdinaryRestartFixture.validateBeforeRuntime(selection.ordinaryPhase, event.getServer());
+        if (selection.safeDeleteCrashPhase != null) ProviderSafeDeleteCrashFixture.validateBeforeRuntime(selection.safeDeleteCrashPhase, event.getServer());
         if (!selection.ownsRuntime()) runtime = ServerVerseRuntime.create(event.getServer());
     }
     private void registerCommands(RegisterCommandsEvent event) {

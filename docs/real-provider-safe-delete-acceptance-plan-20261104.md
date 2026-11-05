@@ -10,6 +10,71 @@ plan into the actual narrow source/runner it specifies, for review **before
 any native execution**. Nothing in this document, or in the source it
 describes, has been run.
 
+## Round 2 hardening (this update)
+
+A second technical review of the first draft (97276b8) found the fixture/
+runner "not yet safe or sufficient to run" and named five corrections,
+addressed below, all still unexecuted:
+
+- **Preflight moved before `ServerVerseRuntime.create`.** Added
+  `ProviderSafeDeleteCrashFixture.validateBeforeRuntime(phase, server)`,
+  wired into `DynamicVerse.serverStarting` exactly like
+  `ProviderOrdinaryRestartFixture.validateBeforeRuntime`. Phase A's check
+  refuses a retained prior marker/result. Phase B's check reads the marker,
+  cross-checks its nonce/root against the wrapper-owned nonce file, and
+  independently re-reads the real durable state file to confirm the exact
+  recorded operation id/generation is still `PENDING` — all **before**
+  production recovery runs, not after. `confinedRoot` also now requires the
+  root's final path segment to equal the exact registered disposable
+  directory name, not merely "any real directory."
+- **Generated-launch/input contract enforced, not just file existence.**
+  The wrapper now sources `scripts/providerOrdinaryRestartReceiptLib.sh`
+  (its hash/closure helpers are generic, not ordinary-restart-specific) and
+  adds a `crash_require_generated` check mirroring
+  `ordinary_require_generated`: exact `cd '<root>'; exec` binding, exact
+  classpath/VM-args/program-args file references, the exact
+  `-Ddynamicverse.providerSafeDeleteCrashPhase=<phase>` property with no
+  GameTest-namespace property present, and a `-classpath`-leading argfile.
+  It then extracts the provider jar via `ordinary_provider_input` and
+  requires its SHA-256 to equal the **hook-bearing** corrected provider's
+  hash (`4c4d70a9...`, not the older SUPERFLAT-credited `5c7afbc7...` nor
+  the stale repository default), for both phases, and requires both phases'
+  full classpath closures (`ordinary_closure_hash`) to be identical. All of
+  this was actually run (read-only, no process spawned) against the real
+  generated files from this session's launch-script generation, and passed:
+  `A: contract OK`, `B: contract OK`, both provider hashes matched exactly,
+  both closures matched exactly.
+- **Wrapper-owned, round-tripped nonce; atomic marker/result writes.** The
+  wrapper now generates the one expected nonce itself and writes it to a
+  nonce file *before* Phase A launches; Phase A echoes it into the marker,
+  the wrapper verifies the echo, and Phase B's result additionally echoes it
+  again, cross-checked by the wrapper after Phase B exits. Marker and result
+  are now written via a `CREATE_NEW` staging sibling, `force(true)`, then
+  `ATOMIC_MOVE` — no reader can ever observe a partially-written file.
+  The wrapper installs an `EXIT` trap that kills the exact spawned Phase A
+  PID if still alive on any refusal path, re-verifies PID ownership
+  immediately before sending the kill signal (not only once at marker time),
+  fails closed if `lsof` itself is unavailable instead of skipping the
+  lock-release check, and now runs Phase B under `timeout 120s` with its own
+  distinct refusal on timeout.
+- **Phase B's assertions strengthened.** `targetRejectionCompleted` now
+  requires the read-acquisition callback to have actually fired exactly
+  once, with an explicit `VerseReservationPhase.FAILED` and an empty lease —
+  a callback that simply never ran is no longer treated as "unreadable."
+  Added `targetNeverReloaded` via the real `server.getLevel(TARGET_KEY) ==
+  null` check. The unrelated verse's replay is now verified through a real
+  acquired lease, `runtime.resolve(lease)` to an actual current `ServerLevel`,
+  and that level's own sentinel block content — not listing state alone.
+  Both phases now write a distinct sentinel block into the target and the
+  unrelated verse (`REDSTONE_LAMP`/`GLOWSTONE`, the same technique
+  `ProviderOrdinaryRestartFixture` already uses) and force a real save
+  before Phase A's marker is published, so the target's confined on-disk
+  storage is real content, not an empty directory. Phase A's marker now
+  records the exact admitted operation's id and target generation, read
+  back from the real durable file; Phase B's result echoes both, and the
+  wrapper refuses a result whose operation id/generation doesn't match
+  Phase A's.
+
 ## What exists now (compiled, not executed)
 
 - `src/main/java/.../lifecycle/ProviderSafeDeleteCrashFixture.java`: the
@@ -134,17 +199,31 @@ bytes) and the absence of removal/rename for protected targets.
 ## Still not resolved / not done
 
 - The in-process success/occupied-refusal/busy-refusal/`FAILED_SAVE` fixture
-  (property 1's other half) is not yet written.
-- Nothing above has been executed. `bash -n` syntax-checked the wrapper
-  script; `compileJava`/`compileTestJava` passed for the Java source; the
-  two launch scripts generate successfully with the hook-bearing corrected
-  provider explicitly selected. No marker, no kill, no Phase B run, no
-  session.lock check has actually happened yet.
-- This wrapper is narrower and less exhaustively hashed/guarded than the
-  established `providerOrdinaryRestart` convention
-  (`scripts/providerOrdinaryRestartReceiptLib.sh`) — deliberately, pending
-  this review, rather than front-loading that level of hardening before any
-  feedback on the approach itself.
+  (property 1's other half) is **still not written**. This was explicitly
+  asked for again in round 2 and was not delivered in this update — round 2
+  prioritized the five corrections to the already-drafted crash fixture over
+  starting a new one, since the existing draft was explicitly called "not
+  yet safe... to run." Reusing the `ownsRuntime()`/dedicated-phase pattern
+  already established for `seededRestartPhase` A/B (so this new fixture, not
+  `DynamicVerse`'s own auto-created runtime, owns the one real
+  `ServerVerseRuntime` instance for its run) is the intended approach for
+  the next increment.
+- Nothing above has been executed as a native server. `bash -n`
+  syntax-checked the wrapper script; `compileJava`/`compileTestJava` passed
+  for the Java source; the two launch scripts generate successfully with
+  the hook-bearing corrected provider explicitly selected; the wrapper's
+  full preflight contract/hash/closure logic was actually run (read-only,
+  no process spawned) against those real generated files and passed. No
+  marker, no kill, no Phase B run, no session.lock check has actually
+  happened yet.
+- Round 2 reused the established `providerOrdinaryRestart` convention's
+  generic hash/closure helpers directly (by sourcing the same library) and
+  added an analogous generated-launch contract check, so the gap with that
+  convention is now mainly: no O1/O2-style pre-launch level.dat/state hash
+  snapshotting across the exact same receipt tuple shape, and no retry-only
+  profile variant. Those remain open if a future round wants that exact
+  parity; not reproduced here given the different (crash/kill vs graceful)
+  shape of this fixture.
 
 ## Explicitly not authorized by this document
 
