@@ -44,6 +44,15 @@ program_a="$workspace/build/moddev/providerSafeDeleteCrashPhaseARunProgramArgs.t
 program_b="$workspace/build/moddev/providerSafeDeleteCrashPhaseBRunProgramArgs.txt"
 log4j_a="$workspace/build/moddev/providerSafeDeleteCrashPhaseALog4j2.xml"
 log4j_b="$workspace/build/moddev/providerSafeDeleteCrashPhaseBLog4j2.xml"
+# The exact four directories ModDev wires into -Dfml.modFolders= for every
+# run of this source set; both phases launch from the same workspace, so
+# these paths are identical for A and B -- what the closure check below
+# actually proves is that their on-disk CONTENT did not change between
+# phases (a rebuild in between would change these hashes).
+mod_main_classes="$workspace/build/classes/java/main"
+mod_main_resources="$workspace/build/resources/main"
+mod_test_classes="$workspace/build/classes/java/test"
+mod_test_resources="$workspace/build/resources/test"
 receipts="$workspace/build/moddev/providerSafeDeleteCrash-receipts"
 # The exact hook-bearing corrected provider jar (TestOnlySaveFailureHook
 # added on top of the admission-order fix); NOT the older SUPERFLAT-credited
@@ -56,7 +65,7 @@ phase_b_kill_after_seconds=10
 
 refuse() { printf '%s\n' "refused: $*" >&2; exit 125; }
 
-for tool in sha256sum lsof timeout awk sed grep kill wait mkdir; do
+for tool in sha256sum lsof timeout awk sed grep kill wait mkdir setsid date; do
   command -v "$tool" >/dev/null 2>&1 || refuse "required tool missing before anything is spawned: $tool"
 done
 [[ -d /proc ]] || refuse "/proc is required for owned-process start-identity verification on this platform"
@@ -65,12 +74,18 @@ phase_a_pid=""
 phase_b_pid=""
 cleanup() {
   # Any refusal/interruption path after spawning a phase must not leave its
-  # process alive. Only ever signals the exact PID this wrapper spawned.
+  # process alive. Phase A execs java directly over its own spawned PID, so
+  # signaling that PID is sufficient. Phase B is spawned under `timeout`
+  # (itself under `setsid`, as its own process-group leader): SIGKILL
+  # cannot be forwarded by any process, so killing only the `timeout` PID
+  # would silently orphan the actual java process underneath it. Signaling
+  # the negative PID (the process GROUP setsid created) reaches both.
   if [[ -n "$phase_a_pid" ]] && kill -0 "$phase_a_pid" 2>/dev/null; then
     kill -9 "$phase_a_pid" 2>/dev/null || true
     wait "$phase_a_pid" 2>/dev/null || true
   fi
   if [[ -n "$phase_b_pid" ]] && kill -0 "$phase_b_pid" 2>/dev/null; then
+    kill -9 -- "-$phase_b_pid" 2>/dev/null || true
     kill -9 "$phase_b_pid" 2>/dev/null || true
     wait "$phase_b_pid" 2>/dev/null || true
   fi
@@ -96,6 +111,9 @@ crash_require_generated() {
   # The exact java executable this generated script will exec, bound into
   # the contract rather than merely assumed.
   [[ $(grep -Foc -- "exec '/tmp/temurin21/bin/java'" "$generated") == 1 ]] || return 1
+  # The exact four mod-folder directories this run actually loads classes
+  # and resources from -- not merely trusted to be the ones hashed below.
+  [[ $(grep -Foc -- "'-Dfml.modFolders=dynamicverse%%$mod_main_classes:dynamicverse%%$mod_main_resources:dynamicverse%%$mod_test_classes:dynamicverse%%$mod_test_resources'" "$generated") == 1 ]] || return 1
 }
 
 # Rechecked immediately before each launch, not only once at the start, so
@@ -116,9 +134,31 @@ verify_input_contract() {
   closure_b=$(ordinary_closure_hash "$normal_b") || refuse "cannot hash phase B's classpath closure"
   [[ "$closure_a" == "$closure_b" ]] || refuse "phase A and phase B classpath closures differ ($closure_a vs $closure_b)"
 
-  legacy_closure_a=$(ordinary_hash "$legacy_a") || refuse "cannot hash phase A's legacy classpath"
-  legacy_closure_b=$(ordinary_hash "$legacy_b") || refuse "cannot hash phase B's legacy classpath"
-  [[ "$legacy_closure_a" == "$legacy_closure_b" ]] || refuse "phase A and phase B legacy classpaths differ"
+  # A hash of the listing file alone only proves the two listings name the
+  # same paths, not that the jars at those paths have the same bytes.
+  # ordinary_closure_hash resolves and content-hashes every entry the
+  # listing names (recursively, for directory entries).
+  legacy_closure_a=$(ordinary_closure_hash "$legacy_a") || refuse "cannot hash phase A's legacy classpath contents"
+  legacy_closure_b=$(ordinary_closure_hash "$legacy_b") || refuse "cannot hash phase B's legacy classpath contents"
+  [[ "$legacy_closure_a" == "$legacy_closure_b" ]] || refuse "phase A and phase B legacy classpath contents differ"
+
+  local mod_main_classes_hash_a mod_main_resources_hash_a mod_test_classes_hash_a mod_test_resources_hash_a
+  local mod_main_classes_hash_b mod_main_resources_hash_b mod_test_classes_hash_b mod_test_resources_hash_b
+  mod_main_classes_hash_a=$(ordinary_typed_entry_hash "$mod_main_classes") || refuse "cannot hash main classes directory before phase A"
+  mod_main_resources_hash_a=$(ordinary_typed_entry_hash "$mod_main_resources") || refuse "cannot hash main resources directory before phase A"
+  mod_test_classes_hash_a=$(ordinary_typed_entry_hash "$mod_test_classes") || refuse "cannot hash test classes directory before phase A"
+  mod_test_resources_hash_a=$(ordinary_typed_entry_hash "$mod_test_resources") || refuse "cannot hash test resources directory before phase A"
+  mod_main_classes_hash_b=$(ordinary_typed_entry_hash "$mod_main_classes") || refuse "cannot hash main classes directory before phase B"
+  mod_main_resources_hash_b=$(ordinary_typed_entry_hash "$mod_main_resources") || refuse "cannot hash main resources directory before phase B"
+  mod_test_classes_hash_b=$(ordinary_typed_entry_hash "$mod_test_classes") || refuse "cannot hash test classes directory before phase B"
+  mod_test_resources_hash_b=$(ordinary_typed_entry_hash "$mod_test_resources") || refuse "cannot hash test resources directory before phase B"
+  [[ "$mod_main_classes_hash_a" == "$mod_main_classes_hash_b" ]] || refuse "main classes directory content changed between phase A and phase B verification"
+  [[ "$mod_main_resources_hash_a" == "$mod_main_resources_hash_b" ]] || refuse "main resources directory content changed between phase A and phase B verification"
+  [[ "$mod_test_classes_hash_a" == "$mod_test_classes_hash_b" ]] || refuse "test classes directory content changed between phase A and phase B verification"
+  [[ "$mod_test_resources_hash_a" == "$mod_test_resources_hash_b" ]] || refuse "test resources directory content changed between phase A and phase B verification"
+  printf 'mainClasses=%s\nmainResources=%s\ntestClasses=%s\ntestResources=%s\n' \
+    "$mod_main_classes_hash_a" "$mod_main_resources_hash_a" "$mod_test_classes_hash_a" "$mod_test_resources_hash_a" \
+    > "$receipts/mod-folder-hashes.txt" 2>/dev/null || true
 
   local log4j_hash_a log4j_hash_b
   log4j_hash_a=$(ordinary_hash "$log4j_a") || refuse "cannot hash phase A's log4j configuration"
@@ -153,6 +193,7 @@ printf '%s' "$expected_nonce" > "$nonce_file" || refuse "cannot write expected-n
 
 ### Phase A: launch, wait for the self-reported marker, verify and kill exactly that PID.
 cd -- "$root" || refuse "cannot cd into disposable root"
+phase_a_prespawn_epoch=$(date -u +%s)
 /bin/bash -e -- "$generated_a" > "$receipts/phase-a.full.log" 2>&1 &
 phase_a_pid=$!
 phase_a_start=$(proc_start_ticks "$phase_a_pid") || true
@@ -170,11 +211,25 @@ done
 reported_pid=$(sed -n 's/^pid=//p' "$marker" | tr -d '\r')
 reported_nonce=$(sed -n 's/^nonce=//p' "$marker" | tr -d '\r')
 reported_game_root=$(sed -n 's/^gameRoot=//p' "$marker" | tr -d '\r')
+reported_start_instant=$(sed -n 's/^processStartInstant=//p' "$marker" | tr -d '\r')
 [[ "$reported_pid" =~ ^[0-9]+$ ]] || refuse "marker reports no valid PID"
 [[ "$reported_pid" == "$phase_a_pid" ]] || refuse "marker PID $reported_pid does not match the exact JVM this wrapper spawned ($phase_a_pid) -- refusing to kill anything"
 [[ "$reported_nonce" == "$expected_nonce" ]] || refuse "marker nonce does not match this wrapper's own expected nonce"
 [[ "$reported_game_root" == "$root" ]] || refuse "marker gameRoot does not match this wrapper's disposable root"
 [[ "$(sed -n 's/^durablePendingVerified=//p' "$marker" | tr -d '\r')" == "true" ]] || refuse "marker does not confirm the durable PENDING intent was verified before publication"
+
+# Cross-check the JVM's own self-reported wall-clock start instant (written
+# by ProcessHandle.current().info().startInstant(), otherwise never
+# consumed) against this wrapper's independent observation window -- an
+# identity signal from a different clock source than the /proc start-ticks
+# check below, catching a PID whose kernel-relative ticks happen to match
+# but whose actual wall-clock start lies outside the window this wrapper
+# could have spawned it in.
+[[ -n "$reported_start_instant" && "$reported_start_instant" != unknown ]] || refuse "marker does not report a usable processStartInstant"
+reported_start_epoch=$(date -u -d "$reported_start_instant" +%s 2>/dev/null) || refuse "cannot parse marker processStartInstant '$reported_start_instant'"
+now_epoch=$(date -u +%s)
+(( reported_start_epoch >= phase_a_prespawn_epoch - 2 && reported_start_epoch <= now_epoch + 2 )) || \
+  refuse "marker processStartInstant ($reported_start_instant) falls outside the window this wrapper spawned phase A in -- refusing to kill anything"
 
 # Re-verify both PID and process-start identity immediately before every
 # signal, not only once at marker time -- kill -0 alone only proves a PID
@@ -204,7 +259,12 @@ lsof -- "$world_root/session.lock" > "$receipts/phase-a.session-lock-check.log" 
 ### Phase B: an independent, timeout-bounded launch against the same disposable root.
 verify_input_contract   # rechecked immediately before this launch too.
 set +e
-timeout --kill-after="${phase_b_kill_after_seconds}s" "${phase_b_timeout_seconds}s" /bin/bash -e -- "$generated_b" > "$receipts/phase-b.full.log" 2>&1 &
+# setsid (without -f, so it execs in place rather than forking away) makes
+# this `timeout` invocation its own session/process-group leader, so the
+# actual java process `timeout` later forks inherits that same group --
+# letting cleanup()/refusal paths reach BOTH via `kill -9 -- -$phase_b_pid`
+# even though SIGKILL to `timeout` alone can never be forwarded to its child.
+setsid timeout --kill-after="${phase_b_kill_after_seconds}s" "${phase_b_timeout_seconds}s" /bin/bash -e -- "$generated_b" > "$receipts/phase-b.full.log" 2>&1 &
 phase_b_pid=$!
 wait "$phase_b_pid"
 phase_b_exit=$?

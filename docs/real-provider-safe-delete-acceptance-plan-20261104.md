@@ -43,8 +43,62 @@ Fixed by modeling the two roots explicitly and testably:
   named `world`, a game root with the wrong name, a `world` directory that
   is not the expected game root's own child (same names, wrong relationship),
   a symlinked world directory, a symlinked game-root ancestor, and a
-  nonexistent retained/foreign path. **Actually run**: `8/8 passed, 0
-  failures, 0 errors.**
+  nonexistent retained/foreign path. **Actually run**: 8/8 passed, 0
+  failures, 0 errors.
+
+## Round 3 input-receipt and process-ownership closures (this update)
+
+The same review (Jira comment 51571) also found the round-2 input-receipt
+and process-termination hardening incomplete. Closed here, wrapper-script-
+only (no Java changes, so the prior 91/0/0/0 compile/test result still
+applies):
+
+- **Mod-folder directories weren't bound or hashed.** The generated launch
+  script passes `-Dfml.modFolders=...` naming the main/test class and
+  resource directories NeoForge actually loads from; `crash_require_generated`
+  checked everything else about the generated script but not this literal.
+  It now requires the exact expected four paths, and `verify_input_contract`
+  content-hashes all four directories (via the existing `ordinary_tree_hash`/
+  `ordinary_typed_entry_hash` helpers) immediately before each phase,
+  requiring A's and B's hashes to match and recording them to
+  `providerSafeDeleteCrash-receipts/mod-folder-hashes.txt`.
+- **The legacy classpath was only hashed as a listing file, not by
+  content.** `ordinary_hash "$legacy"` hashes the *text file naming* the
+  legacy-classpath jars -- proof the two listings name the same paths, not
+  that those jars have the same bytes. Switched to `ordinary_closure_hash`,
+  which resolves and content-hashes every entry the listing names (the same
+  helper already used for the normal classpath).
+- **`processStartInstant` was written by the JVM but never read.** The
+  wrapper now captures its own wall-clock timestamp immediately before
+  spawning phase A, then after reading the marker, parses the JVM's
+  self-reported `processStartInstant` and requires it to fall inside the
+  window this wrapper could actually have spawned it in -- an identity
+  signal from a different clock source than the `/proc` start-ticks check,
+  both now checked before any kill.
+- **A wrapper-side kill of phase B's `timeout` process could orphan the
+  java process underneath it.** SIGKILL is never forwarded by the process
+  that receives it, so the prior `cleanup()` trap -- which signaled only the
+  PID bash reported for the backgrounded `timeout --kill-after=... ` job --
+  could leave the actual server running (and its `session.lock` held) if
+  the wrapper itself were interrupted or refused between launching phase B
+  and `timeout`'s own bounded termination logic taking effect. Verified
+  empirically (plain `ps`, not assumed from documentation) that `timeout`
+  does not give its monitored child a separate process group of its own --
+  the child inherits `timeout`'s group -- so wrapping the phase B launch in
+  `setsid` (which, run without `-f`, execs in place rather than forking
+  away, so the backgrounded PID bash reports IS the new group leader) lets
+  `cleanup()` reach both via `kill -9 -- -$phase_b_pid`. Confirmed live: a
+  `setsid timeout ... sleep` tree where the forced-kill path actually kills
+  both members, versus killing only the `timeout` PID leaving its child
+  running.
+
+Re-verified after these changes: `bash -n` on the wrapper, and the
+read-only preflight script re-run against freshly regenerated Phase A/B
+launch scripts -- contract OK for both phases, provider hash matches
+`4c4d70a90...`, normal closures match, legacy closure *contents* now match,
+log4j configs match, all four mod-folder directory hashes computed, VM args
+identical apart from the expected phase-only differences. Nothing has been
+executed natively.
 
 ## Round 2 hardening
 
