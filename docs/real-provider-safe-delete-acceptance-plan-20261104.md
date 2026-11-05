@@ -1,4 +1,4 @@
-# Real-provider safe-delete acceptance: fixture/runner (two-JVM crash fixture not yet executed; in-process scenarios fixture executed once, see below)
+# Real-provider safe-delete acceptance: fixture/runner (two-JVM crash fixture's one authorized attempt refused by its own PID safety guard, diagnosed, not retried; in-process scenarios fixture executed once and passed -- see below)
 
 Per MINECRAFT-470 review: `runtimeConfirmedDeleteRemovesOnlyItsOwnMetadataAndInterruptedDeleteStaysQuarantinedAfterRestart`
 is useful production-wiring evidence, but its state store is
@@ -7,14 +7,96 @@ and reconstruction happens in the same process. Per the follow-up technical
 plan review (https://github.com/brooswit-minecraft/dynamic-verse/pull/3,
 "latest technical plan review" comment), this document was updated from a
 plan into the actual narrow source/runner it specifies, for review **before
-any native execution**. The two-JVM crash fixture/runner below (and
-everything under "Round 3" prior to the native run section) still has not
-been executed. Jira comment 51612 explicitly authorized exactly ONE bounded
-native invocation of the separate in-process scenarios fixture
-(`providerSafeDeleteScenariosGameTest`); that one run is documented in the
-section immediately below and has completed. No other native execution --
-including the two-JVM crash fixture, any second invocation, or any
-deliberate crash signal -- has occurred or is authorized.
+any native execution**. Two native authorizations have been exercised so
+far, each exactly once: Jira comment 51612 authorized one invocation of
+the in-process scenarios fixture (`providerSafeDeleteScenariosGameTest`,
+passed -- see its own section below); Jira comment 51617 authorized one
+two-JVM crash/recovery A/B pair, which never reached a kill or Phase B at
+all -- the wrapper's own PID-identity guard correctly refused first (see
+the section immediately below). No SIGKILL has ever been issued against
+anything in this fixture, no second invocation of either fixture, and no
+deliberate crash signal has occurred or is authorized beyond what is
+documented in these two sections.
+
+## Native execution attempt: the two-JVM crash fixture (2026-11-05, head `597b841`) -- refused by its own safety guard; root cause diagnosed, NOT fixed or retried
+
+Authorized by Jira comment 51617 as one bounded A/B pair, using the
+already-reviewed `runProviderSafeDeleteCrashWithReceipt.sh` and
+`ProviderSafeDeleteCrashFixture.java` UNCHANGED. Preconditions verified
+exactly as for the prior native run (source head `597b84180bd32de8f095741fcdfee388452409c5`,
+clean tree; neither file touched since its last review, confirmed via
+`git log`/`git diff`; fresh `compileJava compileTestJava test` 93/0/0/0;
+provider jar independently `sha256sum`'d, matching
+`4c4d70a90...` exactly; a NEW root exclusively claimed,
+`run/m470-safe-delete-crash-NATIVE-20261105T0317Z`, every existing root
+and the prior native run's receipts preserved untouched; both Phase A and
+B launch scripts regenerated against that claimed root with matching
+`expectedGameRoot`; the full offline preflight -- `root_is_exclusively_claimed`,
+`verify_phase_sanity` A and B, `capture_manifest`/`require_manifest_schema`
+for both, `require_manifests_match` -- run and passed against the real
+generated files before launch).
+
+**Result: the wrapper's own PID-identity safety guard refused, before any
+kill was attempted and before Phase B was ever launched.** Exit 125:
+
+```
+spawned phase A as PID 3939094 (start ticks 92125597); waiting up to 120s for its marker
+refused: marker PID 3939097 does not match the exact JVM this wrapper spawned (3939094) -- refusing to kill anything
+```
+
+**Root cause, confirmed by inspecting the actual process tree (not
+assumed):** the wrapper spawns `/bin/bash -e -- "$generated_a" &` and
+assumes that spawned PID becomes the long-running server PID via a
+transparent `exec` chain. The generated script's content is
+`(cd '...'; exec '/tmp/temurin21/bin/java' ... net.neoforged.devlaunch.Main ...)`.
+`net.neoforged.devlaunch.Main` -- NeoForge/ModDev's own dev-launch
+bootstrap, not something this review ever controlled -- does not
+exec-replace into the real server process: `ps` showed the actual running
+server JVM's (PID 3939097) parent was PID 987 (`systemd --user`), not
+3939094, meaning the chain of intermediate processes between the
+wrapper's spawned bash and the real server had already exited by the
+time it was checked, orphaning the real server to the nearest reaper.
+This breaks the wrapper's single-PID-tracks-the-whole-lifecycle
+assumption -- an assumption many rounds of source review reasoned about
+correctly everywhere else, but one that could only actually be falsified
+by attempting a real launch, not by reading source.
+
+**Everything else about Phase A's own logic is confirmed correct from the
+retained evidence**, independent of the wrapper's PID bug: the marker
+(`durablePendingVerified=true`, correct `gameRoot`, correct `nonce`
+matching the claim, `operationId=de23f275-ea85-4ef7-b411-1e3554a4fb5b`,
+`targetKey=dynamicverse:crash_delete_target`, a real `targetRegionHash`)
+and the durable state file
+(`world/data/dynamicverse-managed-state.properties`) agree exactly:
+`operation.de23f275-...=DELETE|...|PENDING|...` for the target, with both
+`crash_delete_target` (generation 2) and `crash_unrelated` (generation 1)
+READY -- proving the admission, the durable PENDING journal write, and
+the deliberate block-forever barrier all worked precisely as designed,
+entirely independent of the external wrapper's PID-tracking defect.
+
+**The orphaned real server JVM (PID 3939097) was left untouched by the
+wrapper** (correctly refusing, per its own safety design) **and was not
+touched by any action of mine.** It later self-terminated on its own,
+~50 seconds after the marker was published, via Minecraft's own built-in
+`ServerHangWatchdog` -- confirmed by the retained crash report
+(`crash-reports/crash-2026-11-04_19.18.06-server.txt`): `"ServerHangWatchdog
+detected that a single server tick took ... (should be max 0.05)"`,
+with the watchdog's own thread dump showing the "Server thread" blocked
+exactly where expected, inside `ProviderSafeDeleteCrashFixture.phaseA`'s
+deliberate `Thread.sleep`. This is a standard vanilla safety mechanism,
+unrelated to and not triggered by this wrapper or this review's own code.
+
+Phase B was never launched. No SIGKILL was ever issued by the wrapper. No
+process was signaled by name or by any means outside the wrapper's own
+reviewed, refused-before-acting path. Every existing root, the prior
+native scenarios run's receipts, and this attempt's own root (marker,
+logs, crash report, durable state, world data) are all retained exactly
+as left -- nothing was deleted or cleaned up.
+
+Per the authorization: this is diagnostic evidence, not permission to
+retry, work around, or broaden the run. No fix has been applied to the
+wrapper or the fixture. Stopped and reported for the reviewer's next
+decision.
 
 ## Native execution: providerSafeDeleteScenariosGameTest (2026-11-05, head `597b841`)
 
