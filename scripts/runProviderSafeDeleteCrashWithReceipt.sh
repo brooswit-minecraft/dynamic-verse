@@ -133,6 +133,34 @@ proc_start_ticks() {
   awk '{print $22}' "/proc/$pid/stat" 2>/dev/null
 }
 
+# The generated launch script's own content is `(cd '...'; exec 'java' ...)`
+# -- a parenthesized compound command. Running it via `/bin/bash -- script &`
+# makes bash fork a SUBSHELL to run that compound command; `exec` then
+# replaces the SUBSHELL (not the outer, wrapper-spawned bash) with java, so
+# $! (the outer bash) is never the real JVM. Confirmed empirically with a
+# harmless, no-NeoForge reproduction: the outer bash stays alive throughout,
+# as the exec'd process's direct parent, with a DIFFERENT PID. Field 4 of
+# /proc/<pid>/stat is ppid; this scans for the one process whose ppid is the
+# given parent, exactly mirroring proc_start_ticks' existing (undefended,
+# consistent with the rest of this file) reliance on positional /proc/stat
+# fields. Fails closed if the launch shape doesn't produce exactly one
+# child -- it never falls back to trusting any other self-reported PID.
+find_only_child() {
+  local parent=$1 stat_file ppid found="" pid
+  for stat_file in /proc/[0-9]*/stat; do
+    [[ -r "$stat_file" ]] || continue
+    ppid=$(awk '{print $4}' "$stat_file" 2>/dev/null) || continue
+    [[ "$ppid" == "$parent" ]] || continue
+    pid=$(basename -- "$(dirname -- "$stat_file")")
+    if [[ -n "$found" ]]; then
+      return 1  # more than one child -- not the expected launch shape; fail closed
+    fi
+    found=$pid
+  done
+  [[ -n "$found" ]] || return 1
+  printf '%s' "$found"
+}
+
 # A PID existing (kill -0) is not proof it is still the process this wrapper
 # spawned -- the kernel can recycle a PID for something unrelated. Every
 # signal, INCLUDING this cleanup/interruption path (not only the primary
@@ -154,12 +182,33 @@ kill_if_still_owned() {
       kill -9 -- "-$pid" 2>/dev/null || true
     fi
     kill -9 "$pid" 2>/dev/null || true
+    # Only reached (and only valid to call at all) once we have actually
+    # signaled a PID this script owns as its own direct job -- confirmed
+    # by a real same-shell reproduction that an UNCONDITIONAL trailing
+    # `wait` here (previously run regardless of whether a mismatch left
+    # the PID untouched) blocks until that deliberately-untouched process
+    # exits on its own, which could be arbitrarily long. Never wait on a
+    # PID this function just decided NOT to touch.
+    wait "$pid" 2>/dev/null || true
   fi
-  wait "$pid" 2>/dev/null || true
 }
 
 cleanup() {
-  kill_if_still_owned "$phase_a_pid" "$phase_a_start" direct
+  # phase_a_pid is the VERIFIED real child (via find_only_child), set only
+  # once established; phase_a_launcher_pid is the raw $! bash itself
+  # reported, which find_only_child's own discovery showed is a DIFFERENT
+  # process (the outer bash, not the JVM). Kill the real child first if
+  # known -- killing it directly has no orphan risk, since it has no
+  # children of its own in this launch shape. Either way, also reach the
+  # launcher if it is still tracked: once established, phase_a_pid alone
+  # being killed lets the launcher exit on its own shortly after (nothing
+  # left to wait on), but explicitly re-verifying and signaling it here
+  # too means THIS script's own wait() reaps it directly rather than
+  # leaving it for init to reap indirectly after this script exits.
+  if [[ -n "$phase_a_pid" ]]; then
+    kill_if_still_owned "$phase_a_pid" "$phase_a_start" direct
+  fi
+  kill_if_still_owned "$phase_a_launcher_pid" "$phase_a_launcher_start" direct
   kill_if_still_owned "$phase_b_pid" "$phase_b_start" group
 }
 
@@ -313,6 +362,8 @@ main() {
   done
   [[ -d /proc ]] || refuse "/proc is required for owned-process start-identity verification on this platform"
 
+  phase_a_launcher_pid=""
+  phase_a_launcher_start=""
   phase_a_pid=""
   phase_a_start=""
   phase_b_pid=""
@@ -360,10 +411,28 @@ main() {
   local phase_a_prespawn_epoch
   phase_a_prespawn_epoch=$(date -u +%s)
   /bin/bash -e -- "$generated_a" > "$receipts/phase-a.full.log" 2>&1 &
-  phase_a_pid=$!
+  phase_a_launcher_pid=$!
+  phase_a_launcher_start=$(proc_start_ticks "$phase_a_launcher_pid") || true
+  [[ -n "$phase_a_launcher_start" ]] || refuse "cannot capture phase A launcher's own process start identity immediately after spawn"
+  echo "spawned phase A launcher as PID $phase_a_launcher_pid (start ticks $phase_a_launcher_start)" >&2
+
+  # $phase_a_launcher_pid is the outer bash the generated script's own
+  # `(cd '...'; exec 'java' ...)` subshell wrapping runs under -- NOT the
+  # JVM. Establish the actual owned child from the real parent/child
+  # relationship (never trust $! alone, and never trust the marker's
+  # self-reported PID as the FIRST source of truth) before doing anything
+  # else that could signal a process.
+  local child_wait_i
+  for ((child_wait_i = 0; child_wait_i < 100; child_wait_i++)); do
+    phase_a_pid=$(find_only_child "$phase_a_launcher_pid") && break
+    phase_a_pid=""
+    if ! kill -0 "$phase_a_launcher_pid" 2>/dev/null; then break; fi
+    sleep 0.1
+  done
+  [[ -n "$phase_a_pid" ]] || refuse "cannot establish the exact owned child process from the generated launch's parent/subshell shape"
   phase_a_start=$(proc_start_ticks "$phase_a_pid") || true
-  [[ -n "$phase_a_start" ]] || refuse "cannot capture phase A's own process start identity immediately after spawn"
-  echo "spawned phase A as PID $phase_a_pid (start ticks $phase_a_start); waiting up to ${marker_timeout_seconds}s for its marker" >&2
+  [[ -n "$phase_a_start" ]] || refuse "cannot capture the owned child's own process start identity"
+  echo "established owned child PID $phase_a_pid (start ticks $phase_a_start) as phase A's real process; waiting up to ${marker_timeout_seconds}s for its marker" >&2
 
   local marker_seen=0 i
   for ((i = 0; i < marker_timeout_seconds; i++)); do
@@ -414,8 +483,16 @@ main() {
     sleep 1
   done
   (( exited )) || refuse "phase A PID $phase_a_pid did not exit within ${exit_timeout_seconds}s of SIGKILL"
-  wait "$phase_a_pid" 2>/dev/null; phase_a_exit=$?
-  phase_a_pid=""   # already reaped; cleanup trap must not touch it again
+  # bash's `wait` builtin only works on the CALLING shell's own direct
+  # children/jobs. $phase_a_pid (the discovered real JVM) is a child of
+  # $phase_a_launcher_pid, not of this wrapper script directly -- only the
+  # launcher is this script's own job and so the only PID this script can
+  # validly `wait` on. kill -0/-9 above have no such restriction and
+  # correctly targeted the real JVM; this wait only reaps the launcher,
+  # which terminates on its own once its one child (just killed) exits.
+  wait "$phase_a_launcher_pid" 2>/dev/null; phase_a_exit=$?
+  phase_a_pid=""            # already reaped; cleanup trap must not touch it again
+  phase_a_launcher_pid=""   # likewise -- its one child is gone, it has already exited
   # Expected and recorded separately from a successful exit status: this PID
   # was forcibly killed, so its exit status is not evidence of success or
   # failure, only confirmation that it actually terminated.

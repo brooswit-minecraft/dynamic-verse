@@ -245,6 +245,119 @@ check "root_is_exclusively_claimed REFUSES a marker with a malformed (non-hex) n
 
 rm -rf "$root_probe_base"
 
+### 8. find_only_child against the REAL generated parent/subshell launch
+### shape (Jira comment 51622): the generated script's own content is
+### `(cd '...'; exec '<executable>' ...)`. Launching that via
+### `/bin/bash -- script &` makes bash fork a subshell to run the
+### parenthesized compound command; `exec` replaces the SUBSHELL, not the
+### outer wrapper-spawned bash -- so $! is never the real executable.
+### Reproduced here with a harmless temporary executable (sleep), no
+### Minecraft/native launch, mirroring the exact shape that misled the
+### original diagnosis.
+subshell_probe_dir=$(mktemp -d)
+subshell_script="$subshell_probe_dir/generated.sh"
+cat > "$subshell_script" <<SCRIPT
+(cd '$subshell_probe_dir'; exec /bin/sleep 30)
+SCRIPT
+/bin/bash -e -- "$subshell_script" >/dev/null 2>&1 &
+launcher_pid=$!
+launcher_start=$(proc_start_ticks "$launcher_pid")
+child_pid=""
+for _ in $(seq 1 50); do
+  child_pid=$(find_only_child "$launcher_pid") && break
+  sleep 0.1
+done
+check "find_only_child discovers a real child of the launcher within the expected window" "$([[ -n "$child_pid" ]] && echo 1 || echo 0)"
+check "the discovered child's PID differs from the launcher's own \$! (the exact original misdiagnosis)" "$([[ -n "$child_pid" && "$child_pid" != "$launcher_pid" ]] && echo 1 || echo 0)"
+if [[ -n "$child_pid" ]]; then
+  child_cmd=$(tr '\0' ' ' < "/proc/$child_pid/cmdline" 2>/dev/null)
+  check "the discovered child is actually running the exec'd executable, not the launcher's own bash" "$([[ "$child_cmd" == *"sleep"* ]] && echo 1 || echo 0)"
+fi
+# Killing ONLY the discovered real child (never the launcher) must not
+# orphan anything further -- there is nothing further in this shape -- and
+# the launcher must exit on its own shortly after, exactly like the
+# fixed wrapper's own cleanup now does.
+if [[ -n "$child_pid" ]]; then
+  kill -9 "$child_pid" 2>/dev/null
+  sleep 1
+  # A zombie still has a /proc/<pid> entry, so existence alone is not
+  # "exited" -- check the actual process state (field 3 of /proc/<pid>/stat);
+  # gone entirely or zombie ('Z') both count as "exited" for this check.
+  launcher_state=$(awk '{print $3}' "/proc/$launcher_pid/stat" 2>/dev/null)
+  check "the launcher exits on its own once its real child (killed directly) is gone" \
+    "$([[ -z "$launcher_state" || "$launcher_state" == "Z" ]] && echo 1 || echo 0)"
+fi
+wait "$launcher_pid" 2>/dev/null || true
+rm -rf "$subshell_probe_dir"
+
+# find_only_child must fail closed -- never silently pick one -- when the
+# launch shape produces more than one child (not the expected shape).
+multi_child_script="$subshell_probe_dir-multi.sh"
+mkdir -p "$(dirname "$multi_child_script")" 2>/dev/null || true
+cat > "$multi_child_script" <<'SCRIPT'
+/bin/sleep 30 & /bin/sleep 30 & wait
+SCRIPT
+/bin/bash -e -- "$multi_child_script" >/dev/null 2>&1 &
+multi_launcher_pid=$!
+sleep 0.5
+if find_only_child "$multi_launcher_pid" >/dev/null 2>&1; then
+  check "find_only_child REFUSES (fails closed) when more than one child exists" 0
+else
+  check "find_only_child REFUSES (fails closed) when more than one child exists" 1
+fi
+pkill -9 -P "$multi_launcher_pid" 2>/dev/null || true
+kill -9 "$multi_launcher_pid" 2>/dev/null || true
+wait "$multi_launcher_pid" 2>/dev/null || true
+rm -f "$multi_child_script"
+
+### 9. kill_if_still_owned's identity-gated signaling, proven against real
+### (harmless) processes -- never signaling on a start-identity mismatch,
+### always signaling on a genuine match. No mocking needed: observing
+### whether a real, harmless sleep process survives IS the proof.
+owned_pid_match_target=""
+/bin/sleep 30 &
+owned_pid_match_target=$!
+owned_match_ticks=$(proc_start_ticks "$owned_pid_match_target")
+kill_if_still_owned "$owned_pid_match_target" "$owned_match_ticks" direct
+sleep 0.3
+check "kill_if_still_owned signals a real process when start-identity matches" "$([[ ! -d "/proc/$owned_pid_match_target" ]] && echo 1 || echo 0)"
+
+/bin/sleep 30 &
+owned_pid_mismatch_target=$!
+kill_if_still_owned "$owned_pid_mismatch_target" "0000000-deliberately-wrong-ticks" direct
+sleep 0.3
+check "kill_if_still_owned REFUSES to signal a real process when start-identity does not match" "$([[ -d "/proc/$owned_pid_mismatch_target" ]] && echo 1 || echo 0)"
+kill -9 "$owned_pid_mismatch_target" 2>/dev/null
+wait "$owned_pid_mismatch_target" 2>/dev/null || true
+
+### 10. proc_start_ticks reflects a real, currently-running process and
+### goes empty once that exact process is gone (the basis every identity
+### check in this wrapper relies on).
+/bin/sleep 30 &
+ticks_probe_pid=$!
+ticks_value=$(proc_start_ticks "$ticks_probe_pid")
+check "proc_start_ticks returns a plausible non-empty value for a real running process" "$([[ "$ticks_value" =~ ^[0-9]+$ ]] && echo 1 || echo 0)"
+kill -9 "$ticks_probe_pid" 2>/dev/null
+wait "$ticks_probe_pid" 2>/dev/null || true
+ticks_after=$(proc_start_ticks "$ticks_probe_pid")
+check "proc_start_ticks returns empty once that exact process is gone" "$([[ -z "$ticks_after" ]] && echo 1 || echo 0)"
+
+### 11. The marker/PID comparison itself, using the real marker-parsing
+### idiom (sed -n 's/^pid=//p') against a constructed fake marker -- a
+### mismatched self-reported PID must compare unequal to a real
+### discovered PID. No native server; no real marker file needed beyond a
+### plain constructed properties file.
+fake_marker=$(mktemp)
+printf 'pid=999999999\n' > "$fake_marker"
+fake_reported_pid=$(sed -n 's/^pid=//p' "$fake_marker" | tr -d '\r')
+/bin/sleep 5 &
+real_discovered_pid=$!
+check "a fake marker's self-reported PID correctly compares unequal to a real, different discovered PID (the refusal condition)" \
+  "$([[ "$fake_reported_pid" != "$real_discovered_pid" ]] && echo 1 || echo 0)"
+kill -9 "$real_discovered_pid" 2>/dev/null
+wait "$real_discovered_pid" 2>/dev/null || true
+rm -f "$fake_marker"
+
 echo "---"
 echo "pass=$pass fail=$fail"
 [[ $fail == 0 ]]

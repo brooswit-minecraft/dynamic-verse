@@ -11,12 +11,110 @@ any native execution**. Two native authorizations have been exercised so
 far, each exactly once: Jira comment 51612 authorized one invocation of
 the in-process scenarios fixture (`providerSafeDeleteScenariosGameTest`,
 passed -- see its own section below); Jira comment 51617 authorized one
-two-JVM crash/recovery A/B pair, which never reached a kill or Phase B at
-all -- the wrapper's own PID-identity guard correctly refused first (see
-the section immediately below). No SIGKILL has ever been issued against
-anything in this fixture, no second invocation of either fixture, and no
-deliberate crash signal has occurred or is authorized beyond what is
+two-JVM crash/recovery A/B pair, which never reached the principal
+verified-kill step or Phase B at all -- the wrapper's own PID-identity
+guard correctly refused to touch the real server (see the section
+immediately below, and its 51622 correction: the wrapper's own cleanup
+trap did issue a real SIGKILL to its own recorded launcher PID, which is
+different from "no kill attempted anywhere"). No second invocation of
+either fixture, and no deliberate crash signal against the actual server,
+has occurred or is authorized beyond what is
 documented in these two sections.
+
+## Round 3, seventh incremental review (Jira comment 51622): the diagnosis was wrong, and the real root cause is now fixed -- source/offline only, no retry
+
+Reviewed against the `9d49ece` diagnosis. Two concrete corrections, both
+independently re-verified (not taken on the reviewer's word alone) before
+fixing anything:
+
+- **"No SIGKILL was ever issued" was wrong.** Traced the actual EXIT path:
+  `refuse()` calls `exit 125`; `trap cleanup EXIT` runs; `cleanup()` calls
+  `kill_if_still_owned` for the recorded Phase-A PID. At the moment of the
+  mismatch refusal, that PID's start-ticks still matched (no time had
+  elapsed for recycling), so `kill_if_still_owned` almost certainly *did*
+  issue `kill -9` -- just against the wrapper's own recorded launcher PID
+  (`3939094`), never against the real server (`3939097`), which the
+  identity guard correctly left untouched. This is retained, not reported
+  as a fabricated signal history: no log line records the kill itself
+  (`kill_if_still_owned` has no echo), so what is stated here is the most
+  likely reconstruction consistent with the retained evidence (the
+  launcher's absence shortly after, the function's own code, and the
+  tight synchronous timing), not an independently-logged confirmation.
+- **The root cause ("`net.neoforged.devlaunch.Main` forks and exits") was
+  an unverified leap, now retracted.** An independent, harmless
+  reproduction -- the exact `(cd 'root'; exec 'executable' ...)` shape,
+  substituting `/usr/bin/python3` for `java`, no NeoForge, no signals --
+  showed the wrapper-spawned PID and the exec'd PID are *always* distinct
+  under this shape (bash forks a subshell to run the parenthesized
+  compound command; `exec` replaces the SUBSHELL, not the outer spawned
+  bash), **and** that the wrapper-spawned PID stays alive throughout as
+  the exec'd process's direct parent -- no devlaunch-specific forking
+  needed to explain the PID mismatch itself. A second reproduction then
+  confirmed the real explanation for the observed reparenting to `systemd
+  --user`: killing *only* the wrapper-spawned launcher PID while its
+  exec-chain descendant is still running reparents that descendant to
+  init immediately -- exactly matching what was observed. The reparenting
+  was therefore very likely a consequence of `cleanup()`'s own (correct,
+  already-reviewed) launcher kill, not evidence of any NeoForge-specific
+  process model.
+
+**The fix** (`runProviderSafeDeleteCrashWithReceipt.sh`, source/offline
+only -- no native run): a new `find_only_child(parent_pid)` scans
+`/proc/*/stat` for the one process whose own ppid (field 4, the same
+positional-field convention `proc_start_ticks` already relies on) is the
+given parent, failing closed (refusing) if zero or more than one match is
+found -- it never falls back to trusting `$!`, and never loosens PID
+equality to accept any self-reported process. Phase A's launch now:
+spawns the generated script exactly as before (`phase_a_launcher_pid`);
+polls `find_only_child` to establish the real owned child
+(`phase_a_pid`) from the ACTUAL parent/child relationship, not an
+assumption; captures that child's own start-identity; and runs every
+existing check (marker PID/nonce/root, start-identity re-verification
+immediately before signaling, the frozen-manifest comparison, the
+session-lock check, Phase B's timeout/process-group handling) completely
+unchanged, now correctly pointed at the real process. `cleanup()` prefers
+killing the established real child (no orphan risk -- confirmed it has no
+further children of its own in this launch shape) and separately reaches
+the launcher too, so this script's own `wait()` reaps it directly rather
+than leaving it for `init` to reap indirectly.
+
+**A second, independent bug was found and fixed while building the
+offline tests for this correction** (not reported by 51622, discovered by
+actually exercising the fix with real harmless processes): the preexisting
+`kill_if_still_owned`'s trailing `wait "$pid"` ran *unconditionally*, even
+on an identity mismatch where nothing was killed. A same-shell
+reproduction showed this blocks for as long as that deliberately-untouched
+process takes to exit on its own -- potentially indefinitely for a
+genuinely long-running mismatch target, exactly the "cleanup trap hangs
+on the thing it correctly decided not to touch" failure this review has
+been hardening against throughout. Fixed by moving the `wait` inside the
+matched/killed branch only; a mismatch now returns immediately, touching
+nothing.
+
+**Offline tests retained** (`testProviderSafeDeleteCrashWrapperOffline.sh`,
+extended to 33/33, all against real harmless processes, no
+Minecraft/server/native launch): `find_only_child` against the real
+generated parent/subshell shape (a harmless `sleep` substitute) --
+discovers the correct child, confirms it differs from `$!`, confirms it
+is actually running the exec'd executable, confirms killing it directly
+lets the launcher exit on its own, and confirms the function fails closed
+when more than one child exists; `kill_if_still_owned` proven directly
+against real processes -- signals on a genuine start-identity match,
+provably does NOT signal (and does not hang) on a mismatch;
+`proc_start_ticks` reflects a real running process and goes empty once it
+is gone; and the real marker-parsing idiom applied to a constructed fake
+marker, proving a mismatched self-reported PID compares unequal to a real
+discovered PID.
+
+Re-verified without executing anything natively: `compileJava`/
+`compileTestJava`/`test` 93/0/0/0 (unaffected -- wrapper-script-only
+change); `bash -n`; the existing contract/manifest preflight re-run
+against the regenerated stable-preparation-root launch scripts, unchanged
+results; the extended offline harness, 33/33. No GameTest or native
+server launch of any kind has occurred in this round. Per the
+authorization: source/offline preparation only, no retry, no new A/B
+pair, no server signal -- stopped after returning this correction for
+review.
 
 ## Native execution attempt: the two-JVM crash fixture (2026-11-05, head `597b841`) -- refused by its own safety guard; root cause diagnosed, NOT fixed or retried
 
