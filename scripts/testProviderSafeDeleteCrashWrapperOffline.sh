@@ -29,7 +29,8 @@ check() {
 source "$wrapper"
 [[ "$(type -t capture_manifest)" == function && "$(type -t require_manifest_schema)" == function \
    && "$(type -t require_manifests_match)" == function && "$(type -t read_process_start_instant)" == function \
-   && "$(type -t root_is_exclusively_claimed)" == function && "$(type -t refuse)" == function ]]
+   && "$(type -t root_is_exclusively_claimed)" == function && "$(type -t refuse)" == function \
+   && "$(type -t session_lock_is_held)" == function ]]
 check "sourced the real wrapper's actual functions" "$([[ $? == 0 ]] && echo 1 || echo 0)"
 
 normal_a_real="$workspace/build/moddev/providerSafeDeleteCrashPhaseARunClasspath.txt"
@@ -357,6 +358,56 @@ check "a fake marker's self-reported PID correctly compares unequal to a real, d
 kill -9 "$real_discovered_pid" 2>/dev/null
 wait "$real_discovered_pid" 2>/dev/null || true
 rm -f "$fake_marker"
+
+### 12. session_lock_is_held (Jira comment 51622's live retry, native run
+### 20261105T1410Z: the ORIGINAL merged-stream check refused every run in
+### this sandbox regardless of truth, because lsof writes an unrelated
+### "can't stat() fuse.gvfsd-fuse" warning to stderr UNCONDITIONALLY, and
+### the original code merged that warning into the same file it tested for
+### non-emptiness). Proven here against REAL harmless file holders/lsof
+### invocations, not mocked -- the exact environment-specific false
+### positive is reproduced and shown fixed.
+lock_probe_file=$(mktemp)
+lock_probe_out=$(mktemp)
+lock_probe_err=$(mktemp)
+
+# A genuinely held file: a real process (sleep) holds an open fd on it.
+( exec 9<>"$lock_probe_file"; sleep 30 ) &
+lock_holder_pid=$!
+sleep 0.3
+held_result=$(session_lock_is_held "$lock_probe_file" "$lock_probe_out" "$lock_probe_err")
+check "session_lock_is_held reports 1 (held) for a file a real process actually holds open" "$([[ "$held_result" == 1 ]] && echo 1 || echo 0)"
+kill -9 "$lock_holder_pid" 2>/dev/null
+wait "$lock_holder_pid" 2>/dev/null || true
+
+# The same file, now genuinely free: must read as free regardless of
+# whatever this host's real lsof chooses to write to stderr.
+free_result=$(session_lock_is_held "$lock_probe_file" "$lock_probe_out" "$lock_probe_err")
+check "session_lock_is_held reports 0 (free) once the real holder is gone, independent of lsof's own stderr content" \
+  "$([[ "$free_result" == 0 ]] && echo 1 || echo 0)"
+
+# A non-empty stderr with an EMPTY stdout must never be mistaken for "held" --
+# this is the exact bug class: construct that shape directly against a
+# wrapped lsof stand-in and confirm the function still reports 0 (free).
+fake_lsof_dir=$(mktemp -d)
+cat > "$fake_lsof_dir/lsof" <<'FAKE_LSOF'
+#!/usr/bin/env bash
+echo "lsof: WARNING: can't stat() fuse.gvfsd-fuse file system /run/user/1001/gvfs" >&2
+exit 1
+FAKE_LSOF
+chmod +x "$fake_lsof_dir/lsof"
+fake_result=$(PATH="$fake_lsof_dir:$PATH" session_lock_is_held "$lock_probe_file" "$lock_probe_out" "$lock_probe_err")
+check "session_lock_is_held is NOT fooled by a stderr-only warning with empty stdout (the exact false positive hit live)" \
+  "$([[ "$fake_result" == 0 ]] && echo 1 || echo 0)"
+
+# A genuinely missing lsof binary must still fail closed (exit 125 via refuse).
+empty_path_dir=$(mktemp -d)
+missing_lsof_status=0
+( PATH="$empty_path_dir" session_lock_is_held "$lock_probe_file" "$lock_probe_out" "$lock_probe_err" >/dev/null 2>&1 ) || missing_lsof_status=$?
+check "session_lock_is_held fails closed (refuse, exit 125) when the lsof binary itself is unavailable" \
+  "$([[ "$missing_lsof_status" == 125 ]] && echo 1 || echo 0)"
+
+rm -rf -- "$lock_probe_file" "$lock_probe_out" "$lock_probe_err" "$fake_lsof_dir" "$empty_path_dir"
 
 echo "---"
 echo "pass=$pass fail=$fail"

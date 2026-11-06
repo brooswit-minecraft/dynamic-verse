@@ -349,6 +349,25 @@ read_process_start_instant() {
   ordinary_java_property "$workspace" "$file" processStartInstant
 }
 
+# stdout and stderr are captured to SEPARATE files, not merged: lsof can
+# write environment-specific warnings to stderr (e.g. an unrelated mount it
+# cannot stat) even when it finds no holder at all, and on at least one
+# sandbox this warning fires UNCONDITIONALLY -- merging it into one stream
+# made this check refuse every run regardless of truth (confirmed by
+# reproducing lsof's output on both a genuinely held and a genuinely free
+# file: the warning appears on stderr in both cases; only stdout carries the
+# real holder evidence). A non-0/1 exit (including the shell's own 127 if
+# the `lsof` binary is missing) still fails closed, preserving this check's
+# original "lsof unavailable -> refuse" intent. Echoes 1 if still held, 0 if
+# free; refuses directly on an unexpected lsof exit.
+session_lock_is_held() {
+  local lock_file=$1 out_log=$2 err_log=$3 lsof_exit
+  lsof -- "$lock_file" > "$out_log" 2> "$err_log"
+  lsof_exit=$?
+  (( lsof_exit == 0 || lsof_exit == 1 )) || refuse "lsof exited unexpectedly ($lsof_exit) checking $lock_file -- failing closed"
+  [[ -s "$out_log" ]] && echo 1 || echo 0
+}
+
 main() {
   [[ -n "$root" ]] || refuse "DYNAMICVERSE_SAFE_DELETE_CRASH_EXECUTION_ROOT must be set explicitly to a root already exclusively claimed via scripts/claimSafeDeleteCrashExecutionRoot.sh -- never the stable preparation root ModDev's prepare*Run tasks create as a side effect of regenerating these launch scripts. Claim a fresh root, regenerate createProviderSafeDeleteCrashPhase{A,B}LaunchScript with -PsafeDeleteCrashGameDirectory set to that SAME path, then set this variable to it."
   server_properties="$root/server.properties"
@@ -498,8 +517,11 @@ main() {
   # failure, only confirmation that it actually terminated.
   printf '%s\n' "$phase_a_exit" > "$receipts/phase-a.forced-kill-exit"
 
-  lsof -- "$world_root/session.lock" > "$receipts/phase-a.session-lock-check.log" 2>&1
-  [[ ! -s "$receipts/phase-a.session-lock-check.log" ]] || refuse "a process still holds the world session.lock after phase A's forced exit"
+  local lock_still_held
+  lock_still_held=$(session_lock_is_held "$world_root/session.lock" \
+    "$receipts/phase-a.session-lock-check.log" \
+    "$receipts/phase-a.session-lock-check.stderr.log")
+  [[ "$lock_still_held" == 0 ]] || refuse "a process still holds the world session.lock after phase A's forced exit"
 
   ### Phase B: an independent, timeout-bounded launch against the same disposable root.
   # Rechecked immediately before this launch, not only once at the start, so

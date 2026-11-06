@@ -1,4 +1,4 @@
-# Real-provider safe-delete acceptance: fixture/runner (two-JVM crash fixture's one authorized attempt refused by its own PID safety guard, diagnosed, not retried; in-process scenarios fixture executed once and passed -- see below)
+# Real-provider safe-delete acceptance: fixture/runner (two-JVM crash fixture's third attempt, authorized by Jira comment 51743, reached and killed the real Phase A process, and Phase B's in-process recovery assertions all passed -- but Phase B's own JVM hung after saving all worlds and never exited cleanly; reported, NOT retried -- see below)
 
 Per MINECRAFT-470 review: `runtimeConfirmedDeleteRemovesOnlyItsOwnMetadataAndInterruptedDeleteStaysQuarantinedAfterRestart`
 is useful production-wiring evidence, but its state store is
@@ -7,19 +7,140 @@ and reconstruction happens in the same process. Per the follow-up technical
 plan review (https://github.com/brooswit-minecraft/dynamic-verse/pull/3,
 "latest technical plan review" comment), this document was updated from a
 plan into the actual narrow source/runner it specifies, for review **before
-any native execution**. Two native authorizations have been exercised so
-far, each exactly once: Jira comment 51612 authorized one invocation of
-the in-process scenarios fixture (`providerSafeDeleteScenariosGameTest`,
+any native execution**. Native authorizations exercised so far, each
+exactly once: Jira comment 51612 authorized one invocation of the
+in-process scenarios fixture (`providerSafeDeleteScenariosGameTest`,
 passed -- see its own section below); Jira comment 51617 authorized one
 two-JVM crash/recovery A/B pair, which never reached the principal
 verified-kill step or Phase B at all -- the wrapper's own PID-identity
-guard correctly refused to touch the real server (see the section
-immediately below, and its 51622 correction: the wrapper's own cleanup
-trap did issue a real SIGKILL to its own recorded launcher PID, which is
-different from "no kill attempted anywhere"). No second invocation of
-either fixture, and no deliberate crash signal against the actual server,
-has occurred or is authorized beyond what is
-documented in these two sections.
+guard correctly refused to touch the real server (see the section below,
+and its 51622 correction: the wrapper's own cleanup trap did issue a real
+SIGKILL to its own recorded launcher PID, which is different from "no kill
+attempted anywhere"); Jira comment 51743 (quoting the human owner's
+explicit "yeah" to one corrected isolated test) authorized exactly one more
+two-JVM crash/recovery A/B pair, executed 2026-11-05/06 at head `e313a11`
+-- see "Round 4" below for the full result. No further invocation of either
+fixture, and no further deliberate crash signal against the actual server,
+has occurred or is authorized beyond what is documented in these sections.
+
+## Round 4 (Jira comment 51743): the authorized retry -- Phase A kill correct, Phase B's recovery checks all passed, but Phase B's own JVM hung on shutdown
+
+Authorized by comment 51743, which explicitly cleared "one corrected
+isolated test ... in a newly verified disposable directory," quoting the
+human owner's "yeah" to that exact ask. Preconditions re-verified fresh
+(not assumed) before using the grant: issue status read back as `In
+Progress` with no newer conflicting hold; no java/devlaunch process was
+running; the interrupted 14:30 root
+(`run/m470-safe-delete-crash-NATIVE-20261105T143051Z`) contained only its
+claim marker -- no world, no logs, no receipts -- confirming (independently
+of comment 51672's own read-only finding) that no execution or signal
+reached a real process during the prior interruption. Both earlier
+preserved receipt sets (`...PRESERVED-20261105T0317Z-diagnosed-failure`,
+`...PRESERVED-20261105T1410Z-lsof-false-positive`) were confirmed untouched
+and left in place.
+
+**A real wrapper bug found and fixed before using the grant (source/offline
+only):** the very first use of the grant's fresh root refused with `a
+process still holds the world session.lock after phase A's forced exit`.
+`lsof`'s own stderr in this sandbox carries an unconditional, unrelated
+warning (`can't stat() fuse.gvfsd-fuse file system /run/user/1001/gvfs`)
+-- present whether or not the target file is actually held, reproduced
+directly against both a genuinely-held and a genuinely-free file. The
+check merged stdout and stderr into one stream and gated on its
+non-emptiness, so it refused every run in this sandbox regardless of
+truth. Fixed by separating the two streams, gating only on stdout (the
+real evidence), and still failing closed on any `lsof` exit other than
+0/1 (preserving the original "lsof unavailable -> refuse" intent). Factored
+into its own `session_lock_is_held()` function (previously inline) so it
+could be unit-tested the same way every other identity check in this
+wrapper already is; `scripts/testProviderSafeDeleteCrashWrapperOffline.sh`
+gained four new cases reproducing the exact false positive against real
+harmless processes (held / free / stderr-only-warning / missing-binary),
+37/37 passing.
+
+**A second near-miss, caught before it could burn the one authorized
+attempt:** regenerating the launch scripts against the fresh root
+initially resolved the provider dependency to a *different* jar
+(`acceptedDynamicDimensionsJar`'s build.gradle default,
+`/tmp/dynamicdimensions-composite/...4b09389e...candidate-51101.jar`,
+hash `50b7b75a...`) than the hook-bearing corrected provider this wrapper's
+own hardcoded expectation requires (hash `4c4d70a9...`, carrying
+`TestOnlySaveFailureHook`). The wrapper's own `-PacceptedDynamicDimensionsJar`
+hash check (added in an earlier round specifically to catch this class of
+drift) refused the run outright rather than silently using the wrong
+provider -- confirmed this is NOT a side-channel/tampering: that composite
+build is an entirely separate, currently-dirty working tree (unrelated
+`ExplicitSeedDimensionRegistry`/seed-ownership commits) that `build.gradle`
+has defaulted to since commit `560c5cb`, predating this fixture's work
+entirely. Re-ran with `-PacceptedDynamicDimensionsJar`/
+`-PreviewedDynamicDimensionsClasses` explicitly pointed at the hook-bearing
+jar (re-verified present, hash-matched, and carrying the expected
+`MinecraftServerMixin.quiesceAndCloseTerminalResults` field and
+`TestOnlySaveFailureHook` classes immediately before use); `compileJava
+compileTestJava test` green against it.
+
+**The one authorized execution** (root
+`run/m470-safe-delete-crash-AUTHORIZED-51743-20261106T000806Z`):
+- Phase A: launcher PID correctly distinguished from the real spawned child
+  (PID 3347855); start-identity re-verified immediately before signaling;
+  SIGKILL delivered to exactly that PID; process confirmed exited; the
+  session.lock check (now fixed) correctly reported free, not a false
+  positive. `dynamicverse-crash-delete-phase-a-marker.properties` confirms
+  `durablePendingVerified=true` for operation `5ee485cd-...`.
+- Phase B: booted cleanly, found the interrupted operation, and ran its
+  full in-process recovery check. **Every assertion the fixture requires
+  passed**, per `dynamicverse-crash-delete-phase-b-result.properties`:
+  `targetQuarantined`, `targetRejectionCompleted`, `targetNeverReloaded`,
+  `targetOperationInterruptedPostRecovery`, `unrelatedLeaseAcquired`,
+  `unrelatedSentinelIntact`, `targetStorageIntact`, `targetContentIntact`
+  all `true`; the managed-state store independently confirms the same
+  operation id transitioned to `FAILED`/`ERR_OPERATION_INTERRUPTED`, not
+  silently dropped or re-admitted. This is the actual property under test
+  (an interrupted delete recovers safely), and it held.
+- Immediately after writing that result, the fixture calls
+  `server.halt(false)` as designed. The log shows a completely normal
+  shutdown sequence start -- `Stopping server`, `Saving players`, `Saving
+  worlds`, `Saving chunks` for every level including the unrelated
+  `dynamicverse:crash_unrelated` (notably NOT the quarantined target,
+  consistent with `targetNeverReloaded`), `ThreadedAnvilChunkStorage: All
+  dimensions are saved` -- and then **nothing further is ever logged**.
+  The wrapper's hard bound (`timeout --kill-after=10s 120s`) eventually
+  fired, `phase-b.exit` = `124`, and the wrapper correctly refused: `phase B
+  did not exit cleanly (exit 124, ...)`.
+
+**Net result: FAILED, by the wrapper's own all-or-nothing contract** (any
+non-zero Phase B exit is always a failure here, regardless of what the
+in-process checks found) -- even though the actual property under test
+(crash/recovery correctness) passed every check the fixture makes. This is
+a *different* defect than anything found in rounds 1-3: not the
+PID-identity/kill logic (validated correct this round), not the
+session.lock check (fixed and validated this round), and not the
+recovery logic itself (passed). It is Phase B's own JVM failing to
+terminate after `server.halt(false)` and a fully-completed world save --
+grep of the full log/debug log for `stop|halt|shutdown|saving|thread`
+shows nothing past `ThreadedAnvilChunkStorage: All dimensions are saved`;
+no `ServerStoppedEvent` listener exists anywhere in this codebase or the
+provider; neither of this codebase's two `ServerStoppingEvent` handlers
+(`DynamicVerse.serverStopping`, `MinecraftProviderDuplicationPort$EventOwner
+.serverStopping`) do anything that would explain a hang at this later
+stage, and in any case both must have already run and returned before the
+save sequence shown in the log could proceed. No thread dump was captured
+(the wrapper does not take one before its hard kill) so the exact hang site
+is not yet pinned down -- leading hypothesis, not confirmed: something in
+this project's own level-close/quarantine interception for the deleted
+target stalls during the later (post-chunk-save) stage of
+`MinecraftServer.stopServer()`, but vanilla/NeoForge's own later-stage
+shutdown or an unclosed non-daemon thread has not been ruled out.
+
+Per comment 51743's explicit terms ("no second native attempt under this
+grant"; "if ... the test fails, stop that action and report the exact
+outcome"): **not retried.** All evidence preserved under
+`run/m470-safe-delete-crash-AUTHORIZED-51743-20261106T000806Z/` and
+`build/moddev/providerSafeDeleteCrash-receipts/` (not committed; this
+directory is gitignored). The two real, source-level fixes made and
+validated this round (the lsof stream-separation fix and the explicit
+provider-jar selection) are committed. A follow-up native attempt to
+validate any fix for the shutdown hang needs its own fresh authorization.
 
 ## Round 3, seventh incremental review (Jira comment 51622): the diagnosis was wrong, and the real root cause is now fixed -- source/offline only, no retry
 
