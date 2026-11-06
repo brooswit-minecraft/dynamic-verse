@@ -152,17 +152,36 @@ the broader question of where in vanilla/NeoForge's later-stage shutdown
 
 **Proposed bounded validation for a future authorized attempt** (not yet
 approved, not executed): a non-destructive SIGQUIT thread-dump capture was
-added to the wrapper, firing shortly before phase B's graceful-TERM
+added to the wrapper, firing once shortly before phase B's graceful-TERM
 deadline, targeted at the exact real JVM PID (not the whole process group
 -- `timeout` and the intermediate generated-script bash install no SIGQUIT
 handler, so group-wide delivery would terminate them and corrupt the
-wrapper's own monitoring). Proven offline against a harmless two-level
-nested subshell/exec reproduction (`scripts/testProviderSafeDeleteCrashWrapperOffline.sh`,
-section 13): the outer launcher and intermediate bash are confirmed to
-survive a leaf-targeted SIGQUIT. This is source/offline only so far --
-committed, not executed natively. The next native attempt, whenever
-authorized, would be the first to actually capture what phase B's real
-JVM is doing at the moment of the hang.
+wrapper's own monitoring).
+
+**Review correction (Jira comment 51915):** the first version of this had
+a real PID-reuse gap -- it resolved children of `phase_b_pid` without
+first confirming `phase_b_pid` itself was still the process this wrapper
+spawned, never checked the resolved leaf was actually a JVM, and left its
+delayed timer running even after phase B's own observed run ended; a
+reused PID by the time the timer fired could have produced an entirely
+unrelated child chain and been signaled. Fixed by factoring the logic into
+its own `phase_b_diagnostic_quit()` (current head `8b30a1f`): it
+re-verifies the given PID's start-ticks against the start-ticks captured
+at spawn before resolving anything, requires the resolved leaf's
+`/proc/<pid>/comm` to positively read `java` before signaling, and the
+call site explicitly retires the timer (reusing the existing
+`kill_if_still_owned`) immediately after phase B's own `wait` returns --
+in `cleanup()` too, for an abnormal exit. Three new offline cases
+(`scripts/testProviderSafeDeleteCrashWrapperOffline.sh`, section 13, 45/45
+passing) reproduce each gap directly: a mismatched start-tick, a non-JVM
+leaf, and an early-retired long-sleeping stand-in timer whose payload
+never fires. SIGQUIT's actual effect on a plain process (terminates with
+core dump) was confirmed empirically first, so "the leaf survives" in
+these tests is real evidence the gates fired, not coincidence.
+
+This remains source/offline only -- committed, not executed natively. The
+next native attempt, whenever authorized, would be the first to actually
+capture what phase B's real JVM is doing at the moment of the hang.
 
 Per comment 51743's explicit terms ("no second native attempt under this
 grant"; "if ... the test fails, stop that action and report the exact
