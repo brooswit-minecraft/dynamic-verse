@@ -85,6 +85,9 @@ marker_timeout_seconds=120
 exit_timeout_seconds=30
 phase_b_timeout_seconds=120
 phase_b_kill_after_seconds=10
+# How long before the graceful-TERM deadline to request a (non-destructive)
+# SIGQUIT thread dump -- see its use below.
+phase_b_diag_margin_seconds=10
 
 refuse() { printf '%s\n' "refused: $*" >&2; exit 125; }
 
@@ -547,6 +550,29 @@ main() {
   phase_b_pid=$!
   phase_b_start=$(proc_start_ticks "$phase_b_pid") || true
   [[ -n "$phase_b_start" ]] || refuse "cannot capture phase B's own process start identity immediately after spawn"
+  # Best-effort, non-destructive diagnostic (round 4, native run
+  # AUTHORIZED-51743-20261106T000806Z: phase B's own JVM hung after a fully
+  # completed world save and never exited, forcing the hard timeout, with no
+  # thread dump ever captured to explain why). SIGQUIT is Java's standard
+  # "print a thread dump and keep running" signal -- but only because the
+  # JVM installs its own handler for it; `timeout` and the intermediate
+  # `bash -e -- generated_b` do NOT, so SIGQUIT's default disposition
+  # (terminate) would kill them and corrupt this phase's own monitoring if
+  # sent process-group-wide. Must target the real JVM PID exactly, the same
+  # way the Phase A kill does: `timeout`'s direct child is the generated_b
+  # bash; that bash's own child is the subshell that already exec'd into
+  # java (see find_only_child above). By the time this fires (shortly
+  # before the graceful TERM deadline), phase B has long since finished
+  # booting, so no retry loop is needed -- a failed lookup (phase B already
+  # exited, or any other shape mismatch) is skipped silently; this is pure
+  # diagnostics and must never affect the actual pass/fail outcome.
+  (
+    sleep "$((phase_b_timeout_seconds - phase_b_diag_margin_seconds))"
+    generated_b_bash_pid=$(find_only_child "$phase_b_pid" 2>/dev/null) || exit 0
+    real_jvm_pid=$(find_only_child "$generated_b_bash_pid" 2>/dev/null) || exit 0
+    kill -QUIT "$real_jvm_pid" 2>/dev/null || true
+  ) &
+  disown 2>/dev/null || true
   wait "$phase_b_pid"
   local phase_b_exit=$?
   phase_b_pid=""
