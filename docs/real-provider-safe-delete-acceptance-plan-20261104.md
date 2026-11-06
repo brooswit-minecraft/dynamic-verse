@@ -30,12 +30,15 @@ isolated test ... in a newly verified disposable directory," quoting the
 human owner's "yeah" to that exact ask. Preconditions re-verified fresh
 (not assumed) before using the grant: issue status read back as `In
 Progress` with no newer conflicting hold; no java/devlaunch process was
-running; the interrupted 14:30 root
+observed running at the time of checking; the interrupted 14:30 root
 (`run/m470-safe-delete-crash-NATIVE-20261105T143051Z`) contained only its
-claim marker -- no world, no logs, no receipts -- confirming (independently
-of comment 51672's own read-only finding) that no execution or signal
-reached a real process during the prior interruption. Both earlier
-preserved receipt sets (`...PRESERVED-20261105T0317Z-diagnosed-failure`,
+claim marker -- no world, no logs, no receipts. **Correction (per comment
+51882): this is no evidence found of execution in that root, not proof
+none occurred** -- it does not conclusively rule out a short-lived process
+or signal before the interruption, consistent with comment 51672's own
+hedged wording, which the first version of this note overstated past.
+Both earlier preserved receipt sets
+(`...PRESERVED-20261105T0317Z-diagnosed-failure`,
 `...PRESERVED-20261105T1410Z-lsof-false-positive`) were confirmed untouched
 and left in place.
 
@@ -125,22 +128,54 @@ provider; neither of this codebase's two `ServerStoppingEvent` handlers
 .serverStopping`) do anything that would explain a hang at this later
 stage, and in any case both must have already run and returned before the
 save sequence shown in the log could proceed. No thread dump was captured
-(the wrapper does not take one before its hard kill) so the exact hang site
-is not yet pinned down -- leading hypothesis, not confirmed: something in
-this project's own level-close/quarantine interception for the deleted
-target stalls during the later (post-chunk-save) stage of
-`MinecraftServer.stopServer()`, but vanilla/NeoForge's own later-stage
-shutdown or an unclosed non-daemon thread has not been ruled out.
+(the wrapper did not yet take one before its hard kill), so the exact hang
+site is **not pinned down -- this remains an open question, not a
+conclusion** (per comment 51882's explicit caution against turning the
+level-close/quarantine interception idea into one).
+
+Post-execution, read-only (no new signal, no cleanup): `ps aux` was
+checked once, after phase B's hard kill, and no java/devlaunch process was
+observed at that time -- a direct, single-point-in-time observation, not a
+guarantee against anything transient before or after it. The claimed root
+retains exactly the files the run produced (world, logs, both receipt
+properties files, the claim marker); nothing further was added or removed.
+
+**One specific candidate was checked and ruled out** (source-read only,
+not by execution): the provider's `MinecraftServerMixin` injects
+`disposeExplicitSeeds()` at `stopServer`'s `@At("TAIL")` -- exactly the
+timing that would explain a hang right after "All dimensions are saved."
+Read through to `SeedOwnershipState.dispose()`: it only mutates a couple of
+in-memory maps (`IdentityHashMap`/`ThreadLocal` housekeeping), no I/O, no
+lock waits, nothing that can block. This specific candidate is ruled out;
+the broader question of where in vanilla/NeoForge's later-stage shutdown
+(or an unclosed non-daemon thread) the hang actually sits remains open.
+
+**Proposed bounded validation for a future authorized attempt** (not yet
+approved, not executed): a non-destructive SIGQUIT thread-dump capture was
+added to the wrapper, firing shortly before phase B's graceful-TERM
+deadline, targeted at the exact real JVM PID (not the whole process group
+-- `timeout` and the intermediate generated-script bash install no SIGQUIT
+handler, so group-wide delivery would terminate them and corrupt the
+wrapper's own monitoring). Proven offline against a harmless two-level
+nested subshell/exec reproduction (`scripts/testProviderSafeDeleteCrashWrapperOffline.sh`,
+section 13): the outer launcher and intermediate bash are confirmed to
+survive a leaf-targeted SIGQUIT. This is source/offline only so far --
+committed, not executed natively. The next native attempt, whenever
+authorized, would be the first to actually capture what phase B's real
+JVM is doing at the moment of the hang.
 
 Per comment 51743's explicit terms ("no second native attempt under this
 grant"; "if ... the test fails, stop that action and report the exact
-outcome"): **not retried.** All evidence preserved under
+outcome") and comment 51882 (confirming the grant is now consumed):
+**not retried.** All evidence preserved under
 `run/m470-safe-delete-crash-AUTHORIZED-51743-20261106T000806Z/` and
-`build/moddev/providerSafeDeleteCrash-receipts/` (not committed; this
-directory is gitignored). The two real, source-level fixes made and
-validated this round (the lsof stream-separation fix and the explicit
-provider-jar selection) are committed. A follow-up native attempt to
-validate any fix for the shutdown hang needs its own fresh authorization.
+`build/moddev/providerSafeDeleteCrash-receipts.PRESERVED-20261106T0008Z-authorized-51743-phaseB-hang/`
+(not committed; gitignored, kept alongside the two earlier preserved
+attempts). The source-level fixes made and validated this round (the lsof
+stream-separation fix, the explicit provider-jar selection, and the new
+diagnostic) are committed. A follow-up native attempt to validate any fix
+for the shutdown hang -- or to simply capture the proposed thread dump --
+needs its own fresh authorization.
 
 ## Round 3, seventh incremental review (Jira comment 51622): the diagnosis was wrong, and the real root cause is now fixed -- source/offline only, no retry
 
