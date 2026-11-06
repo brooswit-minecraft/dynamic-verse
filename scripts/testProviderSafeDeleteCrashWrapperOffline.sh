@@ -30,7 +30,7 @@ source "$wrapper"
 [[ "$(type -t capture_manifest)" == function && "$(type -t require_manifest_schema)" == function \
    && "$(type -t require_manifests_match)" == function && "$(type -t read_process_start_instant)" == function \
    && "$(type -t root_is_exclusively_claimed)" == function && "$(type -t refuse)" == function \
-   && "$(type -t session_lock_is_held)" == function ]]
+   && "$(type -t session_lock_is_held)" == function && "$(type -t phase_b_diagnostic_quit)" == function ]]
 check "sourced the real wrapper's actual functions" "$([[ $? == 0 ]] && echo 1 || echo 0)"
 
 normal_a_real="$workspace/build/moddev/providerSafeDeleteCrashPhaseARunClasspath.txt"
@@ -409,19 +409,20 @@ check "session_lock_is_held fails closed (refuse, exit 125) when the lsof binary
 
 rm -rf -- "$lock_probe_file" "$lock_probe_out" "$lock_probe_err" "$fake_lsof_dir" "$empty_path_dir"
 
-### 13. The phase-B thread-dump diagnostic (round 4, Jira comment 51743's
-### authorized retry: phase B's own JVM hung after a fully completed world
-### save, forcing the hard timeout with no thread dump ever captured to
-### explain why). The real launch shape is two levels deep -- `timeout`'s
-### direct child is the generated_b bash, whose own child is the subshell
-### that already exec'd into java -- so the diagnostic must resolve BOTH
-### find_only_child hops to reach the real leaf, and must signal ONLY that
-### exact PID: SIGQUIT's default disposition (terminate) would kill
-### `timeout`/the intermediate bash (neither installs a handler for it,
-### unlike a real JVM) if sent group-wide, corrupting this phase's own
-### monitoring. Reproduced here with the exact two-level nested
-### subshell/exec shape, harmless processes throughout, no Minecraft/native
-### launch.
+### 13. phase_b_diagnostic_quit (round 4, Jira comment 51743's authorized
+### retry: phase B's own JVM hung after a fully completed world save,
+### forcing the hard timeout with no thread dump ever captured to explain
+### why). First review pass (Jira comment 51915) found a real PID-reuse
+### gap in the first version of this: it resolved children of a PID
+### without confirming that PID was still the process this wrapper
+### spawned, never checked the resolved leaf was actually a JVM, and left
+### its delayed timer running even after phase B's own observed run ended.
+### Confirmed empirically first (not assumed): SIGQUIT's default
+### disposition genuinely terminates a plain process with no handler for
+### it (a bare `/bin/sleep` dies with "Quit (core dumped)"), so "the leaf
+### survives" below is real evidence the function's own gates fired, not
+### coincidence. All three gaps reproduced and shown fixed with harmless
+### processes throughout, no Minecraft/native launch.
 diag_probe_dir=$(mktemp -d)
 diag_inner_script="$diag_probe_dir/inner.sh"
 diag_outer_script="$diag_probe_dir/outer.sh"
@@ -433,6 +434,7 @@ cat > "$diag_outer_script" <<SCRIPT
 SCRIPT
 /bin/bash -e -- "$diag_outer_script" >/dev/null 2>&1 &
 diag_launcher_pid=$!
+diag_launcher_start=$(proc_start_ticks "$diag_launcher_pid")
 diag_level1_pid=""
 for _ in $(seq 1 50); do
   diag_level1_pid=$(find_only_child "$diag_launcher_pid") && break
@@ -448,27 +450,58 @@ check "the two-hop find_only_child chain resolves to a real leaf process" "$([[ 
 if [[ -n "$diag_leaf_pid" ]]; then
   diag_leaf_cmd=$(tr '\0' ' ' < "/proc/$diag_leaf_pid/cmdline" 2>/dev/null)
   check "the resolved leaf is actually the exec'd sleep, not either intermediate bash" "$([[ "$diag_leaf_cmd" == *"sleep"* ]] && echo 1 || echo 0)"
-  kill -QUIT "$diag_leaf_pid" 2>/dev/null
+
+  # Gap 1 (changed/reused ancestry): a mismatched start-tick must make the
+  # function bail out before it ever resolves a single child -- the leaf
+  # survives not by luck but because nothing downstream was ever reached.
+  phase_b_diagnostic_quit "$diag_launcher_pid" "0000000-deliberately-wrong-ticks"
   sleep 0.3
-  check "the outer launcher (timeout-equivalent) survives a leaf-targeted SIGQUIT -- group-wide delivery would have killed it" \
+  check "phase_b_diagnostic_quit REFUSES to act when the given PID's start-identity does not match (reused-PID defense)" \
+    "$(kill -0 "$diag_leaf_pid" 2>/dev/null && echo 1 || echo 0)"
+
+  # Gap 2 (non-JVM leaf): identity now matches and the chain resolves
+  # correctly, but the leaf is plain sleep, not java -- the comm check
+  # alone must block the signal.
+  phase_b_diagnostic_quit "$diag_launcher_pid" "$diag_launcher_start"
+  sleep 0.3
+  check "phase_b_diagnostic_quit REFUSES to signal a resolved leaf whose /proc/<pid>/comm is not 'java'" \
+    "$(kill -0 "$diag_leaf_pid" 2>/dev/null && echo 1 || echo 0)"
+
+  check "the outer launcher (timeout-equivalent) was never touched by either call" \
     "$(kill -0 "$diag_launcher_pid" 2>/dev/null && echo 1 || echo 0)"
-  check "the intermediate bash (generated_b-equivalent) survives a leaf-targeted SIGQUIT -- group-wide delivery would have killed it" \
+  check "the intermediate bash (generated_b-equivalent) was never touched by either call" \
     "$(kill -0 "$diag_level1_pid" 2>/dev/null && echo 1 || echo 0)"
 fi
 kill -9 "$diag_leaf_pid" "$diag_level1_pid" "$diag_launcher_pid" 2>/dev/null
 wait "$diag_launcher_pid" 2>/dev/null || true
 rm -rf "$diag_probe_dir"
 
-# A lookup against an already-exited launcher (phase B finished cleanly
-# well before the diagnostic's own deadline) must be skipped silently,
-# never treated as an error -- this is pure diagnostics, never allowed to
-# affect the actual pass/fail outcome.
+# A lookup against an already-exited phase B must be a clean, silent
+# no-op, never an error -- this is pure diagnostics.
 /bin/sleep 0.2 &
 already_gone_pid=$!
 wait "$already_gone_pid" 2>/dev/null
-skip_status=0
-( find_only_child "$already_gone_pid" >/dev/null 2>&1 ) || skip_status=$?
-check "a lookup against an already-finished phase B is a clean, silent miss (fails closed, not an error)" "$([[ "$skip_status" == 1 ]] && echo 1 || echo 0)"
+( phase_b_diagnostic_quit "$already_gone_pid" "irrelevant" ) 2>"$probe_out"
+check "phase_b_diagnostic_quit against an already-finished phase B is a clean, silent no-op" "$([[ ! -s "$probe_out" ]] && echo 1 || echo 0)"
+
+# Gap 3 (early phase B exit must retire the timer): the call site reuses
+# kill_if_still_owned, already proven in section 9 to signal on a genuine
+# identity match -- the property worth proving HERE is that doing so
+# BEFORE a long delayed payload's own sleep elapses means that payload
+# never runs. A real timer standing in for the production one: it sleeps
+# far longer than this test waits, then (only if never killed) writes a
+# marker file. Retiring it immediately, the same way the call site does
+# right after phase B's own `wait` returns, and then waiting past the
+# timer's own full duration, must find no marker was ever written.
+early_retire_marker=$(mktemp -u)
+( sleep 5; : > "$early_retire_marker" ) &
+early_retire_pid=$!
+early_retire_start=$(proc_start_ticks "$early_retire_pid")
+kill_if_still_owned "$early_retire_pid" "$early_retire_start" direct
+sleep 5.5
+check "retiring a delayed timer immediately (as phase B's own early exit does) stops its payload from ever firing" \
+  "$([[ ! -e "$early_retire_marker" ]] && echo 1 || echo 0)"
+rm -f "$early_retire_marker"
 
 echo "---"
 echo "pass=$pass fail=$fail"

@@ -213,6 +213,12 @@ cleanup() {
   fi
   kill_if_still_owned "$phase_a_launcher_pid" "$phase_a_launcher_start" direct
   kill_if_still_owned "$phase_b_pid" "$phase_b_start" group
+  # The phase-B diagnostic timer (see its own comment below) must never
+  # outlive this script even on an abnormal exit (e.g. this wrapper itself
+  # interrupted while blocked in `wait "$phase_b_pid"`, before its own
+  # inline retirement below ever runs) -- otherwise a PID reused by the
+  # time its delayed sleep elapses could signal an unrelated process.
+  kill_if_still_owned "$phase_b_diag_pid" "$phase_b_diag_start" direct
 }
 
 # A trapped INT/TERM handler that returns without exiting lets bash resume
@@ -371,6 +377,46 @@ session_lock_is_held() {
   [[ -s "$out_log" ]] && echo 1 || echo 0
 }
 
+# Best-effort, non-destructive diagnostic (round 4, native run
+# AUTHORIZED-51743-20261106T000806Z: phase B's own JVM hung after a fully
+# completed world save and never exited, forcing the hard timeout, with no
+# thread dump ever captured to explain why). SIGQUIT is Java's standard
+# "print a thread dump and keep running" signal -- but only because the JVM
+# installs its own handler for it; `timeout` and the intermediate
+# `bash -e -- generated_b` do NOT, so SIGQUIT's default disposition
+# (terminate) would kill them and corrupt phase B's own monitoring if sent
+# process-group-wide. Must target the real JVM PID exactly, the same way
+# the Phase A kill does: `timeout`'s direct child is the generated_b bash;
+# that bash's own child is the subshell that already exec'd into java.
+#
+# First review pass (Jira comment 51915) found a real PID-reuse gap in an
+# earlier version of this: it resolved children of a PID without first
+# confirming that PID was still the same process this wrapper spawned,
+# never checked the resolved leaf was actually a JVM, and (at the call
+# site) left the delayed timer running even after phase B's own observed
+# run ended -- a reused PID number could, by the time a delayed signal
+# fires, produce an entirely unrelated child chain. Fixed: re-verify the
+# given PID's start-ticks against the start-ticks captured at spawn before
+# resolving anything; require the resolved leaf's own `/proc/<pid>/comm` to
+# positively read `java` before it is signaled; and (at the call site, not
+# here) explicitly retire this function's own background timer immediately
+# after phase B's own `wait` returns, so no delayed signal can ever fire
+# once that run has ended. Every check here fails closed (silent no-op,
+# never a signal) and none of it can affect the actual pass/fail outcome --
+# this is pure diagnostics. Factored into its own function (rather than an
+# inline subshell) so it can be unit-tested the same way every other
+# identity check in this wrapper already is.
+phase_b_diagnostic_quit() {
+  local given_pid=$1 given_start=$2 current_start generated_b_bash_pid real_jvm_pid real_jvm_comm
+  current_start=$(proc_start_ticks "$given_pid" 2>/dev/null) || return 0
+  [[ "$current_start" == "$given_start" ]] || return 0
+  generated_b_bash_pid=$(find_only_child "$given_pid" 2>/dev/null) || return 0
+  real_jvm_pid=$(find_only_child "$generated_b_bash_pid" 2>/dev/null) || return 0
+  real_jvm_comm=$(cat "/proc/$real_jvm_pid/comm" 2>/dev/null) || return 0
+  [[ "$real_jvm_comm" == "java" ]] || return 0
+  kill -QUIT "$real_jvm_pid" 2>/dev/null || true
+}
+
 main() {
   [[ -n "$root" ]] || refuse "DYNAMICVERSE_SAFE_DELETE_CRASH_EXECUTION_ROOT must be set explicitly to a root already exclusively claimed via scripts/claimSafeDeleteCrashExecutionRoot.sh -- never the stable preparation root ModDev's prepare*Run tasks create as a side effect of regenerating these launch scripts. Claim a fresh root, regenerate createProviderSafeDeleteCrashPhase{A,B}LaunchScript with -PsafeDeleteCrashGameDirectory set to that SAME path, then set this variable to it."
   server_properties="$root/server.properties"
@@ -390,6 +436,8 @@ main() {
   phase_a_start=""
   phase_b_pid=""
   phase_b_start=""
+  phase_b_diag_pid=""
+  phase_b_diag_start=""
   trap cleanup EXIT
   trap 'on_terminating_signal INT' INT
   trap 'on_terminating_signal TERM' TERM
@@ -550,33 +598,24 @@ main() {
   phase_b_pid=$!
   phase_b_start=$(proc_start_ticks "$phase_b_pid") || true
   [[ -n "$phase_b_start" ]] || refuse "cannot capture phase B's own process start identity immediately after spawn"
-  # Best-effort, non-destructive diagnostic (round 4, native run
-  # AUTHORIZED-51743-20261106T000806Z: phase B's own JVM hung after a fully
-  # completed world save and never exited, forcing the hard timeout, with no
-  # thread dump ever captured to explain why). SIGQUIT is Java's standard
-  # "print a thread dump and keep running" signal -- but only because the
-  # JVM installs its own handler for it; `timeout` and the intermediate
-  # `bash -e -- generated_b` do NOT, so SIGQUIT's default disposition
-  # (terminate) would kill them and corrupt this phase's own monitoring if
-  # sent process-group-wide. Must target the real JVM PID exactly, the same
-  # way the Phase A kill does: `timeout`'s direct child is the generated_b
-  # bash; that bash's own child is the subshell that already exec'd into
-  # java (see find_only_child above). By the time this fires (shortly
-  # before the graceful TERM deadline), phase B has long since finished
-  # booting, so no retry loop is needed -- a failed lookup (phase B already
-  # exited, or any other shape mismatch) is skipped silently; this is pure
-  # diagnostics and must never affect the actual pass/fail outcome.
-  (
-    sleep "$((phase_b_timeout_seconds - phase_b_diag_margin_seconds))"
-    generated_b_bash_pid=$(find_only_child "$phase_b_pid" 2>/dev/null) || exit 0
-    real_jvm_pid=$(find_only_child "$generated_b_bash_pid" 2>/dev/null) || exit 0
-    kill -QUIT "$real_jvm_pid" 2>/dev/null || true
-  ) &
+  # Fires once, shortly before phase B's graceful-TERM deadline -- see
+  # phase_b_diagnostic_quit's own comment above for what it checks and why.
+  ( sleep "$((phase_b_timeout_seconds - phase_b_diag_margin_seconds))"; phase_b_diagnostic_quit "$phase_b_pid" "$phase_b_start" ) &
+  phase_b_diag_pid=$!
+  phase_b_diag_start=$(proc_start_ticks "$phase_b_diag_pid") || true
   disown 2>/dev/null || true
   wait "$phase_b_pid"
   local phase_b_exit=$?
   phase_b_pid=""
   phase_b_start=""
+  # Retire the diagnostic timer right now, whether phase B exited cleanly,
+  # was forced, or anything else -- it must never outlive this observed
+  # run, regardless of how much of its own sleep is still left. Reuses the
+  # same identity-gated kill every other owned PID in this script relies
+  # on (never an unconditional kill by raw PID number).
+  kill_if_still_owned "$phase_b_diag_pid" "$phase_b_diag_start" direct
+  phase_b_diag_pid=""
+  phase_b_diag_start=""
   set -e
   printf '%s\n' "$phase_b_exit" > "$receipts/phase-b.exit"
   # A forced/timed-out phase B (TERM=124, or the hard KILL fallback, commonly
