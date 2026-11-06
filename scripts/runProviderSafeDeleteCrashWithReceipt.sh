@@ -394,26 +394,72 @@ session_lock_is_held() {
 # confirming that PID was still the same process this wrapper spawned,
 # never checked the resolved leaf was actually a JVM, and (at the call
 # site) left the delayed timer running even after phase B's own observed
-# run ended -- a reused PID number could, by the time a delayed signal
-# fires, produce an entirely unrelated child chain. Fixed: re-verify the
-# given PID's start-ticks against the start-ticks captured at spawn before
-# resolving anything; require the resolved leaf's own `/proc/<pid>/comm` to
-# positively read `java` before it is signaled; and (at the call site, not
-# here) explicitly retire this function's own background timer immediately
-# after phase B's own `wait` returns, so no delayed signal can ever fire
-# once that run has ended. Every check here fails closed (silent no-op,
-# never a signal) and none of it can affect the actual pass/fail outcome --
-# this is pure diagnostics. Factored into its own function (rather than an
-# inline subshell) so it can be unit-tested the same way every other
-# identity check in this wrapper already is.
+# run ended. Second review pass (Jira comment 51932) found the first fix
+# still incomplete: it never captured/rechecked the generated-bash hop's
+# own start identity, never revalidated the parent chain after the two
+# find_only_child scans (checking `given_pid` once, before both scans,
+# does not establish the later signal still targets this run's same
+# chain), and identified the leaf only by `comm == java`, not the expected
+# run root -- any java process happening to sit two hops below a matching
+# ancestor would have passed.
+#
+# Fixed, source-only, no execution (per 51932's explicit scope -- every
+# claim below is reasoned from documented behavior already relied on
+# elsewhere in this wrapper, not freshly verified by running anything):
+# `given_pid`'s start-ticks are re-checked both before AND after the two
+# scans; the generated-bash hop's own start-ticks are captured right after
+# it is resolved and re-checked afterward too; the leaf's own ppid (field
+# 4 of its /proc/<pid>/stat, the same field find_only_child itself reads)
+# is re-confirmed to still be the generated-bash hop, not merely trusted
+# from the scan that found it. The leaf is also bound to the exact
+# expected run root: its `cwd` must still be this run's own claimed root,
+# which is preserved across exec (not reset by it) -- the same documented
+# exec() behavior the `(cd '$root'; exec ...)` launch idiom this wrapper
+# already uses everywhere else depends on to work at all.
+#
+# Deliberately NOT checked: the leaf's own resolved binary via
+# `/proc/<pid>/exe` against the literal `/tmp/temurin21/bin/java` path
+# `crash_require_generated` requires the generated script to exec. That
+# comparison is only correct if this exact path is never itself a further
+# symlink `readlink -f` would resolve past -- unverified without running
+# something, which this fix is explicitly scoped not to do; getting it
+# wrong would silently break this diagnostic on every future run, a worse
+# failure mode than the narrower binding below. `comm` plus the ancestry
+# and cwd/root checks are the binding this fix adds with confidence.
+#
+# Every check fails closed (silent no-op, never a signal) and none of it
+# can affect the actual pass/fail outcome -- this is pure diagnostics.
+# Factored into its own function (rather than an inline subshell) so it
+# can be unit-tested the same way every other identity check in this
+# wrapper already is.
 phase_b_diagnostic_quit() {
-  local given_pid=$1 given_start=$2 current_start generated_b_bash_pid real_jvm_pid real_jvm_comm
+  local given_pid=$1 given_start=$2
+  local current_start generated_b_bash_pid generated_b_bash_start current_generated_b_bash_start
+  local real_jvm_pid real_jvm_ppid real_jvm_comm real_jvm_cwd root_canonical
+
   current_start=$(proc_start_ticks "$given_pid" 2>/dev/null) || return 0
   [[ "$current_start" == "$given_start" ]] || return 0
+
   generated_b_bash_pid=$(find_only_child "$given_pid" 2>/dev/null) || return 0
+  generated_b_bash_start=$(proc_start_ticks "$generated_b_bash_pid" 2>/dev/null) || return 0
+
   real_jvm_pid=$(find_only_child "$generated_b_bash_pid" 2>/dev/null) || return 0
+
+  # Revalidate the whole chain AFTER both scans above, not only each
+  # scan's own point-in-time result.
+  current_start=$(proc_start_ticks "$given_pid" 2>/dev/null) || return 0
+  [[ "$current_start" == "$given_start" ]] || return 0
+  current_generated_b_bash_start=$(proc_start_ticks "$generated_b_bash_pid" 2>/dev/null) || return 0
+  [[ "$current_generated_b_bash_start" == "$generated_b_bash_start" ]] || return 0
+  real_jvm_ppid=$(awk '{print $4}' "/proc/$real_jvm_pid/stat" 2>/dev/null) || return 0
+  [[ "$real_jvm_ppid" == "$generated_b_bash_pid" ]] || return 0
+
   real_jvm_comm=$(cat "/proc/$real_jvm_pid/comm" 2>/dev/null) || return 0
   [[ "$real_jvm_comm" == "java" ]] || return 0
+  real_jvm_cwd=$(readlink -f "/proc/$real_jvm_pid/cwd" 2>/dev/null) || return 0
+  root_canonical=$(readlink -f "$root" 2>/dev/null) || return 0
+  [[ "$real_jvm_cwd" == "$root_canonical" ]] || return 0
+
   kill -QUIT "$real_jvm_pid" 2>/dev/null || true
 }
 
