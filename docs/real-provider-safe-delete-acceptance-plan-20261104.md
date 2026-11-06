@@ -1,0 +1,1262 @@
+# Real-provider safe-delete acceptance: fixture/runner (two-JVM crash fixture's third attempt, authorized by Jira comment 51743, reached and killed the real Phase A process, and Phase B's in-process recovery assertions all passed -- but Phase B's own JVM hung after saving all worlds and never exited cleanly; reported, NOT retried -- see below)
+
+Per MINECRAFT-470 review: `runtimeConfirmedDeleteRemovesOnlyItsOwnMetadataAndInterruptedDeleteStaysQuarantinedAfterRestart`
+is useful production-wiring evidence, but its state store is
+`InMemoryManagedVerseStateStore`, its `DeleteGateway` port is a controlled fake,
+and reconstruction happens in the same process. Per the follow-up technical
+plan review (https://github.com/brooswit-minecraft/dynamic-verse/pull/3,
+"latest technical plan review" comment), this document was updated from a
+plan into the actual narrow source/runner it specifies, for review **before
+any native execution**. Native authorizations exercised so far, each
+exactly once: Jira comment 51612 authorized one invocation of the
+in-process scenarios fixture (`providerSafeDeleteScenariosGameTest`,
+passed -- see its own section below); Jira comment 51617 authorized one
+two-JVM crash/recovery A/B pair, which never reached the principal
+verified-kill step or Phase B at all -- the wrapper's own PID-identity
+guard correctly refused to touch the real server (see the section below,
+and its 51622 correction: the wrapper's own cleanup trap did issue a real
+SIGKILL to its own recorded launcher PID, which is different from "no kill
+attempted anywhere"); Jira comment 51743 (quoting the human owner's
+explicit "yeah" to one corrected isolated test) authorized exactly one more
+two-JVM crash/recovery A/B pair, executed 2026-11-05/06 at head `e313a11`
+-- see "Round 4" below for the full result. No further invocation of either
+fixture, and no further deliberate crash signal against the actual server,
+has occurred or is authorized beyond what is documented in these sections.
+
+## Round 4 (Jira comment 51743): the authorized retry -- Phase A kill correct, Phase B's recovery checks all passed, but Phase B's own JVM hung on shutdown
+
+Authorized by comment 51743, which explicitly cleared "one corrected
+isolated test ... in a newly verified disposable directory," quoting the
+human owner's "yeah" to that exact ask. Preconditions re-verified fresh
+(not assumed) before using the grant: issue status read back as `In
+Progress` with no newer conflicting hold; no java/devlaunch process was
+observed running at the time of checking; the interrupted 14:30 root
+(`run/m470-safe-delete-crash-NATIVE-20261105T143051Z`) contained only its
+claim marker -- no world, no logs, no receipts. **Correction (per comment
+51882): this is no evidence found of execution in that root, not proof
+none occurred** -- it does not conclusively rule out a short-lived process
+or signal before the interruption, consistent with comment 51672's own
+hedged wording, which the first version of this note overstated past.
+Both earlier preserved receipt sets
+(`...PRESERVED-20261105T0317Z-diagnosed-failure`,
+`...PRESERVED-20261105T1410Z-lsof-false-positive`) were confirmed untouched
+and left in place.
+
+**A real wrapper bug found and fixed before using the grant (source/offline
+only):** the very first use of the grant's fresh root refused with `a
+process still holds the world session.lock after phase A's forced exit`.
+`lsof`'s own stderr in this sandbox carries an unconditional, unrelated
+warning (`can't stat() fuse.gvfsd-fuse file system /run/user/1001/gvfs`)
+-- present whether or not the target file is actually held, reproduced
+directly against both a genuinely-held and a genuinely-free file. The
+check merged stdout and stderr into one stream and gated on its
+non-emptiness, so it refused every run in this sandbox regardless of
+truth. Fixed by separating the two streams, gating only on stdout (the
+real evidence), and still failing closed on any `lsof` exit other than
+0/1 (preserving the original "lsof unavailable -> refuse" intent). Factored
+into its own `session_lock_is_held()` function (previously inline) so it
+could be unit-tested the same way every other identity check in this
+wrapper already is; `scripts/testProviderSafeDeleteCrashWrapperOffline.sh`
+gained four new cases reproducing the exact false positive against real
+harmless processes (held / free / stderr-only-warning / missing-binary),
+37/37 passing.
+
+**A second near-miss, caught before it could burn the one authorized
+attempt:** regenerating the launch scripts against the fresh root
+initially resolved the provider dependency to a *different* jar
+(`acceptedDynamicDimensionsJar`'s build.gradle default,
+`/tmp/dynamicdimensions-composite/...4b09389e...candidate-51101.jar`,
+hash `50b7b75a...`) than the hook-bearing corrected provider this wrapper's
+own hardcoded expectation requires (hash `4c4d70a9...`, carrying
+`TestOnlySaveFailureHook`). The wrapper's own `-PacceptedDynamicDimensionsJar`
+hash check (added in an earlier round specifically to catch this class of
+drift) refused the run outright rather than silently using the wrong
+provider -- confirmed this is NOT a side-channel/tampering: that composite
+build is an entirely separate, currently-dirty working tree (unrelated
+`ExplicitSeedDimensionRegistry`/seed-ownership commits) that `build.gradle`
+has defaulted to since commit `560c5cb`, predating this fixture's work
+entirely. Re-ran with `-PacceptedDynamicDimensionsJar`/
+`-PreviewedDynamicDimensionsClasses` explicitly pointed at the hook-bearing
+jar (re-verified present, hash-matched, and carrying the expected
+`MinecraftServerMixin.quiesceAndCloseTerminalResults` field and
+`TestOnlySaveFailureHook` classes immediately before use); `compileJava
+compileTestJava test` green against it.
+
+**The one authorized execution** (root
+`run/m470-safe-delete-crash-AUTHORIZED-51743-20261106T000806Z`):
+- Phase A: launcher PID correctly distinguished from the real spawned child
+  (PID 3347855); start-identity re-verified immediately before signaling;
+  SIGKILL delivered to exactly that PID; process confirmed exited; the
+  session.lock check (now fixed) correctly reported free, not a false
+  positive. `dynamicverse-crash-delete-phase-a-marker.properties` confirms
+  `durablePendingVerified=true` for operation `5ee485cd-...`.
+- Phase B: booted cleanly, found the interrupted operation, and ran its
+  full in-process recovery check. **Every assertion the fixture requires
+  passed**, per `dynamicverse-crash-delete-phase-b-result.properties`:
+  `targetQuarantined`, `targetRejectionCompleted`, `targetNeverReloaded`,
+  `targetOperationInterruptedPostRecovery`, `unrelatedLeaseAcquired`,
+  `unrelatedSentinelIntact`, `targetStorageIntact`, `targetContentIntact`
+  all `true`; the managed-state store independently confirms the same
+  operation id transitioned to `FAILED`/`ERR_OPERATION_INTERRUPTED`, not
+  silently dropped or re-admitted. This is the actual property under test
+  (an interrupted delete recovers safely), and it held.
+- Immediately after writing that result, the fixture calls
+  `server.halt(false)` as designed. The log shows a completely normal
+  shutdown sequence start -- `Stopping server`, `Saving players`, `Saving
+  worlds`, `Saving chunks` for every level including the unrelated
+  `dynamicverse:crash_unrelated` (notably NOT the quarantined target,
+  consistent with `targetNeverReloaded`), `ThreadedAnvilChunkStorage: All
+  dimensions are saved` -- and then **nothing further is ever logged**.
+  The wrapper's hard bound (`timeout --kill-after=10s 120s`) eventually
+  fired, `phase-b.exit` = `124`, and the wrapper correctly refused: `phase B
+  did not exit cleanly (exit 124, ...)`.
+
+**Net result: FAILED, by the wrapper's own all-or-nothing contract** (any
+non-zero Phase B exit is always a failure here, regardless of what the
+in-process checks found) -- even though the actual property under test
+(crash/recovery correctness) passed every check the fixture makes. This is
+a *different* defect than anything found in rounds 1-3: not the
+PID-identity/kill logic (validated correct this round), not the
+session.lock check (fixed and validated this round), and not the
+recovery logic itself (passed). It is Phase B's own JVM failing to
+terminate after `server.halt(false)` and a fully-completed world save --
+grep of the full log/debug log for `stop|halt|shutdown|saving|thread`
+shows nothing past `ThreadedAnvilChunkStorage: All dimensions are saved`;
+no `ServerStoppedEvent` listener exists anywhere in this codebase or the
+provider; neither of this codebase's two `ServerStoppingEvent` handlers
+(`DynamicVerse.serverStopping`, `MinecraftProviderDuplicationPort$EventOwner
+.serverStopping`) do anything that would explain a hang at this later
+stage, and in any case both must have already run and returned before the
+save sequence shown in the log could proceed. No thread dump was captured
+(the wrapper did not yet take one before its hard kill), so the exact hang
+site is **not pinned down -- this remains an open question, not a
+conclusion** (per comment 51882's explicit caution against turning the
+level-close/quarantine interception idea into one).
+
+Post-execution, read-only (no new signal, no cleanup): `ps aux` was
+checked once, after phase B's hard kill, and no java/devlaunch process was
+observed at that time -- a direct, single-point-in-time observation, not a
+guarantee against anything transient before or after it. The claimed root
+retains exactly the files the run produced (world, logs, both receipt
+properties files, the claim marker); nothing further was added or removed.
+
+**One specific candidate was checked and ruled out** (source-read only,
+not by execution): the provider's `MinecraftServerMixin` injects
+`disposeExplicitSeeds()` at `stopServer`'s `@At("TAIL")` -- exactly the
+timing that would explain a hang right after "All dimensions are saved."
+Read through to `SeedOwnershipState.dispose()`: it only mutates a couple of
+in-memory maps (`IdentityHashMap`/`ThreadLocal` housekeeping), no I/O, no
+lock waits, nothing that can block. This specific candidate is ruled out;
+the broader question of where in vanilla/NeoForge's later-stage shutdown
+(or an unclosed non-daemon thread) the hang actually sits remains open.
+
+**Proposed bounded validation for a future authorized attempt** (not yet
+approved, not executed): a non-destructive SIGQUIT thread-dump capture was
+added to the wrapper, firing once shortly before phase B's graceful-TERM
+deadline, targeted at the exact real JVM PID (not the whole process group
+-- `timeout` and the intermediate generated-script bash install no SIGQUIT
+handler, so group-wide delivery would terminate them and corrupt the
+wrapper's own monitoring).
+
+**Review correction (Jira comment 51915):** the first version of this had
+a real PID-reuse gap -- it resolved children of `phase_b_pid` without
+first confirming `phase_b_pid` itself was still the process this wrapper
+spawned, never checked the resolved leaf was actually a JVM, and left its
+delayed timer running even after phase B's own observed run ended; a
+reused PID by the time the timer fired could have produced an entirely
+unrelated child chain and been signaled. Fixed by factoring the logic into
+its own `phase_b_diagnostic_quit()` (current head `8b30a1f`): it
+re-verifies the given PID's start-ticks against the start-ticks captured
+at spawn before resolving anything, requires the resolved leaf's
+`/proc/<pid>/comm` to positively read `java` before signaling, and the
+call site explicitly retires the timer (reusing the existing
+`kill_if_still_owned`) immediately after phase B's own `wait` returns --
+in `cleanup()` too, for an abnormal exit. Three new offline cases
+(`scripts/testProviderSafeDeleteCrashWrapperOffline.sh`, section 13, 45/45
+passing) reproduce each gap directly: a mismatched start-tick, a non-JVM
+leaf, and an early-retired long-sleeping stand-in timer whose payload
+never fires. SIGQUIT's actual effect on a plain process (terminates with
+core dump) was confirmed empirically first, so "the leaf survives" in
+these tests is real evidence the gates fired, not coincidence.
+
+This remains source/offline only -- committed, not executed natively. The
+next native attempt, whenever authorized, would be the first to actually
+capture what phase B's real JVM is doing at the moment of the hang.
+
+Per comment 51743's explicit terms ("no second native attempt under this
+grant"; "if ... the test fails, stop that action and report the exact
+outcome") and comment 51882 (confirming the grant is now consumed):
+**not retried.** All evidence preserved under
+`run/m470-safe-delete-crash-AUTHORIZED-51743-20261106T000806Z/` and
+`build/moddev/providerSafeDeleteCrash-receipts.PRESERVED-20261106T0008Z-authorized-51743-phaseB-hang/`
+(not committed; gitignored, kept alongside the two earlier preserved
+attempts). The source-level fixes made and validated this round (the lsof
+stream-separation fix, the explicit provider-jar selection, and the new
+diagnostic) are committed. A follow-up native attempt to validate any fix
+for the shutdown hang -- or to simply capture the proposed thread dump --
+needs its own fresh authorization.
+
+## Round 3, seventh incremental review (Jira comment 51622): the diagnosis was wrong, and the real root cause is now fixed -- source/offline only, no retry
+
+Reviewed against the `9d49ece` diagnosis. Two concrete corrections, both
+independently re-verified (not taken on the reviewer's word alone) before
+fixing anything:
+
+- **"No SIGKILL was ever issued" was wrong.** Traced the actual EXIT path:
+  `refuse()` calls `exit 125`; `trap cleanup EXIT` runs; `cleanup()` calls
+  `kill_if_still_owned` for the recorded Phase-A PID. At the moment of the
+  mismatch refusal, that PID's start-ticks still matched (no time had
+  elapsed for recycling), so `kill_if_still_owned` almost certainly *did*
+  issue `kill -9` -- just against the wrapper's own recorded launcher PID
+  (`3939094`), never against the real server (`3939097`), which the
+  identity guard correctly left untouched. This is retained, not reported
+  as a fabricated signal history: no log line records the kill itself
+  (`kill_if_still_owned` has no echo), so what is stated here is the most
+  likely reconstruction consistent with the retained evidence (the
+  launcher's absence shortly after, the function's own code, and the
+  tight synchronous timing), not an independently-logged confirmation.
+- **The root cause ("`net.neoforged.devlaunch.Main` forks and exits") was
+  an unverified leap, now retracted.** An independent, harmless
+  reproduction -- the exact `(cd 'root'; exec 'executable' ...)` shape,
+  substituting `/usr/bin/python3` for `java`, no NeoForge, no signals --
+  showed the wrapper-spawned PID and the exec'd PID are *always* distinct
+  under this shape (bash forks a subshell to run the parenthesized
+  compound command; `exec` replaces the SUBSHELL, not the outer spawned
+  bash), **and** that the wrapper-spawned PID stays alive throughout as
+  the exec'd process's direct parent -- no devlaunch-specific forking
+  needed to explain the PID mismatch itself. A second reproduction then
+  confirmed the real explanation for the observed reparenting to `systemd
+  --user`: killing *only* the wrapper-spawned launcher PID while its
+  exec-chain descendant is still running reparents that descendant to
+  init immediately -- exactly matching what was observed. The reparenting
+  was therefore very likely a consequence of `cleanup()`'s own (correct,
+  already-reviewed) launcher kill, not evidence of any NeoForge-specific
+  process model.
+
+**The fix** (`runProviderSafeDeleteCrashWithReceipt.sh`, source/offline
+only -- no native run): a new `find_only_child(parent_pid)` scans
+`/proc/*/stat` for the one process whose own ppid (field 4, the same
+positional-field convention `proc_start_ticks` already relies on) is the
+given parent, failing closed (refusing) if zero or more than one match is
+found -- it never falls back to trusting `$!`, and never loosens PID
+equality to accept any self-reported process. Phase A's launch now:
+spawns the generated script exactly as before (`phase_a_launcher_pid`);
+polls `find_only_child` to establish the real owned child
+(`phase_a_pid`) from the ACTUAL parent/child relationship, not an
+assumption; captures that child's own start-identity; and runs every
+existing check (marker PID/nonce/root, start-identity re-verification
+immediately before signaling, the frozen-manifest comparison, the
+session-lock check, Phase B's timeout/process-group handling) completely
+unchanged, now correctly pointed at the real process. `cleanup()` prefers
+killing the established real child (no orphan risk -- confirmed it has no
+further children of its own in this launch shape) and separately reaches
+the launcher too, so this script's own `wait()` reaps it directly rather
+than leaving it for `init` to reap indirectly.
+
+**A second, independent bug was found and fixed while building the
+offline tests for this correction** (not reported by 51622, discovered by
+actually exercising the fix with real harmless processes): the preexisting
+`kill_if_still_owned`'s trailing `wait "$pid"` ran *unconditionally*, even
+on an identity mismatch where nothing was killed. A same-shell
+reproduction showed this blocks for as long as that deliberately-untouched
+process takes to exit on its own -- potentially indefinitely for a
+genuinely long-running mismatch target, exactly the "cleanup trap hangs
+on the thing it correctly decided not to touch" failure this review has
+been hardening against throughout. Fixed by moving the `wait` inside the
+matched/killed branch only; a mismatch now returns immediately, touching
+nothing.
+
+**Offline tests retained** (`testProviderSafeDeleteCrashWrapperOffline.sh`,
+extended to 33/33, all against real harmless processes, no
+Minecraft/server/native launch): `find_only_child` against the real
+generated parent/subshell shape (a harmless `sleep` substitute) --
+discovers the correct child, confirms it differs from `$!`, confirms it
+is actually running the exec'd executable, confirms killing it directly
+lets the launcher exit on its own, and confirms the function fails closed
+when more than one child exists; `kill_if_still_owned` proven directly
+against real processes -- signals on a genuine start-identity match,
+provably does NOT signal (and does not hang) on a mismatch;
+`proc_start_ticks` reflects a real running process and goes empty once it
+is gone; and the real marker-parsing idiom applied to a constructed fake
+marker, proving a mismatched self-reported PID compares unequal to a real
+discovered PID.
+
+Re-verified without executing anything natively: `compileJava`/
+`compileTestJava`/`test` 93/0/0/0 (unaffected -- wrapper-script-only
+change); `bash -n`; the existing contract/manifest preflight re-run
+against the regenerated stable-preparation-root launch scripts, unchanged
+results; the extended offline harness, 33/33. No GameTest or native
+server launch of any kind has occurred in this round. Per the
+authorization: source/offline preparation only, no retry, no new A/B
+pair, no server signal -- stopped after returning this correction for
+review.
+
+## Native execution attempt: the two-JVM crash fixture (2026-11-05, head `597b841`) -- refused by its own safety guard; root cause diagnosed, NOT fixed or retried
+
+Authorized by Jira comment 51617 as one bounded A/B pair, using the
+already-reviewed `runProviderSafeDeleteCrashWithReceipt.sh` and
+`ProviderSafeDeleteCrashFixture.java` UNCHANGED. Preconditions verified
+exactly as for the prior native run (source head `597b84180bd32de8f095741fcdfee388452409c5`,
+clean tree; neither file touched since its last review, confirmed via
+`git log`/`git diff`; fresh `compileJava compileTestJava test` 93/0/0/0;
+provider jar independently `sha256sum`'d, matching
+`4c4d70a90...` exactly; a NEW root exclusively claimed,
+`run/m470-safe-delete-crash-NATIVE-20261105T0317Z`, every existing root
+and the prior native run's receipts preserved untouched; both Phase A and
+B launch scripts regenerated against that claimed root with matching
+`expectedGameRoot`; the full offline preflight -- `root_is_exclusively_claimed`,
+`verify_phase_sanity` A and B, `capture_manifest`/`require_manifest_schema`
+for both, `require_manifests_match` -- run and passed against the real
+generated files before launch).
+
+**Result: the wrapper's own PID-identity safety guard refused, before any
+kill was attempted and before Phase B was ever launched.** Exit 125:
+
+```
+spawned phase A as PID 3939094 (start ticks 92125597); waiting up to 120s for its marker
+refused: marker PID 3939097 does not match the exact JVM this wrapper spawned (3939094) -- refusing to kill anything
+```
+
+**Root cause, confirmed by inspecting the actual process tree (not
+assumed):** the wrapper spawns `/bin/bash -e -- "$generated_a" &` and
+assumes that spawned PID becomes the long-running server PID via a
+transparent `exec` chain. The generated script's content is
+`(cd '...'; exec '/tmp/temurin21/bin/java' ... net.neoforged.devlaunch.Main ...)`.
+`net.neoforged.devlaunch.Main` -- NeoForge/ModDev's own dev-launch
+bootstrap, not something this review ever controlled -- does not
+exec-replace into the real server process: `ps` showed the actual running
+server JVM's (PID 3939097) parent was PID 987 (`systemd --user`), not
+3939094, meaning the chain of intermediate processes between the
+wrapper's spawned bash and the real server had already exited by the
+time it was checked, orphaning the real server to the nearest reaper.
+This breaks the wrapper's single-PID-tracks-the-whole-lifecycle
+assumption -- an assumption many rounds of source review reasoned about
+correctly everywhere else, but one that could only actually be falsified
+by attempting a real launch, not by reading source.
+
+**Everything else about Phase A's own logic is confirmed correct from the
+retained evidence**, independent of the wrapper's PID bug: the marker
+(`durablePendingVerified=true`, correct `gameRoot`, correct `nonce`
+matching the claim, `operationId=de23f275-ea85-4ef7-b411-1e3554a4fb5b`,
+`targetKey=dynamicverse:crash_delete_target`, a real `targetRegionHash`)
+and the durable state file
+(`world/data/dynamicverse-managed-state.properties`) agree exactly:
+`operation.de23f275-...=DELETE|...|PENDING|...` for the target, with both
+`crash_delete_target` (generation 2) and `crash_unrelated` (generation 1)
+READY -- proving the admission, the durable PENDING journal write, and
+the deliberate block-forever barrier all worked precisely as designed,
+entirely independent of the external wrapper's PID-tracking defect.
+
+**The orphaned real server JVM (PID 3939097) was left untouched by the
+wrapper** (correctly refusing, per its own safety design) **and was not
+touched by any action of mine.** It later self-terminated on its own,
+~50 seconds after the marker was published, via Minecraft's own built-in
+`ServerHangWatchdog` -- confirmed by the retained crash report
+(`crash-reports/crash-2026-11-04_19.18.06-server.txt`): `"ServerHangWatchdog
+detected that a single server tick took ... (should be max 0.05)"`,
+with the watchdog's own thread dump showing the "Server thread" blocked
+exactly where expected, inside `ProviderSafeDeleteCrashFixture.phaseA`'s
+deliberate `Thread.sleep`. This is a standard vanilla safety mechanism,
+unrelated to and not triggered by this wrapper or this review's own code.
+
+Phase B was never launched. No SIGKILL was ever issued by the wrapper. No
+process was signaled by name or by any means outside the wrapper's own
+reviewed, refused-before-acting path. Every existing root, the prior
+native scenarios run's receipts, and this attempt's own root (marker,
+logs, crash report, durable state, world data) are all retained exactly
+as left -- nothing was deleted or cleaned up.
+
+Per the authorization: this is diagnostic evidence, not permission to
+retry, work around, or broaden the run. No fix has been applied to the
+wrapper or the fixture. Stopped and reported for the reviewer's next
+decision.
+
+## Native execution: providerSafeDeleteScenariosGameTest (2026-11-05, head `597b841`)
+
+Authorized by Jira comment 51612 as one fresh, isolated, bounded invocation
+-- not a general go-ahead. Preconditions verified before launch, all
+independently (not relying on `verifyLocalDynamicDimensionsArtifact` or any
+cached/stale claim):
+
+- **Source head**: `597b84180bd32de8f095741fcdfee388452409c5`, clean
+  working tree (`git status --porcelain` empty), exactly the commit the
+  review (51607/51612) was reviewed against.
+- **Compiled classes match source**: fresh `compileJava compileTestJava
+  test` run immediately before launch -- `93/0/0/0` (unaffected; reported
+  separately from this native evidence per the review's instruction, never
+  conflated). The compiled `.class` file's mtime is newer than the source
+  file's. Independently confirmed via `javap -c -p -v` disassembly of the
+  real compiled `ProviderSafeDeleteScenariosGameTest.class` that
+  `readTerminalLedgerSnapshot`'s first bytecode instruction is
+  `ldc #200 // class net/minecraft/server/MinecraftServer` -- i.e. it
+  resolves the field from the class constant directly, not via
+  `aload_0; invokevirtual getClass()` -- confirming the 51607 fix is
+  actually what is compiled into the artifact that ran, not merely present
+  in source.
+- **Provider jar identity**: independently `sha256sum`'d (not trusted from
+  any prior claim) --
+  `4c4d70a90498fded6dcb8488a114597a5ed0052a8c721e888637d3e0bb29f041`,
+  matching the expected hook-bearing corrected provider exactly. Confirmed
+  present on the generated run's classpath via `ordinary_provider_input`.
+- **Generated closure/identity**: `exec '/tmp/temurin21/bin/java'` (the
+  pinned toolchain); `-Dneoforge.enabledGameTestNamespaces=dynamicverse`
+  and `-Ddynamicverse.providerSafeDeleteScenarios=true` both present in the
+  generated VM args; `-Dfml.modFolders=...` naming this workspace's own
+  freshly-compiled `build/classes/java/{main,test}`/`build/resources/{main,test}`.
+- **Execution root, uniquely owned**: the stable preparation root
+  (`run/m470-safe-delete-scenarios-disposable-20261105`, already present
+  and dirtied only by ordinary script-regeneration across this review) was
+  left untouched. A NEW root,
+  `run/m470-safe-delete-scenarios-NATIVE-20261105T0304Z`, was exclusively
+  claimed via the existing, reviewed `claimSafeDeleteCrashExecutionRoot.sh`
+  (reused as-is -- it is fully generic), and the Gradle run's
+  `gameDirectory` was pointed at it via a new minimal override,
+  `-PsafeDeleteScenariosGameDirectory` (added to `build.gradle`, mirroring
+  the existing `-PsafeDeleteCrashGameDirectory` pattern on the crash
+  fixture). Confirmed before launch: the claimed root contained EXACTLY
+  the claim marker (nothing else), the generated script's embedded `cd`
+  target matched that exact claimed root, and the stable preparation root
+  remained empty and unmodified throughout.
+
+**Run command** (via the new `scripts/runProviderSafeDeleteScenariosGameTestWithReceipt.sh`,
+mirroring the existing `runProviderCreateGameTestWithReceipt.sh` pattern --
+requires the generated script, requires the claimed root to contain
+exactly the claim marker and nothing else, requires no pre-existing
+receipts, `cd`s into the claimed root, runs the generated script under
+`tee` so the log is captured even on failure, records the real exit status
+separately from the wrapper's own):
+
+```
+bash scripts/runProviderSafeDeleteScenariosGameTestWithReceipt.sh
+```
+
+**Result**: wrapper exit `0`; underlying generated-script exit (`*.original-exit`) `0`.
+Log (`*.full.log`, 102 lines, SHA-256
+`32a78a83290b0a82f05c247eb5d1c40a88a33abc8e7742f4309cb3d78f9670a3`):
+`All 1 required tests passed :)`. Per-scenario receipt (the fixture's own
+`System.out.println` markers, in order):
+
+```
+RP_SCENARIO_SUCCESS_ACCEPTED name=rp_scenario_success
+RP_SCENARIO_OCCUPIED_ACCEPTED name=rp_scenario_occupied
+RP_SCENARIO_BUSY_ACCEPTED name=rp_scenario_busy
+RP_SCENARIO_FAILED_SAVE_ACCEPTED target=rp_scenario_fs_target unrelated=rp_scenario_fs_unrelated unrelatedLedgerGeneration=2
+```
+
+**Typed FAILED_SAVE identity/cause**: not separately printed to the log,
+but its proof IS the test passing -- `require()` throws immediately and
+fails the GameTest on any mismatch, and the FAILED_SAVE phase's own
+assertions (reflectively read from the pinned provider's real terminal
+ledger, per the 51604/51607 fixes) require, before reaching
+`RP_SCENARIO_FAILED_SAVE_ACCEPTED`: the new ledger entry's `key()` equals
+the exact target dimension key and its map key equals its own
+`generation()`; `status()==FAILED_SAVE`, `failureStage()==SAVE`,
+`sourceReadiness()==READY`, `sourceStillLoaded()==true`; and `cause()`'s
+class name ends in `.TestOnlySaveFailureHook$TestOnlySaveFailure`. The
+unrelated delete's own new entry (map key/generation `2`, confirmed in the
+receipt line above) was separately required to be a clean
+`SAVED_AND_CLOSED` with no failure stage or cause, proving the armed hook
+never touched it.
+
+**Independent filesystem corroboration**, performed after the run against
+the claimed root's own `world/dimensions/dynamicverse/`: `rp_scenario_success`
+and `rp_scenario_fs_unrelated` are both absent (deleted); `rp_scenario_fs_target`
+is present (retained, quarantined, never deleted or closed -- consistent
+with the FAILED_SAVE level remaining loaded, confirmed by the shutdown
+log's own `Saving chunks for level .../dynamicverse:rp_scenario_fs_target`
+line); `rp_scenario_occupied` and `rp_scenario_busy` are both present
+(retained, their deletes having been refused at admission, never
+attempted).
+
+**Cleanup outcome**: the `GameTestListener`-based cleanup (restoring the
+armed system property, closing the runtime, releasing resources) ran as
+part of the normal `testPassed` path; the server's own ordinary shutdown
+log shows a clean, orderly `Stopping server` / `Saving players` /
+`Saving worlds` / per-dimension `All chunks are saved` sequence with no
+forced termination.
+
+Kept separate from this native evidence, per the review's instruction: the
+93 ordinary `test` task and 23 offline-harness results reported in the
+rounds below are unaffected by and distinct from this native run.
+
+This was the ONE native invocation 51612 authorized. No two-JVM crash
+execution, deliberate crash signal, retained-root deletion, merge, or
+deployment has occurred or is requested next.
+
+## Round 3, sixth incremental review (Jira comment 51607): a real reflection bug in the ledger reader, plus binding/wording corrections
+
+Reviewed against `9be475d`. Confirmed the requested preservation checks
+and root binding are present, and that three independent offline probes
+behave correctly. One concrete blocker remained, closed here:
+
+- **`readTerminalLedgerSnapshot` resolved the field from the wrong
+  class.** `server.getClass().getDeclaredField(...)` searches only the
+  EXACT class it's called on, never inherited fields -- the provider
+  mixin injects `quiesceAndCloseTerminalResults` onto `MinecraftServer`
+  itself, but the concrete runtime server under a GameTest is a subclass
+  that doesn't declare it directly, so the very first snapshot would have
+  thrown `NoSuchFieldException` before either FAILED_SAVE close. Fixed by
+  resolving from `MinecraftServer.class` directly (the exact known
+  declaring class) rather than `server.getClass()` -- a declared field's
+  value can be read from any instance that is-a the declaring class,
+  regardless of its concrete subtype. Verified the underlying Java
+  behavior with a standalone throwaway probe (a parent/child class pair)
+  before trusting either the bug report or the fix: `Child.class
+  .getDeclaredField` on a parent-declared field throws exactly as
+  predicted, and `Parent.class.getDeclaredField(...).get(childInstance)`
+  correctly reads it.
+- **Bound both observed terminal results to their intended identities.**
+  `unrelatedResult.key()`/`targetResult.key()` are now required to equal
+  the exact unrelated/target dimension keys, and each ledger map's own
+  key is required to equal that result's own `generation()` -- on top of
+  (not replacing) the existing unique-new-entry checks, the typed
+  FAILED_SAVE/SAVE/READY/cause checks, and the once-per-JVM hook
+  handling, all unchanged.
+- **Two wording corrections** (flagged as non-blocking): the occupied/busy
+  `ReadyVerse` comparisons are described as record/semantic equality
+  across every field, not "byte-for-byte."
+
+Re-verified without executing anything natively: a standalone Java
+probe confirming the exact `getDeclaredField` inheritance behavior before
+and after the fix; `compileJava`/`compileTestJava`/`test` 93/0/0/0
+(unaffected); the in-process fixture's launch script regenerated and
+inspected. No GameTest in this class has been run; no native run, kill,
+or live-world action has occurred.
+
+## Round 3, fifth incremental review (Jira comment 51604): typed FAILED_SAVE evidence, stronger preservation proofs, and binding the root claim to its own path
+
+Reviewed against `056c523`. Credited the corrected names, one serialized
+GameTest/runtime, bootstrap suppression, the terminal-cleanup listener,
+armed-before-unrelated ordering, and the truthful loaded-source
+expectation. Three more items, closed here:
+
+- **Strong typed FAILED_SAVE evidence turned out to be available after
+  all.** The pinned provider already retains its own typed
+  `QuiesceAndCloseResult` before invoking any completion callback:
+  `MinecraftServerMixin.quiesceAndCloseTerminalResults`, backed by
+  `QuiesceAndCloseTerminals.results` -- confirmed directly against the
+  patch and, since Mixin merges fields into the target class, against the
+  real compiled mixin class via `javap` (field name and declared type
+  exactly as expected, not assumed). No supported accessor exists, so
+  `readTerminalLedgerSnapshot` is a narrowly-scoped, read-only reflective
+  snapshot of that one field (and the private `results` map inside it),
+  validating every value's exact declared type as it reads it and failing
+  the fixture outright -- never silently falling back to the generic
+  `QUARANTINED` outcome -- if the pinned shape doesn't match. The
+  FAILED_SAVE phase now diffs the ledger's key set immediately before and
+  after each of the unrelated and target deletes (never inspecting a
+  generation number assigned by the provider ahead of time, and never
+  touching the hook a second time or resetting its once-per-JVM
+  consumption): the unrelated delete's new entry must be a clean
+  `SAVED_AND_CLOSED` with no failure, and the target's new entry must be
+  `FAILED_SAVE`/`SAVE`/`READY` with `sourceStillLoaded()` true and a cause
+  whose class name ends in `.TestOnlySaveFailureHook$TestOnlySaveFailure`
+  -- the exact typed signal, not a generic quarantine standing in for it.
+- **Several preservation assertions were still missing, not merely weak.**
+  Added: a real `AtomicInteger` completion counter for the success
+  scenario (a `set`-only reference cannot prove "exactly once"); an
+  exact-instance comparison of the FAILED_SAVE target's `ServerLevel`
+  before and after the failure (`==`, not merely non-null); a check that
+  the target's durable DELETE operation intent is retained as `PENDING`
+  (confirmed by reading `SafeDeleteOperation` directly that nothing ever
+  updates it on a quarantine -- this IS the exact recovery intent a future
+  restart would need to find); full-record (`.equals()`, every field, not
+  only `.generation()`) comparison of the occupied/busy targets' durable
+  `ReadyVerse` before and after their refused attempts; confirmation that
+  neither refusal ever journals a new durable operation intent; a real
+  sentinel block written and saved into each of the occupied/busy targets
+  before the refusal and verified unchanged after; and the success
+  scenario's explicit unloaded-level assertion, retained alongside the
+  disk/catalog removal checks.
+- **The root claim wasn't actually bound to its own path.** The marker had
+  no field naming its own containing directory, so
+  `root_is_exclusively_claimed` only checked shape -- an offline probe
+  confirmed a marker copied verbatim into a different directory was
+  wrongly accepted. `claimSafeDeleteCrashExecutionRoot.sh` now resolves
+  and records a `canonicalRoot=` field, validates every ancestor (not only
+  the immediate parent) is not itself a symlink before claiming, and the
+  check now requires that field to equal the directory's own resolved
+  path, requires exactly one of each field (catching a duplicate or
+  conflicting line a plain `grep -q` would miss), and still requires the
+  nonce's own format. The main wrapper no longer generates an unrelated
+  fresh nonce for execution -- it reads and reuses the SAME nonce the
+  claim recorded, carrying that one identity through claim → generated
+  cwd/`expectedGameRoot` → execution. Added negative tests for a
+  copied/foreign marker, a marker naming the wrong root, and markers with
+  a duplicate or malformed nonce field.
+
+Re-verified without executing anything natively: `compileJava`/
+`compileTestJava`/`test` 93/0/0/0 (unaffected -- only the fixture's
+internals changed, not its scenario count); the in-process fixture's
+launch script regenerated and inspected; the committed offline harness
+extended to 23/23, including a full end-to-end dry run (claim a fresh
+root, confirm `root_is_exclusively_claimed` accepts it and the claim's own
+nonce is readable for execution) against the real wrapper functions, not
+a replica. No GameTest in this class has been run; no native run, kill,
+or live-world action has occurred.
+
+## Round 3, fourth incremental review (Jira comment 51596): six corrections to the in-process fixture and the root-provenance gap
+
+Reviewed against `0f0d198`. Credited that the fixture and harness are now
+accessible, the busy case uses a real lease, and the occupied case reaches
+the production player-list check. Found six more issues, each verified
+against the actual source before fixing (not assumed):
+
+- **A fixed scenario name was too long.** `rp_scenario_failed_save_unrelated`
+  is 33 characters; `ServerVerseRuntime.ownedCreateId` permits at most 32
+  (`name.matches("[a-z0-9_-]{1,32}")`, confirmed by reading it directly) --
+  its own create would have been rejected before any native run. Renamed to
+  `rp_scenario_fs_unrelated`/`rp_scenario_fs_target` (24/21 chars), and added
+  `ProviderSafeDeleteScenariosNamingTest` (non-native JUnit) asserting every
+  fixed name against the exact contract regex, run as part of the ordinary
+  `test` task.
+- **The FAILED_SAVE assertion was backwards.** Read
+  `QuiesceAndCloseOrchestrator.execute` directly: on a save failure it
+  returns `terminal(FAILED_SAVE, SAVE, saveFailure)` immediately, **before**
+  ever reaching the close step -- the source level is never closed. Its own
+  state-machine test (`QuiesceAndCloseBridgeTest`) literally expects
+  `"FAILED_SAVE/SAVE/READY"` (status/failureStage/sourceReadiness) for this
+  exact case. `ServerVerseRuntime`'s own quarantine is bookkeeping only (it
+  revokes gate readiness) and does not invent an unload. The fixture
+  previously asserted `server.getLevel(fsTargetKey) == null`; fixed to
+  assert the target's real level remains loaded.
+- **Four independent runtime instances, plus `DynamicVerse`'s own bootstrap
+  fifth, all reconciling the same durable file.** Each of the four
+  `@GameTest` methods constructed its own `ServerVerseRuntime.create`, and
+  `providerSafeDeleteScenarios` was not yet in `ownsRuntime()`, so
+  `DynamicVerse.serverStarting` also built its own. Consolidated into ONE
+  `@GameTest` method sharing ONE runtime, scenarios run strictly
+  sequentially; added `providerSafeDeleteScenarios` to `ownsRuntime()` so
+  the bootstrap instance is suppressed (mirroring the existing
+  `providerSeededDuplicateIntegration` precedent) -- fixture-local, not a
+  new production framework.
+- **The FAILED_SAVE proof was too weak.** Deleting the unrelated verse
+  *before* arming the hook only proves ordinary success, not that a
+  non-matching armed key leaves the hook unconsumed. The hook is now armed
+  *before* either FAILED_SAVE-scenario verse is even created; the unrelated
+  (non-matching) verse is deleted *while already armed* for the target's
+  different key, then the target is deleted. The armed system property is
+  now restored to its original value in the same unified cleanup every
+  outcome runs through (below) -- it was previously never restored.
+  Strengthening the evidence beyond the facade's generic `QUARANTINED`
+  further hit a real constraint: the hook fires at most once per JVM, so a
+  throwaway low-level probe to inspect the typed cause would consume the
+  one real attempt the production-facade assertion needs, and the
+  orchestrator's typed cause is never surfaced through
+  `ServerVerseRuntime`/`SafeDeleteOperation` to begin with (confirmed by
+  reading `SafeDeleteOperation.finish()`/`quarantine()` directly -- no
+  stage-specific error is persisted anywhere observable). Getting a typed
+  signal would need either consuming the hook twice (impossible) or
+  extending production mapping code (explicitly out of scope); the
+  evidence this fixture retains is deliberately bounded to what the real,
+  single armed attempt actually proves through the production facade:
+  `QUARANTINED` outcome, catalog state, retained durable/disk data, and the
+  unrelated verse's normal success under the same armed property.
+- **Cleanup only ran on the success path.** `.thenExecute(runtime::close)`
+  is never reached if a step fails or the test times out. Replaced with a
+  `GameTestListener` registered once via `helper.testInfo.addListener(...)`
+  (a real, public extension point -- confirmed via `javap` against the
+  actual compiled class, not assumed): its `testPassed`/`testFailed`
+  callbacks fire for every terminal outcome, including a genuine framework
+  timeout, and release the open lease, remove the fixture's `FakePlayer`,
+  restore the armed property, and close the runtime exactly once
+  (`compareAndSet`-guarded). Added the stronger durable/disk assertions
+  requested: success now also verifies the target's on-disk storage is
+  actually removed and its durable READY/operation entries are gone (not
+  just catalog/unloaded state); occupied/busy refusals now verify the
+  durable READY generation is byte-identical before and after the refused
+  attempt; FAILED_SAVE now also verifies the durable READY entry is
+  retained and that a fresh `beginAcquireReadyRead` against the quarantined
+  target is denied.
+- **The execution-root check accepted any empty directory, not specifically
+  one this invocation owned.** An emptiness check cannot prove provenance:
+  ModDev's own `prepare*Run` task leaves an untouched directory looking
+  identically empty whether it was just claimed or is an unrelated retained
+  root. Replaced with an explicit claim stage,
+  `scripts/claimSafeDeleteCrashExecutionRoot.sh <path>`: it is the ONLY
+  place that ever creates the root, refuses anything but true absence, and
+  relies on `mkdir`'s own atomicity for the actual exclusive claim (no
+  separate check-then-create race window) before writing one marker file
+  recording the claim (host, pid, UTC timestamp, a nonce). The main wrapper
+  no longer calls `mkdir` on the root at all; `root_is_exclusively_claimed`
+  verifies that exact marker is present and well-formed, refusing a merely
+  empty directory, real content, or a symlink exactly as before. Confirmed
+  empirically (not assumed) that regenerating the launch scripts against an
+  already-claimed root leaves a pre-existing file byte-for-byte untouched,
+  so claiming first and regenerating second is safe.
+
+Re-verified without executing anything natively: `compileJava`/
+`compileTestJava`/`test` 93/0/0/0 (2 new naming-contract tests; everything
+else unaffected); both launch scripts (`providerSafeDeleteScenariosGameTest`,
+and the two-JVM crash fixture's, re-regenerated after an earlier probe had
+pointed them at a scratch path) regenerated against the accepted provider
+jar and inspected -- correct `cd` target, namespace/property, and provider
+hash all present; the committed offline harness extended to 19/19,
+including the claim script's own exclusivity (refuses to re-claim, refuses
+to adopt a pre-existing empty directory) and the marker's survival through
+a modeled `prepare*Run` side effect. No native run, kill, or live-world
+action has occurred.
+
+## Round 3, third incremental review (Jira comment 51591): the retained test harness, and the execution-root/preparation-root separation
+
+Confirmed the 51588 fixes against `804d6d3`. Asked for two more concrete
+items, both done here, plus the separately-authorized in-process fixture
+below:
+
+- **The 10-case sourced-wrapper test harness is now committed**, at
+  `scripts/testProviderSafeDeleteCrashWrapperOffline.sh` (it previously
+  only existed as a scratch file, so the 10/10 claim could not be
+  independently inspected or reproduced from the tree). It gained 4 more
+  cases for this round's new `root_is_pristine_or_absent` (below), for 14
+  total. **Run: 14/14 passed.**
+- **The execution-root/preparation-root separation.** Regenerating these
+  launch scripts for review -- ordinary preparation work, done every
+  round -- makes ModDev's own `prepare*Run` task create the configured
+  `gameDirectory` as a side effect; confirmed empirically it creates
+  *exactly* the bare, empty directory and nothing else. Since the wrapper
+  previously hardcoded the SAME path ModDev's run registration names,
+  every round of ordinary script regeneration would have left the
+  wrapper's own "requires an absent root" guard permanently tripped before
+  a real run could ever begin -- and renaming to a different fixed path
+  doesn't help, since ModDev touches whatever path `gameDirectory` names,
+  confirmed by regenerating against a second, differently-named path and
+  observing the same empty directory appear. Fixed two ways together:
+  - `build.gradle`'s `gameDirectory` (and the matching
+    `providerSafeDeleteCrashExpectedGameRoot` system property, kept
+    derived from the exact same value so they can never drift apart) is
+    now overridable via `-PsafeDeleteCrashGameDirectory=<path>`, defaulting
+    to the existing stable preparation path. The wrapper itself now
+    requires `DYNAMICVERSE_SAFE_DELETE_CRASH_EXECUTION_ROOT` to be set
+    explicitly (sourcing for tests is unaffected: the wrapper's own
+    `root` defaults to empty under `set -u`, and only `main()` -- never
+    invoked by sourcing -- requires it non-empty), so a real run is never
+    silently defaulted onto the same path every preparation round uses.
+  - The actual mechanical fix: `root_is_pristine_or_absent` relaxes the
+    absent-root check to also accept a directory that is absent **or**
+    verified to have zero entries -- the exact state ModDev's prepare
+    task leaves and nothing more. A root with any real content (an
+    `eula.txt`, a marker, anything) is still refused exactly as before;
+    nothing is deleted, reused, or weakened. Validated entirely offline
+    (no native run): all four cases -- absent, genuinely empty, real
+    content, symlinked -- behave correctly against synthetic directories,
+    and the two *real* empty directories left over from this review's own
+    script regenerations (the stable default and a differently-named
+    probe) are both now correctly accepted.
+
+## Prepared (not executed): the separate in-process real-provider safe-delete fixture
+
+Authorized for preparation across 51562/51571/51577/51588 and explicitly
+no longer gated on further status exchange (51588: "It need not wait
+behind additional status exchanges"). `ProviderSafeDeleteScenariosGameTest`
+(`src/main/java/.../lifecycle/`, registered the same way
+`ProviderExplicitSuperflatGameTest` already is, via `DynamicVerse`'s
+existing dispatch switch and a new `dynamicverse.providerSafeDeleteScenarios`
+system property/Gradle run `providerSafeDeleteScenariosGameTest`) covers,
+each in its own `@GameTest` method and each calling
+`ServerVerseRuntime.create(server)` for real production wiring -- the
+real `ManagedVerseStateFileStore` and real `DeleteGateway`/provider
+bridge, not the `InMemoryManagedVerseStateStore`/fake gateway the
+existing `NeoForgeVerseCommandsGameTest` confirmed-delete test uses:
+
+- **Success**: a confirmed delete against a real, READY, unobstructed
+  verse completes as `DeleteOutcome.DELETED`.
+- **Occupied-refusal**: a real NeoForge `FakePlayer` (a genuine
+  `ServerPlayer`, not a test double for the delete path) added to the
+  target's own loaded level via `ServerLevel.addNewPlayer` makes
+  `DeleteGateway.minecraft()`'s real `hasPlayers` check true, and
+  `beginConfirmedDelete` is refused `ERR_PLAYERS_PRESENT` -- confirmed by
+  reading `ServerVerseRuntime.beginConfirmedDelete`'s exact source, not
+  assumed.
+- **Busy-refusal**: read `VerseOperationGate`'s actual source directly
+  (not taken on assumption) to find the real, deterministic path to
+  `DeleteAdmission.ERR_VERSE_BUSY`: `beginConfirmedDelete`'s own readiness
+  check (`gate.readiness(key).state() != READY`) is satisfied by an
+  outstanding read lease (readiness ignores the `reads` counter), but
+  `gate.beginDelete(key)` itself refuses whenever `entry.reads != 0` --
+  so an open `beginAcquireReadyRead` lease, never closed, is what actually
+  triggers `ERR_VERSE_BUSY` through the gate's own `IllegalStateException`
+  path. (An earlier draft assumed calling `beginConfirmedDelete` twice on
+  the same key would do this; reading the source directly showed the first
+  call already flips `entry.ready` to `false`, so a second call would
+  instead hit `ERR_VERSE_NOT_READY` -- caught before writing any fixture
+  code, not discovered by running one.)
+- **Exact-target FAILED_SAVE**: arms the real `TestOnlySaveFailureHook`
+  (`dynamicdimensions.testOnlyFailSaveForKey`, matched by the armed
+  dimension's exact `ResourceLocation#toString()`, global single-fire per
+  JVM -- confirmed by reading the hook's actual source in the patch, not
+  assumed) for one target only, after first deleting a separate,
+  never-armed, unrelated verse normally. The armed target's delete is
+  admitted normally (the injected failure fires during the real forced
+  save, not at admission) and surfaces as `DeleteOutcome.QUARANTINED`,
+  with its catalog entry retained as `QUARANTINED` and its on-disk storage
+  directory still present -- never a silently-successful `DELETED`, and
+  the unrelated verse's own successful delete proves the failure is
+  scoped to the exact armed key, not global breakage.
+
+**Verified without executing anything natively:** `compileJava` BUILD
+SUCCESSFUL (the new class and `DynamicVerse`/`build.gradle` wiring
+compile cleanly); `compileTestJava`/`test` unaffected, 91/0/0/0; the new
+Gradle run's launch script was generated (read-only) against the accepted
+hook-bearing provider jar and inspected directly: its own disposable root,
+`-Dneoforge.enabledGameTestNamespaces=dynamicverse`,
+`-Ddynamicverse.providerSafeDeleteScenarios=true`, and the exact expected
+provider jar (`4c4d70a90...`) are all present and correct. No GameTest in
+this class has been run.
+
+## Round 3, second incremental review (Jira comment 51588): two confirmed runner defects
+
+Reviewed against addea9b. Credited the root-binding/negative test, frozen
+manifests, shared cleanup identity check, and Phase B process-group
+containment. Found two more defects, each reproduced live with a harmless,
+non-native probe before fixing:
+
+- **Both manifest captures were unchecked command substitutions.**
+  `pre_phase_a_manifest=$(capture_manifest ...)` and the phase-B equivalent
+  had no `|| refuse` guard. `capture_manifest` calls `refuse`/`exit`
+  internally on a helper failure, but that `exit` only terminates the
+  SUBSHELL the command substitution creates; under `set -uo pipefail`
+  without `-e`, the parent script was never told the assignment's command
+  had failed, and continued with whatever partial/empty stdout had been
+  produced. Reproduced with a direct probe: a simulated helper failure
+  inside such a subshell left the parent running with an empty captured
+  variable. Worse, if the same failure hit both phase A's and phase B's
+  capture identically, two empty manifests would compare equal via `diff`.
+  Fixed by adding an explicit `|| refuse` to both call sites, plus a new
+  `require_manifest_schema`, called on both captures, that rejects a
+  missing, partial, or empty manifest by checking each retained field is
+  present and looks like the 64-hex hash it's supposed to be -- defense in
+  depth against a helper that returns 0 but still produces malformed
+  output. `main()` now checks and rejects both before the disposable root
+  is created (pre-phase-A) and before phase B is launched (pre-phase-B).
+- **`Properties.store` escapes `:` in VALUES, not only in keys.** Confirmed
+  empirically: writing `processStartInstant=2026-11-05T01:12:10.123Z` via
+  a real `Properties.store` produces the literal line
+  `processStartInstant=2026-11-05T01\:12\:10.123Z` on disk. The wrapper
+  read this field with the same plain `sed` extraction used for every
+  other (colon-free) marker field, leaving the backslashes in place and
+  breaking `date -u -d ...` parsing -- reproduced directly. Fixed by
+  reusing the existing proper Java-properties reader
+  (`ProviderSeededRestartProperties.java`, already used by the
+  `providerOrdinaryRestart` wrapper for exactly this reason) via a new
+  `read_process_start_instant` helper, rather than hand-rolling Java
+  properties escaping rules in bash.
+
+Also restructured for testability, per the same review's request for "a
+source-level/mock failure-path test that actually exercises the wrapper
+functions, not merely a separately retyped happy-path replica": everything
+previously executed as bare top-level statements is now inside `main()`,
+called only when the file is EXECUTED directly
+(`[[ "${BASH_SOURCE[0]}" == "${0}" ]]`), not when it is sourced -- so a
+test can `source` this exact file to get its real functions with zero
+side effects. A new test sources the real wrapper and: reproduces the
+original unguarded-capture bug and proves the `|| refuse` fix stops it;
+injects a mocked helper failure into `capture_manifest` and confirms it's
+caught; feeds `require_manifest_schema` a partial and an empty manifest
+and confirms both are refused; diffs a real manifest against a
+deliberately drifted copy via `require_manifests_match` and confirms
+refusal, and against itself and confirms acceptance; and writes a real
+`Properties.store`d marker with a colon-bearing `processStartInstant`,
+proving the old `sed` read fails to parse while the new
+`read_process_start_instant` round-trips correctly. Run: 10/10 passed.
+
+Re-verified without executing anything natively: `compileJava`/
+`compileTestJava`/`test` unaffected (91/0/0/0 -- this round touched only
+the wrapper script); `bash -n`; sourcing the restructured wrapper produces
+its real functions with no side effects (confirmed: `main` is a defined
+function, never invoked, and the disposable root is not created); the
+existing read-only contract/manifest preflight re-run against the real
+generated files, unchanged results. Nothing has been executed natively.
+
+Operational note (not a defect, nothing to fix): the disposable game root
+currently exists on disk, empty, as a side effect of Gradle's
+`prepareProviderSafeDeleteCrashPhase*Run` tasks (run while regenerating
+the launch scripts during this review). The wrapper's own
+`[[ ! -e "$root" ]] || refuse ...` check will correctly refuse to proceed
+while it exists -- expected, fail-closed behavior, not something this
+non-native work should remove.
+
+## Round 3, incremental review (Jira comment 51577): four more closures
+
+Reviewed against b8c706f (the game-root/world-root fix, not yet including
+the input-receipt/process-ownership closures above). Confirmed useful but
+found four more source-backed gaps; closed here (`build.gradle`, the
+wrapper script, the Java fixture, and its tests -- no native execution):
+
+- **`cleanup()` didn't check process-start identity, only `kill -0`.** A
+  refusal issued because the primary path's identity check failed would
+  still run the EXIT trap, which -- checking only that the PID exists --
+  could kill whatever unrelated process the kernel had since reused that
+  PID for, defeating the refusal it was supposed to honor. Introduced
+  `kill_if_still_owned`, which re-checks `/proc` start ticks before
+  signaling, and routed BOTH the primary kill path and `cleanup()` through
+  it; `phase_b_start` is now captured and checked the same way phase A's
+  already was.
+- **A trapped INT/TERM handler that returns lets the script fall through
+  into the next statement**, rather than actually stopping -- an
+  interruption during phase A's wait loop could otherwise continue on into
+  launching phase B. Split the EXIT trap (`cleanup`) from a new
+  `on_terminating_signal`, which cleans up, clears all traps, and
+  re-delivers the same signal to the wrapper's own PID so it actually
+  terminates.
+- **No immutable pre-phase-A manifest.** `verify_input_contract` recomputed
+  both phases' hashes at each call and compared them to each other; if a
+  build changed shared inputs between calls, both recomputations could
+  still agree while silently differing from what phase A actually ran.
+  Replaced with `capture_manifest`, called once before phase A ever
+  launches and stored (`pre_phase_a_manifest`); phase B's freshly captured
+  manifest is compared against that frozen snapshot via
+  `require_manifests_match`, not against a re-derived phase A snapshot.
+  The retained manifest also newly binds the legacy classpath by content
+  (not just the listing file), all four `-Dfml.modFolders=` directories
+  (now also bound into the generated-script contract check itself), the
+  exact java executable's own binary, and the program arguments -- not
+  only the normal classpath and VM args as before.
+- **`diff ... || true` could treat a diff ERROR as an empty-output
+  success.** `require_manifests_match` now captures diff's exit status
+  explicitly and fails closed on anything other than 0 (identical),
+  distinguishing "differences found" (1, refused with the diff shown) from
+  "diff itself could not run" (2+, also refused). Verified with a
+  deliberately corrupted manifest that the check actually refuses rather
+  than silently passing.
+- **`gameRootFromWorldRoot` accepted any correctly-named/shaped pair, not
+  only the one true root.** The round-3 test
+  `aForeignWorldDirectoryElsewhereWithTheRightNamesIsStillAcceptedOnlyIfCanonicallyRelated`
+  explicitly asserted this as acceptable, contradicting the confinement
+  requirement. `build.gradle` now supplies the exact registered absolute
+  game-root path via a new system property
+  (`dynamicverse.providerSafeDeleteCrashExpectedGameRoot`) on both run
+  configs; `gameRootFromWorldRoot` takes it as an explicit parameter and
+  requires an exact match, not merely a basename/shape match. The
+  contradicting test was replaced with
+  `aForeignPairElsewhereWithTheRightNamesAndShapeIsStillRefusedUnlessItIsTheExactExpectedRoot`,
+  which asserts the opposite (refusal) for the same kind of foreign pair.
+  The two symlink-dependent tests that silently returned (counting as a
+  pass) when this environment cannot create symlinks now call
+  `Assumptions.abort(...)` instead, so that environment limitation shows
+  up as a reported skip, never a silent pass.
+
+Re-verified without executing anything natively: `compileJava`/
+`compileTestJava`/`test` 91/0/0/0 (one test renamed, net count unchanged);
+`bash -n` on the wrapper; both launch scripts regenerated against the
+corrected `build.gradle` (confirmed the new system property reaches the
+generated VM args, identically for A and B); a read-only replica of
+`crash_require_generated`/`verify_phase_sanity`/`capture_manifest`/
+`require_manifests_match` run against those real regenerated files --
+phase A and B sanity both OK, a 29-line manifest captured for each, the
+two manifests match, and a deliberately corrupted copy is correctly
+refused as "inputs changed" rather than silently accepted. The
+`setsid`+group-kill mechanism from the prior closure was also re-verified
+empirically (a throwaway `setsid timeout ... sleep` tree, confirming the
+forced-kill path kills both members, not only `timeout`). Nothing has been
+executed natively.
+
+## Round 3 fix: a confirmed, pre-existing defect
+
+Round 2's draft would have refused to even start. `confinedRoot` called
+`server.getWorldPath(LevelResource.ROOT)` -- the WORLD save directory
+(`gameDir/world`, since the wrapper sets `level-name=world`) -- and then
+required *its own basename* to equal the registered *game*-directory name.
+Those are never the same path, so the very first call would have thrown.
+Separately, the wrapper wrote the nonce file at the game root but read/wrote
+the marker and result at the world root, and the marker recorded the world
+root under the key `root` while the wrapper compared it against the game
+root. Found by review, not by running anything.
+
+Fixed by modeling the two roots explicitly and testably:
+
+- `ProviderSafeDeleteCrashFixture.gameRootFromWorldRoot(Path world)` is a
+  new, server-free static method: given the world directory, it requires
+  the world directory to be real/non-symlinked and named exactly `world`,
+  derives the game root as its parent, requires the game root to be real/
+  non-symlinked and named exactly the registered disposable directory, and
+  requires every ancestor of the game root to be non-symlinked. `gameRoot`/
+  `worldRoot` (both taking a `MinecraftServer`) call this.
+- Nonce, marker, and result files all now live at the **game** root
+  exclusively (the wrapper's `eula.txt`/`server.properties` root); dimension
+  storage naturally stays under the **world** root
+  (`world/dimensions/dynamicverse/<name>`). The marker's `root` key was
+  renamed `gameRoot` to make the identity explicit, and `validateBeforeRuntime`/
+  Phase A/Phase B were all updated to use the correct root consistently.
+- `src/test/java/.../lifecycle/ProviderSafeDeleteCrashFixtureRootBindingTest.java`:
+  8 non-native JUnit tests (no `MinecraftServer`, no native launch) against
+  real temp directories -- the intended valid pair, a world directory not
+  named `world`, a game root with the wrong name, a `world` directory that
+  is not the expected game root's own child (same names, wrong relationship),
+  a symlinked world directory, a symlinked game-root ancestor, and a
+  nonexistent retained/foreign path. **Actually run**: 8/8 passed, 0
+  failures, 0 errors.
+
+## Round 3 input-receipt and process-ownership closures (this update)
+
+The same review (Jira comment 51571) also found the round-2 input-receipt
+and process-termination hardening incomplete. Closed here, wrapper-script-
+only (no Java changes, so the prior 91/0/0/0 compile/test result still
+applies):
+
+- **Mod-folder directories weren't bound or hashed.** The generated launch
+  script passes `-Dfml.modFolders=...` naming the main/test class and
+  resource directories NeoForge actually loads from; `crash_require_generated`
+  checked everything else about the generated script but not this literal.
+  It now requires the exact expected four paths, and `verify_input_contract`
+  content-hashes all four directories (via the existing `ordinary_tree_hash`/
+  `ordinary_typed_entry_hash` helpers) immediately before each phase,
+  requiring A's and B's hashes to match and recording them to
+  `providerSafeDeleteCrash-receipts/mod-folder-hashes.txt`.
+- **The legacy classpath was only hashed as a listing file, not by
+  content.** `ordinary_hash "$legacy"` hashes the *text file naming* the
+  legacy-classpath jars -- proof the two listings name the same paths, not
+  that those jars have the same bytes. Switched to `ordinary_closure_hash`,
+  which resolves and content-hashes every entry the listing names (the same
+  helper already used for the normal classpath).
+- **`processStartInstant` was written by the JVM but never read.** The
+  wrapper now captures its own wall-clock timestamp immediately before
+  spawning phase A, then after reading the marker, parses the JVM's
+  self-reported `processStartInstant` and requires it to fall inside the
+  window this wrapper could actually have spawned it in -- an identity
+  signal from a different clock source than the `/proc` start-ticks check,
+  both now checked before any kill.
+- **A wrapper-side kill of phase B's `timeout` process could orphan the
+  java process underneath it.** SIGKILL is never forwarded by the process
+  that receives it, so the prior `cleanup()` trap -- which signaled only the
+  PID bash reported for the backgrounded `timeout --kill-after=... ` job --
+  could leave the actual server running (and its `session.lock` held) if
+  the wrapper itself were interrupted or refused between launching phase B
+  and `timeout`'s own bounded termination logic taking effect. Verified
+  empirically (plain `ps`, not assumed from documentation) that `timeout`
+  does not give its monitored child a separate process group of its own --
+  the child inherits `timeout`'s group -- so wrapping the phase B launch in
+  `setsid` (which, run without `-f`, execs in place rather than forking
+  away, so the backgrounded PID bash reports IS the new group leader) lets
+  `cleanup()` reach both via `kill -9 -- -$phase_b_pid`. Confirmed live: a
+  `setsid timeout ... sleep` tree where the forced-kill path actually kills
+  both members, versus killing only the `timeout` PID leaving its child
+  running.
+
+Re-verified after these changes: `bash -n` on the wrapper, and the
+read-only preflight script re-run against freshly regenerated Phase A/B
+launch scripts -- contract OK for both phases, provider hash matches
+`4c4d70a90...`, normal closures match, legacy closure *contents* now match,
+log4j configs match, all four mod-folder directory hashes computed, VM args
+identical apart from the expected phase-only differences. Nothing has been
+executed natively.
+
+## Round 2 hardening
+
+A second technical review of the first draft (97276b8) found the fixture/
+runner "not yet safe or sufficient to run" and named five corrections,
+addressed below, all still unexecuted:
+
+- **Preflight moved before `ServerVerseRuntime.create`.** Added
+  `ProviderSafeDeleteCrashFixture.validateBeforeRuntime(phase, server)`,
+  wired into `DynamicVerse.serverStarting` exactly like
+  `ProviderOrdinaryRestartFixture.validateBeforeRuntime`. Phase A's check
+  refuses a retained prior marker/result. Phase B's check reads the marker,
+  cross-checks its nonce/root against the wrapper-owned nonce file, and
+  independently re-reads the real durable state file to confirm the exact
+  recorded operation id/generation is still `PENDING` — all **before**
+  production recovery runs, not after. `confinedRoot` also now requires the
+  root's final path segment to equal the exact registered disposable
+  directory name, not merely "any real directory."
+- **Generated-launch/input contract enforced, not just file existence.**
+  The wrapper now sources `scripts/providerOrdinaryRestartReceiptLib.sh`
+  (its hash/closure helpers are generic, not ordinary-restart-specific) and
+  adds a `crash_require_generated` check mirroring
+  `ordinary_require_generated`: exact `cd '<root>'; exec` binding, exact
+  classpath/VM-args/program-args file references, the exact
+  `-Ddynamicverse.providerSafeDeleteCrashPhase=<phase>` property with no
+  GameTest-namespace property present, and a `-classpath`-leading argfile.
+  It then extracts the provider jar via `ordinary_provider_input` and
+  requires its SHA-256 to equal the **hook-bearing** corrected provider's
+  hash (`4c4d70a9...`, not the older SUPERFLAT-credited `5c7afbc7...` nor
+  the stale repository default), for both phases, and requires both phases'
+  full classpath closures (`ordinary_closure_hash`) to be identical. All of
+  this was actually run (read-only, no process spawned) against the real
+  generated files from this session's launch-script generation, and passed:
+  `A: contract OK`, `B: contract OK`, both provider hashes matched exactly,
+  both closures matched exactly.
+- **Wrapper-owned, round-tripped nonce; atomic marker/result writes.** The
+  wrapper now generates the one expected nonce itself and writes it to a
+  nonce file *before* Phase A launches; Phase A echoes it into the marker,
+  the wrapper verifies the echo, and Phase B's result additionally echoes it
+  again, cross-checked by the wrapper after Phase B exits. Marker and result
+  are now written via a `CREATE_NEW` staging sibling, `force(true)`, then
+  `ATOMIC_MOVE` — no reader can ever observe a partially-written file.
+  The wrapper installs an `EXIT` trap that kills the exact spawned Phase A
+  PID if still alive on any refusal path, re-verifies PID ownership
+  immediately before sending the kill signal (not only once at marker time),
+  fails closed if `lsof` itself is unavailable instead of skipping the
+  lock-release check, and now runs Phase B under `timeout 120s` with its own
+  distinct refusal on timeout.
+- **Phase B's assertions strengthened.** `targetRejectionCompleted` now
+  requires the read-acquisition callback to have actually fired exactly
+  once, with an explicit `VerseReservationPhase.FAILED` and an empty lease —
+  a callback that simply never ran is no longer treated as "unreadable."
+  Added `targetNeverReloaded` via the real `server.getLevel(TARGET_KEY) ==
+  null` check. The unrelated verse's replay is now verified through a real
+  acquired lease, `runtime.resolve(lease)` to an actual current `ServerLevel`,
+  and that level's own sentinel block content — not listing state alone.
+  Both phases now write a distinct sentinel block into the target and the
+  unrelated verse (`REDSTONE_LAMP`/`GLOWSTONE`, the same technique
+  `ProviderOrdinaryRestartFixture` already uses) and force a real save
+  before Phase A's marker is published, so the target's confined on-disk
+  storage is real content, not an empty directory. Phase A's marker now
+  records the exact admitted operation's id and target generation, read
+  back from the real durable file; Phase B's result echoes both, and the
+  wrapper refuses a result whose operation id/generation doesn't match
+  Phase A's.
+
+## What exists now (compiled, not executed)
+
+- `src/main/java/.../lifecycle/ProviderSafeDeleteCrashFixture.java`: the
+  two-JVM Phase A/B fixture (property 5, below).
+- `dev.galacticraft.dynamicdimensions.impl.internal.TestOnlySaveFailureHook`,
+  wired into `ServerLevelSaveOperations.save`, added to
+  `provider-patches/dynamicdimensions-reviewed-seed-close.patch` (PR #2,
+  `e1a98b0`): the deterministic `FAILED_SAVE` injection for property 2.
+- `build.gradle`'s `providerSafeDeleteCrashPhaseA`/`PhaseB` run registrations
+  and `DynamicVerse`'s `dynamicverse.providerSafeDeleteCrashPhase` selector.
+- `scripts/runProviderSafeDeleteCrashWithReceipt.sh`: orchestrates both
+  phases, including the PID-verified forced kill described under property 5.
+
+Not yet built: a dedicated in-process success/occupied-refusal/busy-refusal/
+FAILED_SAVE native fixture (property 1's "separate deterministic
+success/refusal/failure scenarios" from the restart scenario). The
+restart/crash half (property 5) was prioritized first since it is the more
+novel, higher-risk mechanism; the in-process scenarios are comparatively
+close to the existing patterns already reviewed elsewhere in this ticket
+(`ProviderBridgeIntegrationGameTest`, `ProviderOrdinaryRestartFixture`) and
+are proposed as the next increment rather than built speculatively here.
+
+## 1. Separate the scenarios (done at the fixture-design level)
+
+`ProviderSafeDeleteCrashFixture` is dedicated solely to the two-process
+restart/crash scenario and uses only real production wiring: the actual
+`ServerVerseRuntime.create(server)` factory, the actual
+`ServerVerseRuntime.DeleteGateway.minecraft(server)`, the corrected provider,
+and the actual `ManagedVerseStateFileStore.minecraft(server)`. No fake
+successful receipt, no fake absence check, no in-memory persistence appears
+anywhere in this class. The deterministic success/refusal/failure scenarios
+are intentionally left for a separate fixture (not yet written — see above).
+
+## 2. Failure injection
+
+Existing provider test hooks were inspected first (`QuiesceAndCloseBridgeTest`
+and friends): they exercise the internal step classes directly with fake
+sources, not the real `MinecraftServerMixin`/`ServerLevel` path, so they do
+not suffice for a native failure. Added `TestOnlySaveFailureHook`
+(`common/src/main/java/dev/galacticraft/dynamicdimensions/impl/internal/`,
+in `provider-patches/`), called from `ServerLevelSaveOperations.save`
+immediately before the real `ServerLevel.save(...)`:
+
+- Inert unless the exact system property `dynamicdimensions.testOnlyFailSaveForKey`
+  is set to the target's exact dimension location; fires at most once per JVM
+  (a `consumed` latch); throws a distinct `TestOnlySaveFailureHook.TestOnlySaveFailure`
+  type so a real production save failure is never masked as this deliberate one.
+- Read `QuiesceAndCloseOrchestrator.execute` directly to confirm the real
+  orchestrator already catches whatever `RuntimeException` the save step
+  returns and maps it to `FAILED_SAVE` without calling `quarantine()` at that
+  stage — this hook rides that existing, already-reviewed path; it adds no
+  new failure path of its own.
+- Occupied refusal and known-no-effect busy refusal need no injection: an
+  actual test-owned player placed in the target world, and an actual held
+  read lease, exercise the real `hasPlayers`/gate-busy checks directly.
+
+Full source/target/hook diff: `provider-patches/dynamicdimensions-reviewed-seed-close.patch`
+(PR #2, commit `e1a98b0`); see `docs/provider-source-reproducibility.md` there
+for the class-comparison manifest and verification already performed on that
+patch (compiles, provider's own 18 unit tests unchanged, new jar hash
+recorded). Not yet exercised through the new hook natively.
+
+## 3. Crash proof — `ProviderSafeDeleteCrashFixture` + the wrapper script
+
+- **Barrier placement, justified by actual queue ordering, not assumed
+  timing:** `dynamicdimensions$beginQuiesceAndClose` only calls
+  `pendingQuiesceAndCloses.admit(...)` — admission is enqueue-only. The real
+  close only runs when `MinecraftServerMixin`'s `tickServer` injection drains
+  that queue. Phase A's `started()` runs from `ServerStartedEvent`, before
+  the server has ever reached its tick loop; if that call never returns, no
+  tick — and therefore no drain, no close, no terminal — can ever happen on
+  that JVM. This is why the fixture blocks (`for (;;) Thread.sleep(MAX_VALUE)`)
+  immediately after confirming admission and the durable PENDING write,
+  rather than relying on timing.
+- **Durable PENDING marker, verified before publication:** Phase A re-reads
+  `ManagedVerseStateFileStore.minecraft(server).read()` (the real file) and
+  requires an actual `DELETE`/`PENDING` operation intent for the target
+  before writing the marker file; the marker itself carries this JVM's own
+  `ProcessHandle.current().pid()` and a nonce.
+- **PID-verified, non-broad kill:** the wrapper (`scripts/runProviderSafeDeleteCrashWithReceipt.sh`)
+  captures `$!` from the exact process it spawned, polls for the marker,
+  reads the marker's *own reported* PID back, and refuses to proceed unless
+  it equals the PID it spawned — only then does it `kill -9` that exact PID.
+  No name-based or broad kill, no sleep used as proof of anything (the sleep
+  loop only polls for the marker's existence, bounded by a timeout that
+  itself refuses on expiry), no graceful-shutdown substitution, no retained
+  profile (the root must be absent before Phase A, refused otherwise).
+- **Phase B waits for real exit and lock release:** the wrapper waits for
+  the killed PID to actually disappear (`kill -0` polling, not `wait` on a
+  process it didn't itself launch) before proceeding, and checks `lsof` on
+  `world/session.lock` reports no holder before launching Phase B.
+- **Expected crash exit recorded separately:** Phase A's exit status (after
+  being forcibly killed) is written to its own `phase-a.forced-kill-exit`
+  file and never conflated with Phase B's exit status, which the wrapper
+  does require to be `0`.
+- Phase B asserts via `runtime.listManaged()`/`beginAcquireReadyRead` that
+  the target is `QUARANTINED` and unreadable, the unrelated verse is still
+  `READY`, and the target's on-disk storage directory still exists (an
+  interrupted delete must never have removed anything), then writes its own
+  result receipt and requests a normal graceful stop (`server.halt(false)`)
+  — Phase B is the recovery check, not another crash.
+
+## 4. Corrected property wording (this document previously over-claimed)
+
+The prior draft said failures "leave the world still loaded." That is true
+only for `FAILED_SAVE`, confirmed by reading `QuiesceAndCloseOrchestrator`:
+a save failure returns before any close/quarantine step runs, so the real
+`ServerLevel` stays loaded and registered. A `FAILED_CLOSE` or cleanup
+failure happens after save succeeds, inside the close/cleanup steps, which
+**do** call `quarantine()` on failure — the source may then be absent from
+`levels`, and `SafeDeleteOperation.finish()` always calls its own
+`quarantine()` for any non-`SAVED_AND_CLOSED` receipt regardless. The
+corrected property: **every failure must preserve data (nothing is deleted
+or corrupted) and must leave the target durably quarantined; only
+`FAILED_SAVE` additionally guarantees the exact same loaded instance is
+still present and registered.** The planned fixture will assert the
+outcome's truthful source presence per failure kind rather than one blanket
+"still loaded" claim, and will compare deliberate sentinel content (not
+whole-file byte identity, since an ordinary save legitimately rewrites
+bytes) and the absence of removal/rename for protected targets.
+
+## Still not resolved / not done
+
+- The in-process success/occupied-refusal/busy-refusal/`FAILED_SAVE` fixture
+  (property 1's other half) is **still not written**. This was explicitly
+  asked for again in round 2 and was not delivered in this update — round 2
+  prioritized the five corrections to the already-drafted crash fixture over
+  starting a new one, since the existing draft was explicitly called "not
+  yet safe... to run." Reusing the `ownsRuntime()`/dedicated-phase pattern
+  already established for `seededRestartPhase` A/B (so this new fixture, not
+  `DynamicVerse`'s own auto-created runtime, owns the one real
+  `ServerVerseRuntime` instance for its run) is the intended approach for
+  the next increment.
+- Nothing above has been executed as a native server. `bash -n`
+  syntax-checked the wrapper script; `compileJava`/`compileTestJava` passed
+  for the Java source; the two launch scripts generate successfully with
+  the hook-bearing corrected provider explicitly selected; the wrapper's
+  full preflight contract/hash/closure logic was actually run (read-only,
+  no process spawned) against those real generated files and passed. No
+  marker, no kill, no Phase B run, no session.lock check has actually
+  happened yet.
+- Round 2 reused the established `providerOrdinaryRestart` convention's
+  generic hash/closure helpers directly (by sourcing the same library) and
+  added an analogous generated-launch contract check, so the gap with that
+  convention is now mainly: no O1/O2-style pre-launch level.dat/state hash
+  snapshotting across the exact same receipt tuple shape, and no retry-only
+  profile variant. Those remain open if a future round wants that exact
+  parity; not reproduced here given the different (crash/kill vs graceful)
+  shape of this fixture.
+
+## Explicitly not authorized by this document
+
+No native run, no world creation, no filesystem mutation, no provider
+invocation, no kill signal sent. Per the no-live-world-deletion gate already
+in force on this ticket, return for review before any of that.

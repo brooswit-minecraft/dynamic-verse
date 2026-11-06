@@ -21,10 +21,13 @@ import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ProviderDuplicati
 import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.SeededBridgeRegressionGameTest;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ProviderBridgeIntegrationGameTest;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderCreateIntegrationGameTest;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderExplicitSuperflatGameTest;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderSafeDeleteScenariosGameTest;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderSeededDuplicateIntegrationGameTest;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderSeededRestartPhaseAGameTest;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderSeededRestartPhaseBGameTest;
 import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderOrdinaryRestartFixture;
+import io.github.brooswitminecraft.dynamicverse.lifecycle.ProviderSafeDeleteCrashFixture;
 import java.util.List;
 import java.util.OptionalLong;
 import java.util.function.Consumer;
@@ -36,6 +39,7 @@ public final class DynamicVerse {
     public static final String MOD_ID = "dynamicverse";
     private ServerVerseRuntime runtime;
     private ProviderOrdinaryRestartFixture ordinaryRestart;
+    private ProviderSafeDeleteCrashFixture safeDeleteCrash;
     private final BootstrapFacade facade = new BootstrapFacade();
 
     public DynamicVerse(IEventBus modEventBus) {
@@ -49,13 +53,15 @@ public final class DynamicVerse {
 
     private void registerGameTests(RegisterGameTestsEvent event) {
         FixtureSelection selection = fixtureSelection();
-        if (selection.ordinaryPhase != null) return; // O1/O2 is an ordinary server profile, never a GameTest selection.
+        if (selection.ordinaryPhase != null || selection.safeDeleteCrashPhase != null) return; // ordinary server profiles, never a GameTest selection.
         String restartPhase = selection.seededRestartPhase;
-        event.register(selection.seededBridgeRegression ? SeededBridgeRegressionGameTest.class : switch (restartPhase) {
+        event.register(selection.seededBridgeRegression ? SeededBridgeRegressionGameTest.class
+                : selection.providerSafeDeleteScenarios ? ProviderSafeDeleteScenariosGameTest.class
+                : switch (restartPhase) {
             case "A" -> ProviderSeededRestartPhaseAGameTest.class;
             case "B" -> ProviderSeededRestartPhaseBGameTest.class;
             default -> selection.providerCreateIntegration
-                    ? ProviderCreateIntegrationGameTest.class
+                    ? (Boolean.getBoolean("dynamicverse.explicitSuperflat") ? ProviderExplicitSuperflatGameTest.class : ProviderCreateIntegrationGameTest.class)
                     : selection.providerSeededDuplicateIntegration
                             ? ProviderSeededDuplicateIntegrationGameTest.class
                     : selection.providerBridgeIntegration
@@ -67,6 +73,7 @@ public final class DynamicVerse {
     private void serverStarting(ServerStartingEvent event) {
         FixtureSelection selection = fixtureSelection();
         if (selection.ordinaryPhase != null) ProviderOrdinaryRestartFixture.validateBeforeRuntime(selection.ordinaryPhase, event.getServer());
+        if (selection.safeDeleteCrashPhase != null) ProviderSafeDeleteCrashFixture.validateBeforeRuntime(selection.safeDeleteCrashPhase, event.getServer());
         if (!selection.ownsRuntime()) runtime = ServerVerseRuntime.create(event.getServer());
     }
     private void registerCommands(RegisterCommandsEvent event) {
@@ -79,6 +86,13 @@ public final class DynamicVerse {
             ordinaryRestart = new ProviderOrdinaryRestartFixture(selection.ordinaryPhase);
             ordinaryRestart.started(event.getServer(), runtime);
         }
+        // Prepared for review, not yet executed: see
+        // docs/real-provider-safe-delete-acceptance-plan-20261104.md. Phase A
+        // deliberately blocks the server thread here and never returns.
+        if (selection.safeDeleteCrashPhase != null && runtime != null) {
+            safeDeleteCrash = new ProviderSafeDeleteCrashFixture(selection.safeDeleteCrashPhase);
+            safeDeleteCrash.started(event.getServer(), runtime);
+        }
     }
     private void afterServerTick(ServerTickEvent.Post event) {
         if (runtime != null && runtime.owns(event.getServer())) runtime.tick();
@@ -86,6 +100,7 @@ public final class DynamicVerse {
     }
     private void serverStopping(ServerStoppingEvent event) {
         ordinaryRestart = null;
+        safeDeleteCrash = null;
         if (runtime != null && runtime.owns(event.getServer())) { runtime.close(); runtime = null; }
     }
 
@@ -93,21 +108,32 @@ public final class DynamicVerse {
     private static FixtureSelection fixtureSelection() {
         String seededPhase = System.getProperty("dynamicverse.providerSeededRestartPhase", "");
         String ordinaryPhase = System.getProperty("dynamicverse.providerOrdinaryRestartPhase", "");
+        String safeDeleteCrashPhase = System.getProperty("dynamicverse.providerSafeDeleteCrashPhase", "");
         boolean seededBridge = Boolean.getBoolean("dynamicverse.seededBridgeRegression");
         boolean providerCreate = Boolean.getBoolean("dynamicverse.providerCreateIntegration");
         boolean providerDuplicate = Boolean.getBoolean("dynamicverse.providerSeededDuplicateIntegration");
         boolean providerBridge = Boolean.getBoolean("dynamicverse.providerBridgeIntegration");
+        boolean providerSafeDeleteScenarios = Boolean.getBoolean("dynamicverse.providerSafeDeleteScenarios");
         if (!seededPhase.isEmpty() && !seededPhase.equals("A") && !seededPhase.equals("B")) throw new IllegalStateException("unsupported seeded restart phase");
         if (!ordinaryPhase.isEmpty() && !ordinaryPhase.equals("O1") && !ordinaryPhase.equals("O2")) throw new IllegalStateException("unsupported ordinary restart phase");
+        if (!safeDeleteCrashPhase.isEmpty() && !safeDeleteCrashPhase.equals("A") && !safeDeleteCrashPhase.equals("B")) throw new IllegalStateException("unsupported safe-delete crash phase");
         int selected = (seededPhase.isEmpty() ? 0 : 1) + (ordinaryPhase.isEmpty() ? 0 : 1) + (seededBridge ? 1 : 0)
-                + (providerCreate ? 1 : 0) + (providerDuplicate ? 1 : 0) + (providerBridge ? 1 : 0);
+                + (providerCreate ? 1 : 0) + (providerDuplicate ? 1 : 0) + (providerBridge ? 1 : 0) + (safeDeleteCrashPhase.isEmpty() ? 0 : 1)
+                + (providerSafeDeleteScenarios ? 1 : 0);
         if (selected > 1) throw new IllegalStateException("mixed Dynamic Verse fixture selectors are refused");
-        return new FixtureSelection(seededPhase, ordinaryPhase.isEmpty() ? null : ordinaryPhase, seededBridge, providerCreate, providerDuplicate, providerBridge);
+        return new FixtureSelection(seededPhase, ordinaryPhase.isEmpty() ? null : ordinaryPhase, seededBridge, providerCreate, providerDuplicate, providerBridge,
+                safeDeleteCrashPhase.isEmpty() ? null : safeDeleteCrashPhase, providerSafeDeleteScenarios);
     }
     private record FixtureSelection(String seededRestartPhase, String ordinaryPhase, boolean seededBridgeRegression,
                                     boolean providerCreateIntegration, boolean providerSeededDuplicateIntegration,
-                                    boolean providerBridgeIntegration) {
-        boolean ownsRuntime() { return seededRestartPhase.equals("A") || seededRestartPhase.equals("B") || providerSeededDuplicateIntegration; }
+                                    boolean providerBridgeIntegration, String safeDeleteCrashPhase, boolean providerSafeDeleteScenarios) {
+        // providerSafeDeleteScenarios is included here (mirroring
+        // providerSeededDuplicateIntegration) so DynamicVerse's own bootstrap
+        // never constructs a SECOND ServerVerseRuntime alongside the one the
+        // fixture's own @GameTest method constructs and owns -- both would
+        // otherwise independently reconcile the same on-disk durable state
+        // file at startup and tick in parallel.
+        boolean ownsRuntime() { return seededRestartPhase.equals("A") || seededRestartPhase.equals("B") || providerSeededDuplicateIntegration || providerSafeDeleteScenarios; }
     }
 
     /** Stateless delegation prevents command-event ordering from fabricating a runtime/catalog. */
@@ -123,6 +149,9 @@ public final class DynamicVerse {
         }
         @Override public CreateAdmission beginCreate(String name, CreateType type, OptionalLong seed, Consumer<CreateOutcome> completion) {
             return runtime == null ? CreateAdmission.ERR_PROVIDER_UNAVAILABLE : runtime.beginCreate(name, type, seed, completion);
+        }
+        @Override public DeleteAdmission beginConfirmedDelete(String name, java.util.function.Consumer<DeleteOutcome> completion) {
+            return runtime == null ? DeleteAdmission.ERR_VERSE_NOT_MANAGED : runtime.beginConfirmedDelete(name, completion);
         }
         @Override public DeleteAdmission beginDelete(String name) {
             return runtime == null ? DeleteAdmission.ERR_VERSE_NOT_MANAGED : runtime.beginDelete(name);

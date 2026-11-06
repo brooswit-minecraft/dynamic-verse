@@ -53,6 +53,12 @@ neoForge {
         }
     }
     runs {
+        register("reviewGameTest") {
+            type = "gameTestServer"
+            gameDirectory = layout.projectDirectory.dir("run/m470-review-disposable-20261102")
+            sourceSet = sourceSets.test
+            systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse_review"
+        }
         register("bridgeGameTest") {
             type = "gameTestServer"
             // Isolated disposable run state; do not point this at an existing world.
@@ -97,6 +103,29 @@ neoForge {
             sourceSet = sourceSets.providerBridgeGameTest
             systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
             systemProperty "dynamicverse.providerBridgeIntegration", "true"
+        }
+        register("providerExplicitSuperflatGameTest") {
+            type = "gameTestServer"
+            gameDirectory = layout.projectDirectory.dir("run/m470-explicit-superflat-disposable-corrected-20261102")
+            sourceSet = sourceSets.providerBridgeGameTest
+            systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
+            systemProperty "dynamicverse.providerCreateIntegration", "true"
+            systemProperty "dynamicverse.explicitSuperflat", "true"
+        }
+        // The in-process (single-JVM, real provider/store wiring) companion
+        // to the two-JVM providerSafeDeleteCrashPhase{A,B} fixture --
+        // success, occupied-refusal, busy-refusal, and exact-target
+        // FAILED_SAVE. gameDirectory is overridable via
+        // -PsafeDeleteScenariosGameDirectory (mirroring
+        // -PsafeDeleteCrashGameDirectory on the crash fixture) so a real
+        // native run is never silently pointed at the stable preparation
+        // root ordinary script regeneration may have already touched.
+        register("providerSafeDeleteScenariosGameTest") {
+            type = "gameTestServer"
+            gameDirectory = layout.projectDirectory.dir(findProperty("safeDeleteScenariosGameDirectory") ?: "run/m470-safe-delete-scenarios-disposable-20261105")
+            sourceSet = sourceSets.providerBridgeGameTest
+            systemProperty "neoforge.enabledGameTestNamespaces", "dynamicverse"
+            systemProperty "dynamicverse.providerSafeDeleteScenarios", "true"
         }
         register("providerCreateGameTest") {
             type = "gameTestServer"
@@ -158,6 +187,43 @@ neoForge {
             sourceSet = sourceSets.providerBridgeGameTest
             systemProperty "dynamicverse.providerOrdinaryRestartPhase", "O2"
         }
+        // Prepared for review, not yet executed: see
+        // docs/real-provider-safe-delete-acceptance-plan-20261104.md. Phase A
+        // deliberately never exits on its own; an external wrapper owns
+        // killing its exact verified PID. Phase B is a second, independent
+        // launch against the same disposable root.
+        //
+        // gameDirectory is overridable via -PsafeDeleteCrashGameDirectory
+        // specifically so ordinary preparation (regenerating these launch
+        // scripts for review, which ModDev's own prepare*Run tasks create as
+        // a side effect) never has to touch the SAME path a real execution
+        // will later require to be freshly absent. The default below is the
+        // stable "preparation root" ModDev may create/dirty at any time
+        // during ordinary review work; a real run must override this
+        // property to a fresh, timestamped root the wrapper itself requires
+        // via DYNAMICVERSE_SAFE_DELETE_CRASH_EXECUTION_ROOT, regenerate
+        // these two launch scripts against that override, and only then
+        // invoke the wrapper -- see runProviderSafeDeleteCrashWithReceipt.sh.
+        register("providerSafeDeleteCrashPhaseA") {
+            type = "server"
+            gameDirectory = layout.projectDirectory.dir(findProperty("safeDeleteCrashGameDirectory") ?: "run/m470-safe-delete-crash-disposable-20261104")
+            sourceSet = sourceSets.providerBridgeGameTest
+            systemProperty "dynamicverse.providerSafeDeleteCrashPhase", "A"
+            // Supplied by the launch contract itself (not re-derived from cwd
+            // or inferred from a basename pattern) so the fixture can bind to
+            // the exact registered root rather than accepting any directory
+            // that merely happens to share its name and parent/child shape.
+            // Always derived from the SAME override as gameDirectory above,
+            // so the two can never silently drift apart.
+            systemProperty "dynamicverse.providerSafeDeleteCrashExpectedGameRoot", layout.projectDirectory.dir(findProperty("safeDeleteCrashGameDirectory") ?: "run/m470-safe-delete-crash-disposable-20261104").asFile.absolutePath
+        }
+        register("providerSafeDeleteCrashPhaseB") {
+            type = "server"
+            gameDirectory = layout.projectDirectory.dir(findProperty("safeDeleteCrashGameDirectory") ?: "run/m470-safe-delete-crash-disposable-20261104")
+            sourceSet = sourceSets.providerBridgeGameTest
+            systemProperty "dynamicverse.providerSafeDeleteCrashPhase", "B"
+            systemProperty "dynamicverse.providerSafeDeleteCrashExpectedGameRoot", layout.projectDirectory.dir(findProperty("safeDeleteCrashGameDirectory") ?: "run/m470-safe-delete-crash-disposable-20261104").asFile.absolutePath
+        }
     }
 }
 
@@ -188,6 +254,7 @@ dependencies {
     testImplementation "org.junit.jupiter:junit-jupiter"
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
     bridgeGameTestAdditionalRuntimeClasspath files(reviewedDynamicDimensionsClasses)
+    reviewGameTestAdditionalRuntimeClasspath files(reviewedDynamicDimensionsClasses)
     // The selected provider runtime source set exposes these as ordinary run
     // dependencies so NeoForge discovers their mod metadata and mixins.
     providerBridgeGameTestRuntimeOnly files(acceptedDynamicDimensionsJar)

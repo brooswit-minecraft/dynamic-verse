@@ -57,11 +57,13 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
     private final ManagedVerseStateStore state;
     private final String providerUnavailable;
     private boolean closed;
+    private DeleteGateway deletes;
+    private final Map<UUID, io.github.brooswitminecraft.dynamicverse.lifecycle.delete.SafeDeleteOperation> pendingDeletes = new HashMap<>();
 
     /** Provider linkage is attempted only at server ownership creation, never from command class initialization. */
     public static ServerVerseRuntime create(MinecraftServer server) {
         try {
-            return new ServerVerseRuntime(server, descriptor -> CurrentLevelEvidence.observed(server.getLevel(descriptor.key())),
+            ServerVerseRuntime result = new ServerVerseRuntime(server, descriptor -> CurrentLevelEvidence.observed(server.getLevel(descriptor.key())),
                     (catalog, gate) -> {
                         ProviderDuplicationBridge bridge = ProviderDuplicationBridge.forMinecraftServer(server, catalog, gate);
                         return new BridgeGateway() {
@@ -71,6 +73,8 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
                             @Override public boolean supportsSeededDuplicate() { return bridge.supportsSeededReload(); }
                         };
                     }, CreateGateway.minecraft(server), ManagedVerseStateFileStore.minecraft(server), null);
+            result.deletes = DeleteGateway.minecraft(server);
+            return result;
         } catch (LinkageError | RuntimeException unavailable) {
             return new ServerVerseRuntime(server, descriptor -> CurrentLevelEvidence.observed(server.getLevel(descriptor.key())), null, null,
                     new InMemoryManagedVerseStateStore(), unavailable.getClass().getSimpleName());
@@ -89,6 +93,12 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
     public static ServerVerseRuntime controlled(MinecraftServer server, LevelLookup lookup, BridgeGatewayFactory factory,
                                                 CreateGateway creates, ManagedVerseStateStore state) {
         return new ServerVerseRuntime(server, lookup, factory, creates, state, null);
+    }
+    public static ServerVerseRuntime controlled(MinecraftServer server, LevelLookup lookup, BridgeGatewayFactory factory,
+                                                CreateGateway creates, ManagedVerseStateStore state, DeleteGateway deletes) {
+        ServerVerseRuntime runtime = new ServerVerseRuntime(server, lookup, factory, creates, state, null);
+        runtime.deletes = deletes;
+        return runtime;
     }
 
     private ServerVerseRuntime(MinecraftServer server, LevelLookup levels, BridgeGatewayFactory factory, CreateGateway creates,
@@ -271,18 +281,77 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
     }
 
     /**
-     * Deliberately has no provider, filesystem, gate-reservation, or catalog
-     * mutation path.  A future delete state machine must replace this only
-     * after verified forced-save-and-close evidence is available.
+     * Probe only: no provider, filesystem, gate-reservation, or catalog
+     * mutation. When a delete gateway is available, an otherwise-eligible
+     * owned/ready verse must be confirmed through beginConfirmedDelete
+     * rather than deleted by this call alone.
      */
     @Override public DeleteAdmission beginDelete(String name) {
         if (closed) return DeleteAdmission.ERR_VERSE_NOT_MANAGED;
-        return FailClosedDeleteAdmission.validate(name, new FailClosedDeleteAdmission.OwnedVerseLookup() {
+        DeleteAdmission validation = FailClosedDeleteAdmission.validate(name, new FailClosedDeleteAdmission.OwnedVerseLookup() {
             @Override public boolean isOwned(String key) { return catalog.contains(key); }
             @Override public boolean isReady(String key) {
                 return gate.readiness(key).state() == VerseOperationGate.Readiness.State.READY;
             }
         });
+        return validation == DeleteAdmission.ERR_SAFE_DELETE_UNAVAILABLE && deletes != null
+                ? DeleteAdmission.ERR_CONFIRMATION_REQUIRED : validation;
+    }
+
+    /** Called only by the explicit /verse delete <name> confirm command. */
+    @Override public DeleteAdmission beginConfirmedDelete(String name, Consumer<DeleteOutcome> completion) {
+        Objects.requireNonNull(completion);
+        if (closed) return DeleteAdmission.ERR_VERSE_NOT_MANAGED;
+        String key = normalizeOwnedName(name);
+        if (key == null || !catalog.contains(key)) return DeleteAdmission.ERR_VERSE_NOT_MANAGED;
+        if (deletes == null) return DeleteAdmission.ERR_SAFE_DELETE_UNAVAILABLE;
+        if (gate.readiness(key).state() != VerseOperationGate.Readiness.State.READY) return DeleteAdmission.ERR_VERSE_NOT_READY;
+        ManagedVerseStateStore.ReadyVerse provenance = supportedProvenance.get(key);
+        if (provenance == null) return DeleteAdmission.ERR_PROVIDER_UNAVAILABLE;
+        VerseOperationGate.DeleteReservation reservation;
+        try { reservation = gate.beginDelete(key); }
+        catch (IllegalStateException busy) { return DeleteAdmission.ERR_VERSE_BUSY; }
+        UUID operationId = UUID.randomUUID();
+        try {
+            OwnedDimensionDescriptor descriptor = catalog.require(key);
+            java.nio.file.Path root = deletes.root().toAbsolutePath().normalize();
+            java.nio.file.Path mapped = DimensionType.getStorageFolder(descriptor.key(), root).toAbsolutePath().normalize();
+            var target = new io.github.brooswitminecraft.dynamicverse.lifecycle.delete.SafeDeleteOperation.Target(key,
+                    reservation.identity(), reservation.generation(), root, root.relativize(mapped), operationId);
+            var journal = new io.github.brooswitminecraft.dynamicverse.lifecycle.delete.SafeDeleteOperation.Journal() {
+                public void begin(io.github.brooswitminecraft.dynamicverse.lifecycle.delete.SafeDeleteOperation.Target ignored) {
+                    persist(state.read().withOperation(new ManagedVerseStateStore.OperationIntent(operationId,
+                            ManagedVerseStateStore.OperationKind.DELETE, key, key, true, provenance,
+                            ManagedVerseStateStore.OperationPhase.PENDING, null)));
+                }
+                public void cancelKnownNoEffect(io.github.brooswitminecraft.dynamicverse.lifecycle.delete.SafeDeleteOperation.Target ignored) {
+                    persist(state.read().withoutOperation(operationId));
+                }
+                public void deleted(io.github.brooswitminecraft.dynamicverse.lifecycle.delete.SafeDeleteOperation.Target ignored) {
+                    persist(state.read().withoutReady(key).withoutOperation(operationId));
+                    catalog.unregisterIfSame(descriptor); supportedProvenance.remove(key); effectiveSeeds.remove(key);
+                }
+            };
+            var operation = new io.github.brooswitminecraft.dynamicverse.lifecycle.delete.SafeDeleteOperation(target, deletes, journal,
+                    new io.github.brooswitminecraft.dynamicverse.lifecycle.delete.ConfinedDimensionDeleter(), reservation, outcome -> {
+                        pendingDeletes.remove(operationId);
+                        DeleteOutcome result = outcome == io.github.brooswitminecraft.dynamicverse.lifecycle.delete.SafeDeleteOperation.Outcome.DELETED
+                                ? DeleteOutcome.DELETED : DeleteOutcome.QUARANTINED;
+                        if (closed) completion.accept(result); else terminalFeedback.add(() -> completion.accept(result));
+                    });
+            pendingDeletes.put(operationId, operation);
+            var admitted = operation.start();
+            if (admitted != io.github.brooswitminecraft.dynamicverse.lifecycle.delete.SafeDeleteOperation.Admission.ADMITTED) pendingDeletes.remove(operationId);
+            return switch (admitted) {
+                case ADMITTED -> DeleteAdmission.ADMITTED;
+                case PLAYERS_PRESENT -> DeleteAdmission.ERR_PLAYERS_PRESENT;
+                case NOT_CURRENT -> DeleteAdmission.ERR_VERSE_NOT_READY;
+                case REFUSED -> DeleteAdmission.ERR_VERSE_BUSY;
+                case UNAVAILABLE -> DeleteAdmission.ERR_PROVIDER_UNAVAILABLE;
+            };
+        } catch (Exception | LinkageError unavailable) {
+            reservation.close(); return DeleteAdmission.ERR_PROVIDER_UNAVAILABLE;
+        }
     }
 
     @Override public List<ManagedVerseListing> listManaged() {
@@ -314,13 +383,15 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         catch (ClosedDimensionCopyException ignored) { return null; }
     }
     /** Cooperating server tick; callback feedback is dispatched after access revalidation. */
-    public void tick() { if (!closed) { access.tick(); observeCreates(); observeReplays(); while (!terminalFeedback.isEmpty()) terminalFeedback.remove().run(); } }
+    public void tick() { if (!closed) { access.tick(); observeCreates(); observeReplays(); for (var operation : List.copyOf(pendingDeletes.values())) operation.tick(); while (!terminalFeedback.isEmpty()) terminalFeedback.remove().run(); } }
     public boolean owns(Object candidate) { return server == candidate; }
     @Override public void close() {
         if (!closed) {
             closed = true;
             access.retire();
             terminalFeedback.clear();
+            for (var operation : List.copyOf(pendingDeletes.values())) operation.abort();
+            pendingDeletes.clear();
             for (PendingCreate pending : List.copyOf(pendingCreates.values())) pending.fail();
             pendingCreates.clear();
             for (PendingReplay pending : List.copyOf(pendingReplays.values())) pending.fail();
@@ -359,6 +430,8 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
         for (ManagedVerseStateStore.ReadyVerse ready : updated.ready().values()) replayReady(ready);
     }
     private void replayReady(ManagedVerseStateStore.ReadyVerse ready) {
+        // An interrupted DELETE still has its old READY descriptor. Never reload that tombstoned key.
+        if (gate.readiness(ready.id()).state() == VerseOperationGate.Readiness.State.QUARANTINED) return;
         if (!seedProvenanceConsistent(ready)) { registerUnavailable(ready); gate.quarantine(ready.id()); return; }
         OwnedDimensionDescriptor descriptor;
         try { descriptor = descriptorFromPersisted(ready); }
@@ -602,6 +675,41 @@ public final class ServerVerseRuntime implements VerseAccessService, VerseLifecy
     }
     private long createGeneration;
     private long nextCreateGeneration() { return ++createGeneration; }
+
+    public interface DeleteGateway extends io.github.brooswitminecraft.dynamicverse.lifecycle.delete.SafeDeleteOperation.Port {
+        java.nio.file.Path root();
+        static DeleteGateway minecraft(MinecraftServer server) {
+            DynamicDimensionRegistry registry = DynamicDimensionRegistry.from(server);
+            return new DeleteGateway() {
+                private ResourceKey<Level> key(io.github.brooswitminecraft.dynamicverse.lifecycle.delete.SafeDeleteOperation.Target target) {
+                    return ResourceKey.create(Registries.DIMENSION, ResourceLocation.parse(target.key()));
+                }
+                public java.nio.file.Path root() { return server.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT); }
+                public boolean matchesCurrent(io.github.brooswitminecraft.dynamicverse.lifecycle.delete.SafeDeleteOperation.Target target) {
+                    ServerLevel level = server.getLevel(key(target));
+                    return level != null && identity(level).equals(target.identity());
+                }
+                public boolean hasPlayers(io.github.brooswitminecraft.dynamicverse.lifecycle.delete.SafeDeleteOperation.Target target) {
+                    ServerLevel level = server.getLevel(key(target)); return level != null && !level.players().isEmpty();
+                }
+                public boolean isClosedAndAbsent(io.github.brooswitminecraft.dynamicverse.lifecycle.delete.SafeDeleteOperation.Target target) {
+                    return server.getLevel(key(target)) == null;
+                }
+                public boolean beginClose(io.github.brooswitminecraft.dynamicverse.lifecycle.delete.SafeDeleteOperation.Target target,
+                        Consumer<io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ClosedDimensionReceipt> terminal) {
+                    if (!matchesCurrent(target) || hasPlayers(target)) return false;
+                    return registry.beginQuiesceAndClose(key(target).location(), (owner, player) -> {
+                        throw new IllegalStateException("delete refuses an occupied level, including players arriving during close");
+                    }, result -> terminal.accept(new io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ClosedDimensionReceipt(
+                            result.key().location().toString(), result.generation(), result.initiallyLoaded(),
+                            result.status() == dev.galacticraft.dynamicdimensions.api.lifecycle.QuiesceAndCloseStatus.SAVED_AND_CLOSED
+                                    ? io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ClosedDimensionStatus.SAVED_AND_CLOSED
+                                    : io.github.brooswitminecraft.dynamicverse.lifecycle.copy.ClosedDimensionStatus.FAILED_CLOSE,
+                            result.failureStage() != null || result.cause() != null || result.sourceStillLoaded())));
+                }
+            };
+        }
+    }
 
     /** Provider and filesystem boundary used by the one production create path and its controlled tests. */
     public interface CreateGateway {

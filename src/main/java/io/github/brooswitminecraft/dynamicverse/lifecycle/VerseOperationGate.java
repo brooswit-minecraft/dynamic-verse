@@ -50,6 +50,48 @@ public final class VerseOperationGate {
         return new CreateReservation(destination);
     }
 
+    public synchronized DeleteReservation beginDelete(String key) {
+        Entry entry = entries.get(key);
+        if (entry == null || !entry.ready || entry.operating || entry.reads != 0 || entry.quarantined)
+            throw new IllegalStateException("Delete source is not exclusively READY");
+        entry.ready = false; entry.operating = true;
+        return new DeleteReservation(key, entry.identity, entry.generation);
+    }
+    public final class DeleteReservation implements io.github.brooswitminecraft.dynamicverse.lifecycle.delete.SafeDeleteOperation.Reservation {
+        private final String key, identity;
+        private final long generation;
+        private Long closeGeneration;
+        private boolean closed;
+        private DeleteReservation(String key, String identity, long generation) { this.key = key; this.identity = identity; this.generation = generation; }
+        public String identity() { return identity; }
+        public long generation() { return generation; }
+        @Override public void restoreKnownNoEffect() { synchronized (VerseOperationGate.this) {
+            if (closed) return;
+            Entry entry = entries.get(key); entry.ready = true; entry.operating = false; closed = true;
+        } }
+        @Override public void bindCloseGeneration(long value) { synchronized (VerseOperationGate.this) {
+            if (closed || closeGeneration != null || value < 0) throw new IllegalStateException("close generation already consumed");
+            closeGeneration = value;
+        } }
+        @Override public SourceWriteReloadFence fence() {
+            return (source, value) -> { synchronized (VerseOperationGate.this) {
+                Entry entry = entries.get(key);
+                if (closed || !key.equals(source) || closeGeneration == null || closeGeneration != value
+                        || entry == null || !entry.operating || entry.ready || entry.reads != 0 || entry.quarantined)
+                    throw new IllegalStateException("delete fence lost exclusivity");
+                return () -> { };
+            } };
+        }
+        @Override public void deleted() { synchronized (VerseOperationGate.this) {
+            if (closed || closeGeneration == null) throw new IllegalStateException("no delete close receipt");
+            entries.remove(key); closed = true;
+        } }
+        @Override public void close() { synchronized (VerseOperationGate.this) {
+            if (closed) return;
+            Entry entry = entries.get(key); entry.ready = false; entry.operating = false; entry.quarantined = true; closed = true;
+        } }
+    }
+
     public synchronized ReadyRead tryAcquireReadyRead(String key) {
         Entry entry = entries.get(key);
         if (entry == null || !entry.ready || entry.operating || entry.quarantined) return null;

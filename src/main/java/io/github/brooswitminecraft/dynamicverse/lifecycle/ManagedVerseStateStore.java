@@ -26,6 +26,11 @@ public interface ManagedVerseStateStore {
             copy.put(value.id(), value);
             return new State(copy, operations);
         }
+        public State withoutReady(String key) {
+            java.util.HashMap<String, ReadyVerse> copy = new java.util.HashMap<>(ready);
+            copy.remove(key);
+            return new State(copy, operations);
+        }
         public State withOperation(OperationIntent value) {
             java.util.HashMap<UUID, OperationIntent> copy = new java.util.HashMap<>(operations);
             copy.put(value.id(), value);

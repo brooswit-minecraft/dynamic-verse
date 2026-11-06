@@ -24,6 +24,12 @@ public final class OwnedDimensionCatalog {
 
     public synchronized boolean contains(String id) { return descriptors.containsKey(id); }
     public synchronized void unregister(String id) { descriptors.remove(id); }
+    /** Roll back only the exact descriptor reserved by a known-no-effect admission. */
+    public synchronized boolean unregisterIfSame(OwnedDimensionDescriptor descriptor) {
+        if (descriptors.get(descriptor.id()) != descriptor) return false;
+        descriptors.remove(descriptor.id());
+        return true;
+    }
 
     /** Snapshot only; catalog ownership never implies runtime readiness. */
     public synchronized List<OwnedDimensionDescriptor> descriptors() { return List.copyOf(descriptors.values()); }
